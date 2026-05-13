@@ -1,0 +1,7 @@
+Subject: {{ subject }}
+
+Hi {{ rep_first_name | default("there") }},
+
+(Placeholder template — real templates land with the insight engine.)
+
+— Sales Assistant

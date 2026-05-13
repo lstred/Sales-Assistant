@@ -1,165 +1,286 @@
 # CLAUDE.md — Living Agent Context for Sales Assistant
 
-> **Purpose of this file.** This is the canonical, always-up-to-date context
-> document for any Claude / Copilot coding agent working in this repo. Every
-> time we make a meaningful change to architecture, data model, integrations,
-> conventions, or open questions, we update this file in the same commit.
+> **Purpose of this file.** Canonical, always-up-to-date context document for
+> any Claude / Copilot agent working in this repo. Update this file in the
+> same commit as any meaningful change to architecture, data model,
+> integrations, conventions, or open questions.
 >
-> **Rule for the agent:** Read this file *and* `NEW_APP_CONTEXT_PROMPT.md`
-> before doing any non-trivial work. When you make a change that affects
-> anything documented here, update the relevant section in the same change.
+> **Rule:** Read this file *and* `NEW_APP_CONTEXT_PROMPT.md` before doing any
+> non-trivial work. Update affected sections in the same commit.
 
 ---
 
-## 1. Project summary
+## 1. Product summary
 
-Sales Assistant is an internal tool that:
+Sales Assistant is a **native Windows desktop application** that acts as an
+AI-powered sales-management assistant for the user (a sales manager). It:
 
-1. Pulls sales / order / customer-coverage data from the `NRF_REPORTS` SQL
-   Server database.
-2. Evaluates each sales rep against per-rep and peer-group metrics.
-3. Generates insights (e.g., dropping fill rate, dormant accounts, missed
-   coverage on assigned accounts, GP erosion).
-4. Emails reps:
-   - **Event-driven** — when an insight crosses a threshold.
-   - **Scheduled** — recurring digest (cadence TBD; likely weekly).
+1. Pulls data from `NRF_REPORTS` SQL Server (rep assignments, sales
+   activity, account coverage, displays, and historical/old-system sales).
+2. Evaluates each sales rep across multiple weighted metrics.
+3. Engages reps over email — **manually-approved** at first, **scheduled**
+   later — with personalized coaching, follow-up requests, escalation, and
+   tone matching the rep's current performance trajectory.
+4. **Receives, stores, and replies to** rep responses on email chains the AI
+   originated. Maintains durable conversation history and remembers
+   commitments (e.g., "I'll do the PK session on Friday") so future emails
+   can follow up.
+5. Doubles as a **manager-side analytics tool** — actionable, territory-aware
+   insights (no generic vanity KPIs).
 
-We are **not** building a UI dashboard in this project (the existing Inventory
-Dashboard already covers that). This app is a backend service plus an email
-delivery layer.
+Form-factor requirements (binding):
+
+- **Native Windows desktop**, packaged as an `.exe` via PyInstaller.
+- **No browser / Streamlit / web stack.**
+- **Premium UI quality** — clean, modern, professional, polished. Custom QSS,
+  consistent spacing, Segoe UI Variable font, accent-driven design.
+- **Safe and secure** — secrets in Windows Credential Manager (via `keyring`),
+  parameterized SQL only, no plaintext API keys / passwords on disk, AI
+  responses constrained to data the rep is authorized to see.
 
 ## 2. Source-of-truth documents
 
-| Doc | What's in it | When to read it |
+| Doc | Contains | When to read |
 |---|---|---|
-| `NEW_APP_CONTEXT_PROMPT.md` | SQL Server connection setup, every table & field used, nicknames/aliases, business rules, unit conversion, gotchas, computed metrics, existing dashboard field definitions. | **Before** writing any data-layer or metric code. |
-| `CLAUDE.md` (this file) | Architecture decisions, conventions, integrations, open questions, change log. | Every session, before making non-trivial changes. |
-| `README.md` | Human-facing project overview & setup. | When updating user-facing instructions. |
+| `NEW_APP_CONTEXT_PROMPT.md` | SQL Server connection setup, every legacy table & field, business rules, unit conversion, gotchas. | Before writing any data-layer or metric code. |
+| `CLAUDE.md` (this file) | Architecture, conventions, integrations, open questions, change log. | Every session before non-trivial changes. |
+| `README.md` | Human-facing overview & setup. | When updating user-facing instructions. |
 
-If `NEW_APP_CONTEXT_PROMPT.md` and this file ever disagree, **`NEW_APP_CONTEXT_PROMPT.md` wins** for database/field facts. Update CLAUDE.md to match.
+If `NEW_APP_CONTEXT_PROMPT.md` and this file disagree, **NEW_APP_CONTEXT_PROMPT.md
+wins** for DB/field facts; update CLAUDE.md to match.
 
-## 3. Tech stack (planned)
+## 3. Tech stack (locked-in)
 
-Nothing has been installed yet. Planned baseline:
-
-- **Language:** Python 3.11+
-- **Data access:** SQLAlchemy + `pyodbc` + ODBC Driver 18 for SQL Server
-  (Windows Trusted Connection — no SQL logins).
-- **DataFrames / metrics:** pandas.
-- **Scheduling:** TBD — candidates: Windows Task Scheduler invoking a CLI
-  entry point, or APScheduler running as a long-lived service. Decide before
-  implementing the scheduler.
-- **Email:** TBD — candidates: SMTP via `smtplib`, Microsoft Graph API
-  (preferred if the org is M365), or `win32com` Outlook automation. Decide
-  before implementing the email layer.
-- **Templating (email body):** Jinja2.
-- **Config:** Same resolution order as the existing dashboard
-  (env var → `%APPDATA%\PurchaseOrderBot\config.json` → `config_local.py`),
-  extended for new keys (SMTP creds, schedule, recipient overrides, etc.).
-- **Testing:** pytest.
-- **Lint/format:** ruff + black (to be added).
-
-> **Before adding any of the above as dependencies, confirm with the user.**
+- **Language:** Python 3.11+ (current dev: 3.11.9).
+- **UI:** **PySide6** (Qt for Python, LGPL). Custom QSS theme — no
+  qt-material / no Streamlit / no Electron.
+- **DB (warehouse):** SQLAlchemy + pyodbc + ODBC Driver 18 for SQL Server,
+  Windows Trusted Connection.
+- **DB (local app state):** SQLite via stdlib `sqlite3`, file lives under
+  `%APPDATA%\SalesAssistant\state.sqlite`.
+- **Secrets:** `keyring` → Windows Credential Manager. Never persist secrets
+  in `config.json` / `config_local.py` / source.
+- **Config:** `pydantic` v2 models. JSON file at
+  `%APPDATA%\SalesAssistant\config.json` for non-secret settings.
+- **AI:** Provider abstraction (`app/ai/base.py`). Default impl: **OpenAI**
+  (`gpt-4.1` / `gpt-5` family) via `httpx`. Abstraction allows Anthropic /
+  Azure OpenAI later.
+- **Email:** **SMTP (send) + IMAP (receive)** via stdlib `smtplib` /
+  `imaplib`. `email.message.EmailMessage` for composition. Behind an
+  `EmailTransport` interface so Microsoft Graph can be added later.
+- **Templating (email):** Jinja2.
+- **Scheduling:** APScheduler (BackgroundScheduler) running inside the Qt
+  app's event loop. No Windows services in v1.
+- **Packaging:** PyInstaller, single-folder build (faster startup than
+  one-file). Code-signing TBD.
+- **Lint/format/test:** ruff, black, pytest.
 
 ## 4. Repository layout
-
-Current (scaffolding only):
 
 ```
 .
 ├── .gitignore
 ├── CLAUDE.md
 ├── NEW_APP_CONTEXT_PROMPT.md
-└── README.md
-```
-
-Planned (will be created as we build — update this tree when it changes):
-
-```
-.
+├── README.md
+├── pyproject.toml
 ├── app/
 │   ├── __init__.py
-│   ├── config.py              # AppConfig + connection-string + email config resolution
-│   ├── data/
+│   ├── __main__.py                  # `python -m app`
+│   ├── main.py                      # App entry point
+│   ├── app_paths.py                 # %APPDATA% paths
+│   ├── config/
 │   │   ├── __init__.py
-│   │   ├── db.py              # SQLAlchemy engine, read_dataframe(), validate_connection()
-│   │   ├── queries.py         # Raw SQL strings
-│   │   └── loaders.py         # Loaders that apply standard filters & normalizations
+│   │   ├── models.py                # Pydantic config models
+│   │   └── store.py                 # Load/save + keyring secrets
+│   ├── data/                        # SQL Server (NRF_REPORTS)
+│   │   ├── __init__.py
+│   │   ├── db.py                    # Engine + read_dataframe + ping
+│   │   ├── queries.py               # Raw SQL constants
+│   │   └── loaders.py               # Filtered/normalized loaders
+│   ├── storage/                     # Local SQLite (conversations, log)
+│   │   ├── __init__.py
+│   │   ├── db.py
+│   │   ├── schema.py
+│   │   └── repos.py
 │   ├── services/
 │   │   ├── __init__.py
-│   │   ├── rep_metrics.py     # Per-rep KPIs + peer-group comparisons
-│   │   └── insights.py        # Insight rules → list of insight objects
+│   │   ├── rep_metrics.py           # Per-rep metric computations
+│   │   └── insights.py              # Insight rules → InsightItem list
+│   ├── ai/
+│   │   ├── __init__.py
+│   │   ├── base.py                  # AIProvider interface
+│   │   ├── factory.py
+│   │   └── openai_provider.py
 │   ├── notifications/
 │   │   ├── __init__.py
-│   │   ├── email_client.py    # Email transport (TBD provider)
-│   │   └── templates/         # Jinja2 .html / .txt templates
+│   │   ├── email_client.py          # SMTP+IMAP transport
+│   │   └── templates/
 │   ├── scheduler/
-│   │   └── runner.py          # Schedule entry point
-│   └── cli.py                 # CLI entry: run-once, send-test-email, etc.
-├── tests/
-├── pyproject.toml             # deps + tool config
-└── config_local.py            # GITIGNORED — local connection string + secrets
+│   │   ├── __init__.py
+│   │   └── runner.py
+│   └── ui/
+│       ├── __init__.py
+│       ├── theme.py                 # QSS, palette, fonts
+│       ├── main_window.py
+│       ├── widgets/
+│       │   ├── __init__.py
+│       │   ├── sidebar.py
+│       │   └── status_bar.py
+│       ├── views/
+│       │   ├── __init__.py
+│       │   ├── dashboard_view.py
+│       │   ├── reps_view.py
+│       │   ├── conversations_view.py
+│       │   └── settings_view.py
+│       └── dialogs/
+│           ├── __init__.py
+│           ├── db_settings_dialog.py
+│           ├── email_settings_dialog.py
+│           └── ai_settings_dialog.py
+└── tests/
+    └── test_smoke.py
 ```
 
-## 5. Database — quick orientation
+## 5. Database — what *this* app cares about
 
-Full details in `NEW_APP_CONTEXT_PROMPT.md`. Highlights for *this* app:
+Full reference in `NEW_APP_CONTEXT_PROMPT.md`. Highlights specific to Sales
+Assistant:
 
-- **Server:** `NRFVMSSQL04`, **DB:** `NRF_REPORTS`, **Auth:** Windows Trusted.
-- **Sales fact table:** `dbo._ORDERS`. Customer sales = `ACCOUNT#I > 1`;
+### 5a. New-system data (post-2025-08-04, granular)
+
+- **`dbo._ORDERS`** — sales fact rows. Customer sales = `ACCOUNT#I > 1`;
   warehouse POs = `ACCOUNT#I = 1` (must exclude from rep metrics).
-- **Sales rep name on the order line:** `_ORDERS.SALESPERSON_DESC`.
-- **Rep ↔ account assignment:** `dbo.BILLSLMN`
-  (`BSACCT` = account, `BSSLMN` = salesman, `BSCODE` = cost center). This is
-  the canonical source for "who owns which accounts" and for peer grouping
-  (BSCODE-overlap Jaccard ≥ 0.60 = peers).
-- **Customer name:** `_ORDERS.BANK_NAME2`.
-- **Revenue field:** `ENTENDED_PRICE_NO_FUNDS` *(yes, the typo is intentional
-  and permanent in the schema — never "fix" it)*.
-- **GP fields:** `LINE_GPD_WITHOUT_FUNDS` (GP) and `LINE_GPP_WITH_FUNDS` (GPP).
-- **Dates:** `ORDER_ENTRY_DATE_YYYYMMDD` and `INVOICE_DATE_YYYYMMDD` are
-  numeric YYYYMMDD — must be parsed in Python, not compared as SQL dates.
-- **Backorders:** `DETAIL_LINE_STATUS in ('B','R')`; quantity-level metrics
-  use `'B'` only.
-- **CCA program accounts:** `dbo.BILL_CD` filter
-  (`BCCAT='MP'` AND `BCCODE IN ('ACA','ACP','AC1')`).
-- **Always parameterize SQL** with `text()` + `:param`. No f-strings around
-  user-supplied values.
+- **`dbo.BILLSLMN`** — rep ↔ account ↔ cost center assignment. **Source of
+  truth for rep ownership and territory.** Columns: `BSACCT` (account),
+  `BSSLMN` (salesman number), `BSCODE` (cost center).
+- **`dbo.SALESMAN`** — rep name lookup. Join `BILLSLMN.BSSLMN = SALESMAN.YSLMN#`;
+  rep display name is `SALESMAN.YNAME`.
+- **`dbo.BILLTO`** — customer master. Columns we use:
+  - `BACCT#` — new-system account number (matches `_ORDERS.ACCOUNT#I` and
+    `BILLSLMN.BSACCT`).
+  - `BBANK2` — old-system account number (joins to
+    `ClydeMarketingHistory.CustomerNumber`).
+  - **A leading `*` in the account/name field marks the account as CLOSED.**
+    Closed accounts:
+    - Don't penalize a rep for missing sales there.
+    - Still surface as "lost-account context" the rep can be reminded of.
+- **`dbo._ORDERS.SALESPERSON_DESC`** — name on the order line (text, may
+  drift from `SALESMAN.YNAME`; prefer `BILLSLMN`-driven assignment as truth).
+- **Revenue:** `ENTENDED_PRICE_NO_FUNDS` (yes the typo is permanent).
+  GP: `LINE_GPD_WITHOUT_FUNDS`. GPP: `LINE_GPP_WITH_FUNDS`.
+- **Dates:** `ORDER_ENTRY_DATE_YYYYMMDD` (numeric YYYYMMDD — parse in Python).
+
+### 5b. Old-system / pre-go-live data (≤ 2025-08-04, summarized)
+
+- **`dbo.vw_CostCenterCLydeMRKCodeXREF`** — cross-reference between new
+  cost centers and old "Clyde Marketing Codes". Columns:
+  - `CostCenter` — new system cost center code (e.g. `010`).
+  - `CostCenterName` — description (e.g. `CARPET RESIDENTIAL`).
+  - `ClydeMarketingCode` — old system marketing code, joins to
+    `ClydeMarketingHistory.MarketingCode`.
+- **`dbo.ClydeMarketingHistory`** — old summarized sales by customer × cost
+  center × month × fiscal year. Columns:
+  - `MarketingCode` → join via XREF view.
+  - `FiscalYear` — fiscal year. **Fiscal year starts in February**, so FY is
+    typically calendar+1. (Today is May 2026 → FY 2027.)
+  - `CustomerNumber` → join `BILLTO.BBANK2`.
+  - `SalesPeriod1`..`SalesPeriod12` — monthly sales (Period1=Feb, Period12=Jan).
+  - `CostsPeriod1`..`CostsPeriod12` — monthly costs.
+  - `TotalSales`, `TotalCost`, `Profit` — annual roll-ups.
+- Granularity: **NOT by SKU.** Year-over-year comparisons must aggregate
+  new-system data to (account × cost center × month) before comparing.
+
+### 5c. Display tracking
+
+- **`dbo.CLASSES`** with `CLCAT='DT'` lists displays. `CLCODE` = 3-char
+  display code, `CLDESC` = description.
+- **`dbo.BCACCT`** with `BCCAT='DT'` maps displays to accounts.
+  - `BCCODE` = display code, `BCACCT` = account number,
+  - `DateFormatted` = `YYYY-MM-DD` install date. Treat dates **before
+    2025-08-05 as approximate** (system migration cutoff). Sales bumps after
+    a post-cutoff display date are reliable signal.
+
+### 5d. App-side configuration the user maintains in the UI (not in DB)
+
+- **Sample CC ↔ product CC mapping** — links sample cost centers to their
+  product cost centers.
+- **Display ↔ cost center assignment** — which `DT` codes are "core"
+  displays for which cost center.
+- **Insight weights** — per-metric weights for the composite rep score.
+- **Escalation contacts** — per-rep boss/CC email for escalation mode.
+- **Tone presets** — per-rep tone bias (carrot ↔ stick scale).
+
+Persisted in `%APPDATA%\SalesAssistant\config.json` (non-secret) and the
+local SQLite DB (relational data).
 
 ## 6. Conventions for the agent
 
-- **Don't break the source-of-truth field names.** Use the column names exactly
-  as documented (including `ENTENDED_PRICE_NO_FUNDS`, `[D@MFGR]`, `[$DESC]`,
-  etc.). When tempted to "clean up" a name, alias it in Python instead.
-- **No hard-coded credentials, server names, or paths.** Resolve via the
-  config layer.
-- **All quantities are normalized to SY** at the loader layer (see
-  `NEW_APP_CONTEXT_PROMPT.md` §4). Downstream code assumes SY.
-- **Apply standard filters in loaders, not ad hoc** (`IINVEN='Y'`, exclude
-  remnants, exclude cost centers starting with `'1'`, etc.).
-- **Don't over-engineer.** Add abstractions only when they're used twice.
-- **Don't commit `config_local.py`, `.env`, or anything in
-  `%APPDATA%\PurchaseOrderBot\`.** The `.gitignore` already covers these — do
-  not weaken it.
-- **Update this file** when you change architecture, dependencies, schema
-  assumptions, integrations, or conventions.
+- Use exact source-of-truth field names (including the `ENTENDED` typo,
+  `[D@MFGR]`, `[$DESC]`, `[BSACCT]`, etc.). Alias in Python only.
+- **Parameterize all SQL** with `text()` + `:param`. Never f-string user
+  values into SQL.
+- **All quantities are normalized to SY** in the loader layer.
+- **Apply standard filters in loaders** (`IINVEN='Y'`, exclude remnants,
+  exclude cost centers starting with `'1'`, exclude future-dated rows, drop
+  closed accounts from penalty metrics but keep for context).
+- **No secrets on disk.** Email passwords, AI API keys → `keyring` only.
+  The config JSON only stores non-secret references (host, port, username,
+  model name).
+- **AI access scope:** the AI may only read/answer about a rep's own
+  accounts and metrics. The prompt-builder enforces this; do not pass
+  unrelated reps' data into a per-rep AI call.
+- **AI responds only on chains it originated.** Verify thread ownership via
+  the local `conversations` table before generating any reply.
+- **Territory-aware comparisons:** any cross-rep comparison must normalize
+  for territory size and account mix. No raw "rep A sold $X vs rep B sold
+  $Y" framing.
+- **Don't over-engineer.** Add abstractions only after second use.
+- **Premium UI bar:** if a UI change makes the app look more like a stock Qt
+  demo, don't ship it. Spacing, alignment, typography, and motion matter.
+- Update this file in the same commit as any change that affects it.
 
-## 7. Open questions (decide before building the relevant piece)
+## 7. Local-state schema (SQLite, `%APPDATA%\SalesAssistant\state.sqlite`)
+
+CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
+
+- `reps` — cached rep roster (`salesman_number`, `name`, `email`, `tone`,
+  `boss_email`, `active`).
+- `conversations` — one row per email thread the AI initiated
+  (`rep_id`, `subject`, `topic`, `status`, `tone`, timestamps, `thread_key`).
+- `messages` — full audit log of every email in/out (direction, headers,
+  body html+text, raw IMAP UID, AI reasoning summary if any).
+- `action_items` — extracted commitments from rep replies, with `due_at`
+  and follow-up status.
+- `send_log` — SMTP send attempts, message-id, deliverability.
+- `metric_snapshots` — periodic metric values per rep for trend analysis.
+- `settings_kv` — small misc key/value (last sync timestamps, etc.).
+
+## 8. Open questions (decide before building the dependent piece)
 
 | # | Question | Needed before |
 |---|---|---|
-| 1 | Which email transport? (SMTP / Microsoft Graph / Outlook COM) | Building `app/notifications/email_client.py` |
-| 2 | Where does the app run? (laptop / always-on Windows VM / scheduled task) | Building `app/scheduler/` |
-| 3 | What is the recipient list source? (hard list / `BILLSLMN` lookup → AD email lookup / config) | Building rep email resolution |
-| 4 | Which insights go in v1 vs later? (fill rate drop, dormant account, GP erosion, missed-coverage, backorder spike, …) | Building `app/services/insights.py` |
-| 5 | Send cadence + quiet hours? | Building scheduler |
-| 6 | Dry-run / preview mode for emails before live send? | Building email layer (strongly recommended yes) |
-| 7 | Persistence for "last sent" / dedup of insights? (SQLite file vs JSON vs none) | Building insights pipeline |
+| 1 | Recipient email-address resolution: hard-coded, AD lookup, or manual entry per rep in UI? | First real send |
+| 2 | Default scheduled cadence (weekly Mon 7am? bi-weekly?) and quiet hours | Enabling scheduler |
+| 3 | Manager review queue UX: in-app preview-and-send (current plan) vs Outlook draft | Done — going with in-app |
+| 4 | Escalation policy: when does AI auto-suggest CC'ing the boss vs only on user trigger? | Building escalation feature |
+| 5 | How long to retain message bodies (forever / N years)? | Before production |
+| 6 | Reps' own read-only portal? | Not v1 |
+| 7 | Code-signing certificate for the .exe? | Before distribution |
 
-## 8. Change log
+## 9. Change log
 
-Update this list (newest first) every time CLAUDE.md is meaningfully changed.
+Newest first.
 
+- **2026-05-13** — Major scope expansion. Locked stack: PySide6 desktop +
+  custom QSS theme; SQLite local state; SMTP+IMAP email; OpenAI default
+  with provider abstraction; keyring for secrets. Added new tables
+  introduced by user: `vw_CostCenterCLydeMRKCodeXREF`, `ClydeMarketingHistory`,
+  `BILLTO` (esp. `BBANK2` & leading-`*` closed-account flag), `SALESMAN`,
+  display tracking via `CLASSES`/`BCACCT` with `CLCAT='DT'`. Added §5b
+  (old-system semantics + fiscal-year-starts-Feb), §5c (displays), §5d
+  (app-side config), §7 (local SQLite schema), and §1/§3/§6 form-factor
+  + UI-quality requirements. Initial app skeleton committed.
 - **2026-05-13** — Initial scaffold: `.gitignore`, `README.md`, `CLAUDE.md`,
-  and the existing `NEW_APP_CONTEXT_PROMPT.md`. No application code yet.
-  Repository pushed to `https://github.com/lstred/Sales-Assistant`.
+  and existing `NEW_APP_CONTEXT_PROMPT.md`. Repo:
+  https://github.com/lstred/Sales-Assistant.
