@@ -55,11 +55,17 @@ def load_invoiced_sales(
     start: date,
     end: date,
     cost_centers: Iterable[str] | None = None,
+    code_prefix: str = "",
 ) -> pd.DataFrame:
     """Line-level invoiced sales between ``start`` and ``end`` inclusive.
 
     Pass ``cost_centers`` to filter to one/more/all CCs (None or empty
     iterable = all CCs).
+
+    ``code_prefix`` (e.g. ``"0"``) restricts to cost centers whose code
+    starts with that prefix; this is **always** applied even when
+    ``cost_centers`` is empty so sample CCs (``'1xx'``) never leak into
+    product-only views.
 
     Adds derived columns:
     * ``invoice_date`` (datetime)
@@ -73,6 +79,7 @@ def load_invoiced_sales(
             "start_yyyymmdd": int(start.strftime("%Y%m%d")),
             "end_yyyymmdd": int(end.strftime("%Y%m%d")),
             "cc_csv": cc_csv,
+            "code_prefix": (code_prefix or "").strip(),
         },
     )
     if df.empty:
@@ -113,6 +120,7 @@ def load_blended_sales(
     end: date,
     cost_centers: Iterable[str] | None = None,
     six_week_january_years: Iterable[int] = (),
+    code_prefix: str = "",
 ) -> pd.DataFrame:
     """Sales between ``start`` and ``end`` blended across both systems.
 
@@ -130,11 +138,12 @@ def load_blended_sales(
     ``invoice_number``, ``data_source``.
     """
     parts: list[pd.DataFrame] = []
+    prefix = (code_prefix or "").strip()
 
     # New-system portion
     new_start = max(start, NEW_SYSTEM_CUTOFF)
     if new_start <= end:
-        new_df = load_invoiced_sales(db, new_start, end, cost_centers)
+        new_df = load_invoiced_sales(db, new_start, end, cost_centers, prefix)
         if new_df is not None and not new_df.empty:
             new_df = new_df.copy()
             new_df["data_source"] = "new"
@@ -168,7 +177,7 @@ def load_blended_sales(
         if old_raw is not None and not old_raw.empty:
             legacy = _unpivot_old_sales(
                 old_raw, start, legacy_end, cost_centers,
-                six_week_january_years, rep_map,
+                six_week_january_years, rep_map, prefix,
             )
             if not legacy.empty:
                 legacy["data_source"] = "legacy"
@@ -196,6 +205,7 @@ def _unpivot_old_sales(
     cost_centers: Iterable[str] | None,
     six_week_january_years: Iterable[int],
     rep_map: dict[tuple[str, str], str] | None = None,
+    code_prefix: str = "",
 ) -> pd.DataFrame:
     """Unpivot ``ClydeMarketingHistory`` SalesPeriod1..12 / CostsPeriod1..12
     columns into one row per (account × cost center × fiscal period) within
@@ -203,6 +213,8 @@ def _unpivot_old_sales(
 
     ``rep_map`` is an optional ``(account_number, cost_center) -> rep_name``
     lookup used to attribute legacy sales to the current owning rep.
+    ``code_prefix`` restricts to cost centers whose code starts with that
+    prefix (applied alongside any explicit ``cost_centers`` filter).
     """
     if raw is None or raw.empty:
         return pd.DataFrame()
@@ -214,6 +226,9 @@ def _unpivot_old_sales(
         wanted = {str(c).strip() for c in cost_centers if c}
         if wanted:
             df = df[df["cost_center"].isin(wanted)]
+    prefix = (code_prefix or "").strip()
+    if prefix:
+        df = df[df["cost_center"].str.startswith(prefix)]
     if df.empty:
         return df
 
@@ -260,11 +275,16 @@ def _unpivot_old_sales(
 def load_open_orders(
     db: DatabaseConfig,
     cost_centers: Iterable[str] | None = None,
+    code_prefix: str = "",
 ) -> pd.DataFrame:
     """Open (un-invoiced) order lines. Useful for pipeline insights only —
     never counted as salesman credit until the invoice posts."""
     cc_csv = ",".join(c for c in (cost_centers or ()) if c)
-    return read_dataframe(db, queries.OPEN_ORDERS_LINES, params={"cc_csv": cc_csv})
+    return read_dataframe(
+        db,
+        queries.OPEN_ORDERS_LINES,
+        params={"cc_csv": cc_csv, "code_prefix": (code_prefix or "").strip()},
+    )
 
 
 # ----------------------------------------------------------------- displays

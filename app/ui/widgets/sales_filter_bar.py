@@ -56,23 +56,26 @@ class _SalesLoader(QThread):
         prior_start: date | None,
         prior_end: date | None,
         six_week_january_years: list[int] | None = None,
+        code_prefix: str = "",
     ) -> None:
         super().__init__()
         self._db = db
         self._start, self._end, self._ccs = start, end, ccs
         self._prior_start, self._prior_end = prior_start, prior_end
         self._sw = list(six_week_january_years or ())
+        self._code_prefix = (code_prefix or "").strip()
 
     def run(self) -> None:  # noqa: D401
         try:
             cur = load_blended_sales(
-                self._db, self._start, self._end, self._ccs or None, self._sw
+                self._db, self._start, self._end, self._ccs or None, self._sw,
+                self._code_prefix,
             )
             prior = None
             if self._prior_start is not None and self._prior_end is not None:
                 prior = load_blended_sales(
                     self._db, self._prior_start, self._prior_end,
-                    self._ccs or None, self._sw,
+                    self._ccs or None, self._sw, self._code_prefix,
                 )
             self.loaded.emit(cur, prior)
         except Exception as exc:  # noqa: BLE001
@@ -106,6 +109,7 @@ class SalesFilterBar(QFrame):
         self._autorun = autorun
         self._has_autorun = False
         self._last_cache_ts = None  # type: datetime | None
+        self._code_prefix_filter = (code_prefix_filter or "").strip()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
@@ -242,12 +246,14 @@ class SalesFilterBar(QFrame):
 
         # Cache hit short-circuit (skipped on explicit Refresh).
         if not force_refresh:
-            cur_key = sales_cache.make_key(s, e, ccs)
+            cur_key = sales_cache.make_key(s, e, ccs, self._code_prefix_filter)
             cur_hit = sales_cache.get(cur_key)
             prior_hit = None
             if prior_start is not None and prior_end is not None:
                 prior_hit = sales_cache.get(
-                    sales_cache.make_key(prior_start, prior_end, ccs)
+                    sales_cache.make_key(
+                        prior_start, prior_end, ccs, self._code_prefix_filter
+                    )
                 )
             if cur_hit and (prior_start is None or prior_hit):
                 cur_df, ts = cur_hit
@@ -270,7 +276,8 @@ class SalesFilterBar(QFrame):
 
         sw = list(self._cfg.fiscal.six_week_january_years) if self._cfg else []
         self._loader = _SalesLoader(
-            self._get_db(), s, e, ccs, prior_start, prior_end, sw
+            self._get_db(), s, e, ccs, prior_start, prior_end, sw,
+            self._code_prefix_filter,
         )
         self._loader.loaded.connect(self._on_loaded)
         self._loader.failed.connect(self._on_failed)
@@ -283,7 +290,9 @@ class SalesFilterBar(QFrame):
         s, e = self.date_range()
         ccs = self.selected_codes()
         try:
-            ts = sales_cache.put(sales_cache.make_key(s, e, ccs), df)
+            ts = sales_cache.put(
+                sales_cache.make_key(s, e, ccs, self._code_prefix_filter), df
+            )
             self._last_cache_ts = ts
             if prior is not None:
                 try:
@@ -291,7 +300,10 @@ class SalesFilterBar(QFrame):
                     pe = e.replace(year=e.year - 1)
                 except ValueError:
                     ps, pe = s - timedelta(days=365), e - timedelta(days=365)
-                sales_cache.put(sales_cache.make_key(ps, pe, ccs), prior)
+                sales_cache.put(
+                    sales_cache.make_key(ps, pe, ccs, self._code_prefix_filter),
+                    prior,
+                )
         except Exception:  # noqa: BLE001 — caching failures are non-fatal
             pass
         suffix = ""

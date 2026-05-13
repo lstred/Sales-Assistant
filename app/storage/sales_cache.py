@@ -35,9 +35,15 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def make_key(start: date, end: date, cost_centers: Iterable[str] | None) -> str:
+def make_key(
+    start: date,
+    end: date,
+    cost_centers: Iterable[str] | None,
+    code_prefix: str = "",
+) -> str:
     ccs = ",".join(sorted({str(c).strip() for c in (cost_centers or ()) if c}))
-    return f"{start.isoformat()}|{end.isoformat()}|{ccs}"
+    prefix = (code_prefix or "").strip()
+    return f"{start.isoformat()}|{end.isoformat()}|{ccs}|p={prefix}"
 
 
 def get(key: str) -> tuple[pd.DataFrame, datetime] | None:

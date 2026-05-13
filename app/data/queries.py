@@ -108,6 +108,8 @@ WHERE   o.[N_NOT_INVENTORY] = 'Y'
   AND   ( :cc_csv = ''
           OR LTRIM(RTRIM(i.[ICCTR])) IN
              (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(:cc_csv, ',')) )
+  AND   ( :code_prefix = ''
+          OR LTRIM(RTRIM(i.[ICCTR])) LIKE :code_prefix + '%' )
 """
 
 # Open orders: real orders (ORDER# > 0) that have **not** yet been invoiced.
@@ -131,6 +133,8 @@ WHERE   o.[N_NOT_INVENTORY] = 'Y'
   AND   ( :cc_csv = ''
           OR LTRIM(RTRIM(i.[ICCTR])) IN
              (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(:cc_csv, ',')) )
+  AND   ( :code_prefix = ''
+          OR LTRIM(RTRIM(i.[ICCTR])) LIKE :code_prefix + '%' )
 """
 
 # ------------------------------------- old-system summarized sales (≤ go-live)

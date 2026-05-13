@@ -286,6 +286,29 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 Newest first.
 
+- **2026-05-13** — Product-CC enforcement + autoload fix:
+  - **CC selector now actually autoloads.** `CostCenterSelector` accepted
+    `autoload=True` but never invoked `reload()` — every screen showed
+    "not loaded" and an empty checklist. Constructor now schedules
+    `QTimer.singleShot(0, self.reload)` and reconnects
+    `model.itemChanged → _on_item_changed` (signals are blocked while
+    rows are populated to avoid N spurious emits). Fixes the
+    "CC filters are blank" complaint across Sales by Rep, Sales by CC,
+    Weekly Email, and Ask the AI.
+  - **Sample CCs (`'1xx'`) can no longer leak into product tables.**
+    A new `code_prefix` parameter has been plumbed end-to-end:
+    `INVOICED_SALES_LINES` and `OPEN_ORDERS_LINES` queries take
+    `:code_prefix`; `load_invoiced_sales` / `load_open_orders` /
+    `load_blended_sales` / `_unpivot_old_sales` accept `code_prefix=""`;
+    `SalesFilterBar` stores its `code_prefix_filter` and forwards it to
+    the loader **and** the cache key. So even when the user clicks
+    *Deselect all* (empty CC list = "everything"), product-only views
+    still hard-exclude `'1xx'` codes both in the warehouse query and the
+    legacy unpivot.
+  - **Cache key now includes the prefix** (`…|p=0`), so a product-only
+    cache and an unfiltered cache cannot collide. Existing caches from
+    the previous round are silently invalidated by the key change.
+
 - **2026-05-13** — Premium polish + persistence round:
   - **Sales views restricted to product CCs** (`'0'` prefix). New
     `code_prefix_filter` parameter on `CostCenterSelector` + `SalesFilterBar`;

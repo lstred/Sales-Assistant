@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Callable
 
 import pandas as pd
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -108,6 +108,10 @@ class CostCenterSelector(QWidget):
         self.view.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
         root.addWidget(self.view, 1)
 
+        self.model.itemChanged.connect(self._on_item_changed)
+        if autoload:
+            QTimer.singleShot(0, self.reload)
+
     # --------------------------------------------------------------- public
     def selected_codes(self) -> list[str]:
         return [
@@ -128,6 +132,7 @@ class CostCenterSelector(QWidget):
         if self._prefix_filter and df is not None and not df.empty:
             df = df[df["cost_center"].astype(str).str.startswith(self._prefix_filter)]
         self._df = df
+        self.model.blockSignals(True)
         self.model.clear()
         for _, row in df.iterrows():
             code = str(row.get("cost_center", "")).strip()
@@ -142,6 +147,7 @@ class CostCenterSelector(QWidget):
             )
             it.setEditable(False)
             self.model.appendRow(it)
+        self.model.blockSignals(False)
         self.count_label.setText(
             f"{len(df):,} loaded · "
             f"{sum(1 for r in range(self.model.rowCount()) if self.model.item(r).checkState() == Qt.CheckState.Checked):,} selected"
