@@ -140,7 +140,7 @@ class AISettingsDialog(QDialog):
 
     def commit_secrets(self) -> None:
         cfg = self._collect()
-        key = self.api_key.text()
+        key = self.api_key.text().strip()
         if key:
             set_secret("AI", f"{cfg.provider}:{cfg.api_username}", key)
             self.api_key.clear()
@@ -150,7 +150,7 @@ class AISettingsDialog(QDialog):
 
     def _on_test(self) -> None:
         cfg = self._collect()
-        pw = self.api_key.text()
+        pw = self.api_key.text().strip()
         if pw:
             set_secret("AI", f"{cfg.provider}:{cfg.api_username}", pw)
         self.test_btn.setEnabled(False)

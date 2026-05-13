@@ -67,23 +67,28 @@ def load_invoiced_sales(
     ``cost_centers`` is empty so sample CCs (``'1xx'``) never leak into
     product-only views.
 
+    Closed historical months are served from the local invoice cache
+    (``app.storage.invoice_cache``); only the current calendar month is
+    fetched fresh from the warehouse.
+
     Adds derived columns:
     * ``invoice_date`` (datetime)
     * ``fiscal_year``, ``fiscal_period``, ``fiscal_period_name``
     """
-    cc_csv = ",".join(c for c in (cost_centers or ()) if c)
-    df = read_dataframe(
-        db,
-        queries.INVOICED_SALES_LINES,
-        params={
-            "start_yyyymmdd": int(start.strftime("%Y%m%d")),
-            "end_yyyymmdd": int(end.strftime("%Y%m%d")),
-            "cc_csv": cc_csv,
-            "code_prefix": (code_prefix or "").strip(),
-        },
-    )
-    if df.empty:
-        return df
+    from app.storage import invoice_cache
+
+    df = invoice_cache.get_for_range(db, start, end, code_prefix or "")
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+
+    # Apply optional CC filter post-fetch (cache stores all CCs for the prefix).
+    ccs = [str(c).strip() for c in (cost_centers or ()) if c]
+    if ccs:
+        df = df[df["cost_center"].astype(str).str.strip().isin(ccs)]
+        if df.empty:
+            return df
+
+    df = df.copy()
     df["invoice_date"] = pd.to_datetime(
         df["invoice_yyyymmdd"].astype("Int64").astype(str), format="%Y%m%d", errors="coerce"
     )

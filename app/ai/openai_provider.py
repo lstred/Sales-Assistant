@@ -17,9 +17,12 @@ class OpenAIProvider:
     name = "openai"
 
     def __init__(self, api_key: str, base_url: str = "") -> None:
-        if not api_key:
+        # Strip stray whitespace/newlines: a trailing \n inside a header value
+        # blows up at the httpx layer with LocalProtocolError.
+        clean = (api_key or "").strip()
+        if not clean:
             raise ValueError("OpenAI API key is required")
-        self._api_key = api_key
+        self._api_key = clean
         self._base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
 
     def _headers(self) -> dict[str, str]:

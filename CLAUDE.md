@@ -286,6 +286,37 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 Newest first.
 
+- **2026-05-13** — AI key fix, legacy-revenue gap, instant repeat loads:
+  - **`LocalProtocolError: Illegal header value …Bearer sk-proj-…\n`** —
+    a trailing newline in a paste-from-clipboard API key crashed httpx
+    when building the `Authorization` header. Fixed defensively in three
+    layers: `OpenAIProvider.__init__` strips whitespace before storing
+    the key; `AISettingsDialog.commit_secrets` and `_on_test` strip
+    before writing to keyring; `factory.build_provider` strips on read.
+    Existing bad keys are auto-recovered on next *Test connection*.
+  - **Legacy revenue was being silently truncated** by the inner JOIN
+    against `dbo.vw_CostCenterCLydeMRKCodeXREF` — any marketing code
+    without a CC mapping in that view was dropped from the blended
+    rolling-year totals. `OLD_SYSTEM_SALES` now `LEFT JOIN`s the XREF
+    and synthesises `cost_center = '0' + marketing_code` and
+    `cost_center_name = '(unmapped marketing code …)'` when no mapping
+    exists, so unmapped codes still flow through (and stay visible to
+    the manager so they can be properly mapped via the CC Mapping view).
+  - **Per-month invoice cache** — new `app/storage/invoice_cache.py`.
+    Invoiced lines (`INVOICE# > 0`) are immutable once posted, so any
+    closed historical month is now persisted in
+    `invoice_month_cache(year, month, code_prefix)` and served from
+    local SQLite on every subsequent load. Only the **current calendar
+    month** still hits the warehouse. CC filters are applied in pandas
+    after retrieval, so changing the CC selection on a previously-loaded
+    range is essentially free. `load_invoiced_sales` is the single entry
+    point that uses this; `load_blended_sales` benefits transparently.
+    `MainWindow._maybe_prompt_refresh` "Refresh from DB" and
+    `SalesFilterBar` "Refresh from DB" both wipe the month cache so a
+    forced refresh actually re-hits SQL Server.
+  - Added 2 tests (cache key includes prefix; immutable months served
+    from disk after first fetch). 13/13 pass.
+
 - **2026-05-13** — Product-CC enforcement + autoload fix:
   - **CC selector now actually autoloads.** `CostCenterSelector` accepted
     `autoload=True` but never invoked `reload()` — every screen showed

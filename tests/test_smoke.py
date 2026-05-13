@@ -133,3 +133,73 @@ def test_make_key_is_order_independent() -> None:
     a = sales_cache.make_key(date(2025, 1, 1), date(2025, 1, 31), ["011", "010"])
     b = sales_cache.make_key(date(2025, 1, 1), date(2025, 1, 31), ["010", "011"])
     assert a == b
+
+
+def test_make_key_includes_prefix() -> None:
+    from datetime import date
+    from app.storage import sales_cache
+    a = sales_cache.make_key(date(2025, 1, 1), date(2025, 1, 31), ["010"], "")
+    b = sales_cache.make_key(date(2025, 1, 1), date(2025, 1, 31), ["010"], "0")
+    assert a != b
+
+
+def test_invoice_cache_serves_immutable_months_from_disk(tmp_path, monkeypatch) -> None:
+    """Past months must be fetched from the warehouse exactly once,
+    then served from local SQLite forever."""
+    import pandas as pd
+    from datetime import date
+    monkeypatch.setattr(
+        "app.storage.invoice_cache.state_db_path",
+        lambda: tmp_path / "ic.sqlite",
+    )
+    from app.storage import invoice_cache
+
+    fetch_count = {"n": 0}
+
+    def fake_fetch(db, year, month, code_prefix):
+        fetch_count["n"] += 1
+        return pd.DataFrame([{
+            "invoice_yyyymmdd": year * 10000 + month * 100 + 15,
+            "account_number": "A1",
+            "cost_center": "010",
+            "salesperson_desc": "JANE",
+            "invoice_number": 1, "order_number": 1, "line_number": 1,
+            "revenue": 100.0, "gross_profit": 30.0,
+        }])
+
+    monkeypatch.setattr(invoice_cache, "_fetch_month", fake_fetch)
+
+    class _FrozenDate(date):
+        @classmethod
+        def today(cls):  # type: ignore[override]
+            return date(2026, 6, 1)
+
+    monkeypatch.setattr(invoice_cache, "date", _FrozenDate)
+
+    df1 = invoice_cache.get_for_range(None, date(2025, 1, 1), date(2025, 3, 31), "0")
+    assert len(df1) == 3            # one row per cached month
+    assert fetch_count["n"] == 3
+
+    df2 = invoice_cache.get_for_range(None, date(2025, 1, 1), date(2025, 3, 31), "0")
+    assert len(df2) == 3
+    assert fetch_count["n"] == 3    # no new warehouse calls
+
+    # Different prefix → separate cache slot, fresh fetches.
+    df3 = invoice_cache.get_for_range(None, date(2025, 1, 1), date(2025, 1, 31), "1")
+    assert len(df3) == 1
+    assert fetch_count["n"] == 4
+
+
+class _FrozenDate(date):
+    """Helper to monkey-patch ``invoice_cache.date.today()``."""
+
+    _fixed: date | None = None
+
+    def __new__(cls, fixed: date):
+        inst = date.__new__(cls, fixed.year, fixed.month, fixed.day)
+        inst._fixed = fixed
+        return inst
+
+    @classmethod
+    def today(cls):  # type: ignore[override]
+        return cls._fixed if cls._fixed is not None else date.today()

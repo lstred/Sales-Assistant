@@ -138,10 +138,17 @@ WHERE   o.[N_NOT_INVENTORY] = 'Y'
 """
 
 # ------------------------------------- old-system summarized sales (≤ go-live)
+# We LEFT JOIN to ``vw_CostCenterCLydeMRKCodeXREF`` so marketing codes that
+# aren't yet mapped to a new-system cost-center don't silently disappear from
+# blended revenue. Unmapped codes are surfaced under a synthetic CC of
+# ``'0' + marketing_code`` so they (a) still pass product-prefix filters and
+# (b) are visible to the user, who can then map them properly in CC Mapping.
 OLD_SYSTEM_SALES = """
 SELECT  LTRIM(RTRIM(h.[MarketingCode]))     AS marketing_code,
-        x.[CostCenter]                       AS cost_center,
-        x.[CostCenterName]                   AS cost_center_name,
+        ISNULL(x.[CostCenter], '0' + LTRIM(RTRIM(h.[MarketingCode])))
+                                             AS cost_center,
+        ISNULL(x.[CostCenterName], '(unmapped marketing code ' + LTRIM(RTRIM(h.[MarketingCode])) + ')')
+                                             AS cost_center_name,
         h.[FiscalYear]                       AS fiscal_year,
         LTRIM(RTRIM(h.[CustomerNumber]))     AS old_customer_number,
         LTRIM(RTRIM(bt.[BACCT#]))            AS account_number,
@@ -156,7 +163,7 @@ SELECT  LTRIM(RTRIM(h.[MarketingCode]))     AS marketing_code,
         h.[CostsPeriod10], h.[CostsPeriod11], h.[CostsPeriod12],
         h.[TotalSales], h.[TotalCost], h.[Profit]
 FROM    dbo.ClydeMarketingHistory AS h
-JOIN    dbo.vw_CostCenterCLydeMRKCodeXREF AS x
+LEFT JOIN dbo.vw_CostCenterCLydeMRKCodeXREF AS x
     ON  LTRIM(RTRIM(x.[ClydeMarketingCode])) = LTRIM(RTRIM(h.[MarketingCode]))
 LEFT JOIN dbo.BILLTO AS bt
     ON  LTRIM(RTRIM(bt.[BBANK2])) = LTRIM(RTRIM(h.[CustomerNumber]))

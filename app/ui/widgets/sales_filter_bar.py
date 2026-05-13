@@ -272,6 +272,13 @@ class SalesFilterBar(QFrame):
         self.status.setText(f"Loading {s} → {e} for {scope}…")
         self.run_btn.setEnabled(False)
         self.refresh_btn.setEnabled(False)
+        if force_refresh:
+            # Wipe per-month invoice cache too so the warehouse is hit fresh.
+            try:
+                from app.storage import invoice_cache
+                invoice_cache.clear_all()
+            except Exception:  # noqa: BLE001
+                pass
         self.run_requested.emit(s, e, ccs)
 
         sw = list(self._cfg.fiscal.six_week_january_years) if self._cfg else []
