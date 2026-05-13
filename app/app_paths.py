@@ -1,12 +1,12 @@
 """Resolved filesystem paths for application data.
 
-All persistent app data lives under ``%APPDATA%\\SalesAssistant\\`` so the
-.exe build doesn't need write access to its install directory.
+Persistent app data lives under ``Documents\\SalesAssistant\\`` so the
+.exe build doesn't need write access to its install directory and so the
+folder isn't subject to managed-IT cleanup of unknown ``%APPDATA%`` folders.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 APP_FOLDER_NAME = "SalesAssistant"
@@ -14,8 +14,7 @@ APP_FOLDER_NAME = "SalesAssistant"
 
 def appdata_dir() -> Path:
     """Return the per-user application data directory, creating it if needed."""
-    base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-    path = Path(base) / APP_FOLDER_NAME
+    path = Path.home() / "Documents" / APP_FOLDER_NAME
     path.mkdir(parents=True, exist_ok=True)
     return path
 

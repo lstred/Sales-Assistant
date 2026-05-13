@@ -77,3 +77,10 @@ desktop.ini
 out/
 output/
 exports/
+
+.appdata/
+_out.log
+_diag*.py
+_pyw*.log
+_launch.log
+
