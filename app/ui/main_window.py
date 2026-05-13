@@ -22,6 +22,7 @@ from app.ui.dialogs.email_settings_dialog import EmailSettingsDialog
 from app.ui.views.ai_chat_view import AIChatView
 from app.ui.views.cc_mapping_view import CCMappingView
 from app.ui.views.conversations_view import ConversationsView
+from app.ui.views.core_displays_view import CoreDisplaysView
 from app.ui.views.dashboard_view import DashboardView
 from app.ui.views.fiscal_calendar_view import FiscalCalendarView
 from app.ui.views.reps_view import RepsView
@@ -42,6 +43,7 @@ NAV_ITEMS = [
     ("ai_chat",       "Ask the AI"),
     ("weekly_email",  "Weekly Email"),
     ("cc_mapping",    "CC Mapping"),
+    ("core_displays", "Core Displays"),
     ("fiscal",        "Fiscal Calendar"),
     ("settings",      "Settings"),
 ]
@@ -107,6 +109,7 @@ class MainWindow(QMainWindow):
         self.ai_chat_view = AIChatView(self._cfg, get_db=lambda: self._cfg.database)
         self.weekly_email_view = WeeklyEmailView(self._cfg, get_db=lambda: self._cfg.database)
         self.cc_mapping_view = CCMappingView(self._cfg, get_db=lambda: self._cfg.database)
+        self.core_displays_view = CoreDisplaysView(self._cfg, get_db=lambda: self._cfg.database)
         self.fiscal_view = FiscalCalendarView(self._cfg)
         self.settings_view = SettingsView()
         self.settings_view.open_db.connect(self._open_db_dialog)
@@ -122,6 +125,7 @@ class MainWindow(QMainWindow):
             "ai_chat":       self.ai_chat_view,
             "weekly_email":  self.weekly_email_view,
             "cc_mapping":    self.cc_mapping_view,
+            "core_displays": self.core_displays_view,
             "fiscal":        self.fiscal_view,
             "settings":      self.settings_view,
         }

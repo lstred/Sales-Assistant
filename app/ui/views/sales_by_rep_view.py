@@ -67,8 +67,7 @@ class SalesByRepView(QWidget):
             self._set_kpis(0, 0, 0, 0)
             return
         rep = (
-            df.assign(rep_label=lambda d: d["salesperson_number"].fillna("") + " — "
-                       + d["salesperson_desc"].fillna(""))
+            df.assign(rep_label=lambda d: d["salesperson_desc"].fillna("(unassigned)").replace("", "(unassigned)"))
               .groupby("rep_label", as_index=False)
               .agg(revenue=("revenue", "sum"),
                    gross_profit=("gross_profit", "sum"),

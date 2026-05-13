@@ -117,8 +117,8 @@ class WeeklyEmailView(QWidget):
         self.list.clear()
 
         df = self._df.copy()
-        df["rep_key"] = df["salesperson_number"].fillna("").astype(str).str.strip()
         df["rep_name"] = df["salesperson_desc"].fillna("").astype(str).str.strip()
+        df["rep_key"] = df["rep_name"]
         # Group by rep
         for rep_key, rep_df in df.groupby("rep_key"):
             if not rep_key:

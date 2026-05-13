@@ -286,6 +286,29 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 Newest first.
 
+- **2026-05-13** — Bugfix + feature round (running-app feedback):
+  - **DB error fix**: removed non-existent `o.[SALESPERSON]` column from
+    `INVOICED_SALES_LINES` and `OPEN_ORDERS_LINES`. The warehouse only
+    exposes `o.[SALESPERSON_DESC]`; the rep number lives in
+    `BILLSLMN.BSSLMN` and is joined separately when needed. Updated
+    `sales_by_rep_view` and `weekly_email_view` to group by
+    `salesperson_desc` only.
+  - **CC duplicates fix**: `vw_CostCenterCLydeMRKCodeXREF` returns one
+    row per (CC × ClydeMarketingCode) — previously surfaced 137 rows for
+    23 CCs. `COST_CENTER_XREF` now `GROUP BY cost_center` so each CC
+    appears exactly once. The CC selector and CC Mapping view also dedupe
+    defensively before rendering.
+  - **CC Mapping reworked**: now lists *all* cost centers (not just
+    "starts-with-1"), with a search box, *Show only unmapped* toggle,
+    parent-name preview column, save/load round-trip into
+    `AppConfig.sample_to_product_cc`. Empty-state card explains where the
+    data comes from when the warehouse returns nothing.
+  - **New view: Core Displays**: assign one or more cost centers to each
+    display (`CLASSES.CLCAT='DT'`). Persists in
+    `AppConfig.core_displays_by_cc`. Master/detail layout — pick a
+    display row, tick the cost centers that consider it core. Auto-loads
+    on first show.
+
 - **2026-05-13** — Polish round (UX feedback from running app):
   - **SQL data quality**: `INVOICED_SALES_LINES` now also requires
     `TRY_CONVERT(int, [ORDER#]) > 0` (orders with blank/zero `ORDER#` are

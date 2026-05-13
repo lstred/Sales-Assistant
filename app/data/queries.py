@@ -11,12 +11,18 @@ Conventions:
 
 # ----------------------------------------------------------------- cost centers
 COST_CENTER_XREF = """
-SELECT  LTRIM(RTRIM([CostCenter]))         AS cost_center,
-        LTRIM(RTRIM([CostCenterName]))     AS cost_center_name,
-        LTRIM(RTRIM([ClydeMarketingCode])) AS clyde_marketing_code
-FROM    dbo.vw_CostCenterCLydeMRKCodeXREF
-WHERE   ISNULL(LTRIM(RTRIM([CostCenter])), '') <> ''
-ORDER BY [CostCenter]
+SELECT  cost_center,
+        MAX(cost_center_name) AS cost_center_name,
+        MAX(clyde_marketing_code) AS clyde_marketing_code
+FROM (
+    SELECT  LTRIM(RTRIM([CostCenter]))         AS cost_center,
+            LTRIM(RTRIM([CostCenterName]))     AS cost_center_name,
+            LTRIM(RTRIM([ClydeMarketingCode])) AS clyde_marketing_code
+    FROM    dbo.vw_CostCenterCLydeMRKCodeXREF
+    WHERE   ISNULL(LTRIM(RTRIM([CostCenter])), '') <> ''
+) t
+GROUP BY cost_center
+ORDER BY cost_center
 """
 
 # ----------------------------------------------------------------- reps roster
@@ -64,7 +70,6 @@ INVOICED_SALES_LINES = """
 SELECT  TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD])         AS invoice_yyyymmdd,
         LTRIM(RTRIM(o.[ACCOUNT#I]))                          AS account_number,
         LTRIM(RTRIM(i.[ICCTR]))                              AS cost_center,
-        LTRIM(RTRIM(o.[SALESPERSON]))                        AS salesperson_number,
         LTRIM(RTRIM(o.[SALESPERSON_DESC]))                   AS salesperson_desc,
         TRY_CONVERT(int, o.[INVOICE#])                       AS invoice_number,
         TRY_CONVERT(int, o.[ORDER#])                         AS order_number,
@@ -91,7 +96,6 @@ OPEN_ORDERS_LINES = """
 SELECT  TRY_CONVERT(int, o.[ORDER_ENTRY_DATE_YYYYMMDD])     AS order_entry_yyyymmdd,
         LTRIM(RTRIM(o.[ACCOUNT#I]))                          AS account_number,
         LTRIM(RTRIM(i.[ICCTR]))                              AS cost_center,
-        LTRIM(RTRIM(o.[SALESPERSON]))                        AS salesperson_number,
         LTRIM(RTRIM(o.[SALESPERSON_DESC]))                   AS salesperson_desc,
         TRY_CONVERT(int, o.[ORDER#])                         AS order_number,
         TRY_CONVERT(int, o.[LINE#I])                         AS line_number,

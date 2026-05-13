@@ -1,8 +1,14 @@
-"""Sample-to-Product cost-center mapping editor.
+"""Cost-Center Mapping editor.
 
-Sample CCs (codes starting with ``'1'``) are mapped to product CCs (codes
-starting with ``'0'``) so that sample expenses can be attributed back to
-their sponsoring product line.
+The original convention was "sample CCs start with ``1`` and map to product
+CCs that start with ``0``", but in the live ``NRF_REPORTS`` warehouse no
+codes start with ``1``. To keep this screen useful, we let the manager pick
+**any** cost center and assign it to a parent (product) cost center — the
+mapping persists in :class:`AppConfig.sample_to_product_cc`.
+
+A **Show only unmapped** filter keeps the editor focused; a search box keeps
+it scannable; auto-loads on first show; clear empty-state guidance when no
+data is available.
 """
 
 from __future__ import annotations
@@ -12,11 +18,13 @@ from typing import Callable
 import pandas as pd
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QPushButton,
     QStackedWidget,
     QTableWidget,
@@ -61,10 +69,10 @@ class CCMappingView(QWidget):
 
         root.addWidget(
             ViewHeader(
-                "Sample → Product Cost Center Mapping",
-                "Sample cost centers (codes starting with 1) are linked to their "
-                "sponsoring product cost centers (codes starting with 0). "
-                "Used to attribute sample expense back to the right product line.",
+                "Cost Center Mapping",
+                "Assign any cost center to a parent product cost center. "
+                "Used to roll up sample / sub-line spending back to the "
+                "product line that sponsors it.",
             )
         )
 
@@ -76,50 +84,58 @@ class CCMappingView(QWidget):
         self.save_btn.clicked.connect(self._save)
         controls.addWidget(self.refresh_btn)
         controls.addWidget(self.save_btn)
-        controls.addStretch(1)
-        self.status = QLabel("Press Reload to populate.")
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Filter by code or name…")
+        self.search.textChanged.connect(self._populate)
+        controls.addWidget(self.search, 1)
+
+        self.unmapped_only = QCheckBox("Show only unmapped")
+        self.unmapped_only.toggled.connect(self._populate)
+        controls.addWidget(self.unmapped_only)
+
+        self.status = QLabel("Loading…")
         self.status.setStyleSheet(f"color: {TEXT_MUTED};")
         controls.addWidget(self.status)
         root.addLayout(controls)
 
-        self.table = QTableWidget(0, 3, self)
-        self.table.setHorizontalHeaderLabels(["Sample CC", "Sample Name", "Maps to Product CC"])
+        self.table = QTableWidget(0, 4, self)
+        self.table.setHorizontalHeaderLabels(
+            ["Cost Center", "Name", "Maps to (Parent CC)", "Parent Name"]
+        )
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.table.setAlternatingRowColors(True)
 
-        # Empty-state card shown when there are no sample CCs to map.
+        # Empty-state card
         self.empty_state = QFrame()
         self.empty_state.setObjectName("card")
         es = QVBoxLayout(self.empty_state)
         es.setContentsMargins(28, 28, 28, 28)
         es.setSpacing(10)
-        es_title = QLabel("Nothing to map yet")
-        es_title.setStyleSheet("font-size: 16px; font-weight: 600;")
-        es_body = QLabel(
-            "Sample cost centers are codes that begin with <b>1</b> (for "
-            "example <code>110</code>, <code>120</code>); product cost "
-            "centers begin with <b>0</b> (for example <code>010</code>).<br><br>"
-            "Press <b>Reload from database</b> to pull the current cost-center "
-            "list from <i>NRF_REPORTS</i>. If no sample CCs appear, none have "
-            "been set up yet — confirm the convention with the warehouse team "
-            "or use the search filter on a sales screen to verify which codes "
-            "exist."
+        title = QLabel("No cost centers loaded")
+        title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        body = QLabel(
+            "Cost centers come from <code>vw_CostCenterCLydeMRKCodeXREF</code> "
+            "in <i>NRF_REPORTS</i>. Press <b>Reload from database</b> to "
+            "populate this list. If your database connection isn't configured "
+            "yet, set it up in <b>Settings → Database</b>."
         )
-        es_body.setWordWrap(True)
-        es_body.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 13px;")
-        es.addWidget(es_title)
-        es.addWidget(es_body)
+        body.setWordWrap(True)
+        body.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 13px;")
+        es.addWidget(title)
+        es.addWidget(body)
         es.addStretch(1)
 
         self.stack = QStackedWidget()
-        self.stack.addWidget(self.empty_state)  # index 0
-        self.stack.addWidget(self.table)        # index 1
+        self.stack.addWidget(self.empty_state)
+        self.stack.addWidget(self.table)
         root.addWidget(self.stack, 1)
 
-        # Auto-load on first show so the screen is never blank.
         QTimer.singleShot(0, self._reload)
 
     # --------------------------------------------------------------- actions
@@ -132,6 +148,12 @@ class CCMappingView(QWidget):
         self._loader.start()
 
     def _on_loaded(self, df: pd.DataFrame) -> None:
+        df = (
+            df.assign(cost_center=lambda d: d["cost_center"].astype(str).str.strip())
+              .sort_values("cost_center")
+              .drop_duplicates(subset=["cost_center"])
+              .reset_index(drop=True)
+        )
         self._df = df
         self.refresh_btn.setEnabled(True)
         self._populate()
@@ -139,45 +161,74 @@ class CCMappingView(QWidget):
     def _on_failed(self, msg: str) -> None:
         self.refresh_btn.setEnabled(True)
         self.status.setText(f"Failed — {msg}")
+        self.stack.setCurrentIndex(0)
 
     def _populate(self) -> None:
-        if self._df is None:
-            return
-        codes = self._df["cost_center"].astype(str).str.strip()
-        names = self._df["cost_center_name"].astype(str).fillna("").str.strip()
-
-        sample_mask = codes.str.startswith("1")
-        product_codes = sorted(c for c in codes[codes.str.startswith("0")].tolist() if c)
-
-        sample_rows = self._df[sample_mask].sort_values("cost_center").reset_index(drop=True)
-        if len(sample_rows) == 0:
-            sample_first = codes.head(8).tolist()
-            self.status.setText(
-                f"No sample CCs (codes starting with '1') in {len(codes):,} cost "
-                f"centers loaded. First few codes: {sample_first}"
-            )
+        if self._df is None or self._df.empty:
             self.stack.setCurrentIndex(0)
+            self.status.setText("No cost centers.")
             return
 
         self.stack.setCurrentIndex(1)
-        self.table.setRowCount(len(sample_rows))
-        for r, row in sample_rows.iterrows():
-            code = str(row["cost_center"]).strip()
-            name = str(row.get("cost_center_name", "")).strip()
+        df = self._df
+        codes = df["cost_center"].tolist()
+        names_by_code = dict(zip(df["cost_center"], df["cost_center_name"].fillna("")))
+
+        needle = self.search.text().strip().lower()
+        unmapped_only = self.unmapped_only.isChecked()
+        mapping = self._cfg.sample_to_product_cc
+
+        rows: list[tuple[str, str]] = []
+        for code in codes:
+            name = names_by_code.get(code, "")
+            mapped = mapping.get(code, "")
+            if unmapped_only and mapped:
+                continue
+            hay = f"{code} {name}".lower()
+            if needle and needle not in hay:
+                continue
+            rows.append((code, name))
+
+        self.table.setRowCount(len(rows))
+        for r, (code, name) in enumerate(rows):
             self.table.setItem(r, 0, _ro(code))
             self.table.setItem(r, 1, _ro(name))
             cb = QComboBox()
             cb.addItem("(unassigned)", "")
-            for pc in product_codes:
-                cb.addItem(pc, pc)
-            current = self._cfg.sample_to_product_cc.get(code, "")
+            for pc in codes:
+                if pc == code:
+                    continue
+                pc_name = names_by_code.get(pc, "")
+                cb.addItem(f"{pc} — {pc_name}" if pc_name else pc, pc)
+            current = mapping.get(code, "")
             idx = cb.findData(current)
             cb.setCurrentIndex(idx if idx >= 0 else 0)
+            cb.currentIndexChanged.connect(
+                lambda _i, row=r: self._update_parent_name(row)
+            )
             self.table.setCellWidget(r, 2, cb)
-        self.status.setText(f"{len(sample_rows)} sample CCs · {len(product_codes)} product CCs available.")
+            self.table.setItem(r, 3, _ro(names_by_code.get(current, "")))
+
+        mapped_count = sum(1 for c in codes if mapping.get(c))
+        self.status.setText(
+            f"{len(codes)} cost center(s) · {mapped_count} mapped · "
+            f"showing {len(rows)}"
+        )
+
+    def _update_parent_name(self, row: int) -> None:
+        cb = self.table.cellWidget(row, 2)
+        if cb is None or self._df is None:
+            return
+        target = (cb.currentData() or "").strip()
+        names_by_code = dict(zip(
+            self._df["cost_center"].astype(str), self._df["cost_center_name"].fillna("")
+        ))
+        self.table.setItem(row, 3, _ro(names_by_code.get(target, "")))
 
     def _save(self) -> None:
-        mapping: dict[str, str] = {}
+        if self._df is None:
+            return
+        mapping = dict(self._cfg.sample_to_product_cc)
         for r in range(self.table.rowCount()):
             code_item = self.table.item(r, 0)
             cb = self.table.cellWidget(r, 2)
@@ -185,11 +236,13 @@ class CCMappingView(QWidget):
                 continue
             code = code_item.text().strip()
             target = (cb.currentData() or "").strip()
-            if code and target:
+            if target:
                 mapping[code] = target
+            else:
+                mapping.pop(code, None)
         self._cfg.sample_to_product_cc = mapping
         save_config(self._cfg)
-        self.status.setText(f"Saved {len(mapping)} mapping(s).")
+        self.status.setText(f"Saved · {len(mapping)} mapping(s) total.")
 
 
 def _ro(text: str) -> QTableWidgetItem:
