@@ -286,6 +286,64 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 Newest first.
 
+- **2026-05-13** — Empty-Dashboard / partial-sales / sample-CC fixes:
+  - **Blended sales loader**: new `load_blended_sales(db, start, end, ccs,
+    six_week_jan_years)` in `app/data/loaders.py`. For dates ≥
+    `NEW_SYSTEM_CUTOFF` (`2025-08-04`) it pulls line-level invoiced sales
+    from `_ORDERS`; for dates before the cutoff it falls back to the
+    summarized `dbo.ClydeMarketingHistory` table, unpivoting
+    `SalesPeriod1..12` / `CostsPeriod1..12` into one row per (account ×
+    cost center × fiscal period). Legacy rows have no rep attribution and
+    are tagged `salesperson_desc = "(legacy / pre-Aug 2025)"`. The new
+    `data_source` column is either `"new"` or `"legacy"`. Fixes the
+    "all sales views show ~$100M instead of ~$180M" complaint —
+    historical pre-cutoff portion of the rolling-year window is now
+    included.
+  - **`SalesFilterBar` switched to blended loader**: every screen that
+    uses it (Sales by Rep, Sales by CC, Weekly Email, Ask the AI)
+    now sees blended totals. **"Also load prior year"** is on by default
+    and now shifts the range exactly one calendar year back (handles
+    leap-day) so YoY columns make sense even when the prior range
+    crosses the cutoff.
+  - **All cost centers in selectors**: new SQL `ALL_COST_CENTERS` (from
+    `dbo.ITEM.[ICCTR]`, left-joined to the XREF view for friendly names)
+    and loader `load_all_cost_centers`. Both `CostCenterSelector` (used
+    by `SalesFilterBar`) and `CCMappingView` now use this — sample CCs
+    that start with `'1'` are surfaced and the *Maps to (Parent CC)*
+    dropdown contains every code, not just the 23 from the XREF view.
+    Empty-state copy in CC Mapping updated to mention `dbo.ITEM`.
+  - **Vs prior year columns**: `SalesByRepView` and
+    `SalesByCostCenterView` now subscribe to
+    `sales_loaded_with_prior(current, prior)` instead of the legacy
+    `sales_loaded(current)`. Each surfaces a `prior_revenue` column and a
+    `yoy_pct` column (Δ% vs prior year). When prior data is missing the
+    columns are blank.
+  - **Dashboard populated**: `DashboardView` now accepts `cfg` + `get_db`,
+    runs a `_DashboardLoader` `QThread` on first show, and shows real
+    KPIs — Last full fiscal month revenue (blended), YTD revenue
+    (blended), Open orders ($) + line count, and Active reps (distinct
+    `salesperson_desc` over the last 90 days). A *Refresh* button reruns
+    the load. Conversation / action-item / needs-review cards remain
+    `0` until those features land. `KpiCard.set_caption()` added so the
+    card sub-text can be updated post-load (e.g., "FY27 P3 · April").
+
+- **2026-05-13** — Invisible-window / pythonw fix:
+  - **App data path moved** to `~\Documents\SalesAssistant` because a
+    managed-IT policy was silently deleting any new file under
+    `%APPDATA%\SalesAssistant` ~1s after process exit (verified by
+    writing test files to several alternate paths — only the original
+    `%APPDATA%\SalesAssistant` lost them). `app/app_paths.py` now uses
+    `Path.home() / "Documents" / "SalesAssistant"`.
+  - **pythonw-safe logging**: `_configure_logging` skips the
+    `StreamHandler(sys.stderr)` when `sys.stderr is None` (the
+    pythonw.exe case), uses `logging.basicConfig(force=True)`, and
+    installs a `sys.excepthook` so unhandled exceptions land in the
+    log. The original silent crash was traceable to
+    `StreamHandler(sys.stderr)` raising on `None` before `MainWindow.show()`.
+  - `MainWindow.show()` now also calls `raise_()` and
+    `activateWindow()`, and logs the post-show
+    `isVisible()` state for diagnosis.
+
 - **2026-05-13** — Bugfix + feature round (running-app feedback):
   - **DB error fix**: removed non-existent `o.[SALESPERSON]` column from
     `INVOICED_SALES_LINES` and `OPEN_ORDERS_LINES`. The warehouse only

@@ -34,3 +34,7 @@ class KpiCard(QFrame):
         if caption:
             self._caption.setText(caption)
             self._caption.setVisible(True)
+
+    def set_caption(self, caption: str) -> None:
+        self._caption.setText(caption)
+        self._caption.setVisible(bool(caption))

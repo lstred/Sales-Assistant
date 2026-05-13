@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Iterable
 
 import pandas as pd
@@ -11,15 +11,31 @@ from app.config.models import DatabaseConfig
 from app.data import queries
 from app.data.db import read_dataframe
 from app.services.fiscal_calendar import (
+    build_fiscal_year,
     fiscal_year_for as _fy_for,
     period_for_invoice_yyyymmdd,
 )
 
+# First day the new system (dbo._ORDERS) became the source of truth for
+# invoiced sales. Anything before this date lives only in the legacy
+# ``ClydeMarketingHistory`` summarized table.
+NEW_SYSTEM_CUTOFF: date = date(2025, 8, 4)
+LEGACY_REP_LABEL: str = "(legacy / pre-Aug 2025)"
+
 
 # ----------------------------------------------------------------- references
 def load_cost_centers(db: DatabaseConfig) -> pd.DataFrame:
-    """Cost-center reference (new code, name, old marketing code)."""
+    """Cost-center reference (XREF view — only mapped product CCs)."""
     return read_dataframe(db, queries.COST_CENTER_XREF)
+
+
+def load_all_cost_centers(db: DatabaseConfig) -> pd.DataFrame:
+    """Master cost-center list from ``dbo.ITEM`` (includes sample ``1xx``
+    CCs). Falls back to the XREF view if ITEM is empty for any reason."""
+    df = read_dataframe(db, queries.ALL_COST_CENTERS)
+    if df is None or df.empty:
+        return load_cost_centers(db)
+    return df
 
 
 def load_reps(db: DatabaseConfig) -> pd.DataFrame:
@@ -89,6 +105,132 @@ def load_old_sales(
         queries.OLD_SYSTEM_SALES,
         params={"fy_start": fy_start, "fy_end": fy_end},
     )
+
+
+def load_blended_sales(
+    db: DatabaseConfig,
+    start: date,
+    end: date,
+    cost_centers: Iterable[str] | None = None,
+    six_week_january_years: Iterable[int] = (),
+) -> pd.DataFrame:
+    """Sales between ``start`` and ``end`` blended across both systems.
+
+    For dates ``>= NEW_SYSTEM_CUTOFF`` (2025-08-04) we use line-level
+    invoiced sales from ``dbo._ORDERS``. For dates before the cutoff we
+    fall back to the summarized ``dbo.ClydeMarketingHistory`` table,
+    unpivoting its 12 monthly columns into one row per
+    (account × cost center × fiscal period). Legacy rows have no rep
+    attribution and are tagged with :data:`LEGACY_REP_LABEL`.
+
+    Returns a DataFrame with these columns (always present):
+    ``invoice_date``, ``fiscal_year``, ``fiscal_period``,
+    ``fiscal_period_name``, ``account_number``, ``cost_center``,
+    ``salesperson_desc``, ``revenue``, ``gross_profit``,
+    ``invoice_number``, ``data_source``.
+    """
+    parts: list[pd.DataFrame] = []
+
+    # New-system portion
+    new_start = max(start, NEW_SYSTEM_CUTOFF)
+    if new_start <= end:
+        new_df = load_invoiced_sales(db, new_start, end, cost_centers)
+        if new_df is not None and not new_df.empty:
+            new_df = new_df.copy()
+            new_df["data_source"] = "new"
+            parts.append(new_df)
+
+    # Legacy portion (everything before the cutoff in the requested range)
+    if start < NEW_SYSTEM_CUTOFF:
+        legacy_end = min(end, NEW_SYSTEM_CUTOFF - timedelta(days=1))
+        fy_start = _fy_for(start)
+        fy_end = _fy_for(legacy_end)
+        try:
+            old_raw = load_old_sales(db, fy_start, fy_end)
+        except Exception:  # noqa: BLE001
+            old_raw = pd.DataFrame()
+        if old_raw is not None and not old_raw.empty:
+            legacy = _unpivot_old_sales(
+                old_raw, start, legacy_end, cost_centers, six_week_january_years
+            )
+            if not legacy.empty:
+                legacy["data_source"] = "legacy"
+                parts.append(legacy)
+
+    cols = [
+        "invoice_date", "fiscal_year", "fiscal_period", "fiscal_period_name",
+        "account_number", "cost_center", "salesperson_desc",
+        "revenue", "gross_profit", "invoice_number", "data_source",
+    ]
+    if not parts:
+        return pd.DataFrame(columns=cols)
+    parts = [p.reindex(columns=cols) for p in parts]
+    out = pd.concat(parts, ignore_index=True)
+    # Ensure numeric dtypes for downstream aggregations
+    for c in ("revenue", "gross_profit"):
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+    return out
+
+
+def _unpivot_old_sales(
+    raw: pd.DataFrame,
+    start: date,
+    end: date,
+    cost_centers: Iterable[str] | None,
+    six_week_january_years: Iterable[int],
+) -> pd.DataFrame:
+    """Unpivot ``ClydeMarketingHistory`` SalesPeriod1..12 / CostsPeriod1..12
+    columns into one row per (account × cost center × fiscal period) within
+    the requested date window."""
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    df = raw.copy()
+    df["cost_center"] = df["cost_center"].astype(str).str.strip()
+    df["account_number"] = df["account_number"].fillna("").astype(str).str.strip()
+
+    if cost_centers:
+        wanted = {str(c).strip() for c in cost_centers if c}
+        if wanted:
+            df = df[df["cost_center"].isin(wanted)]
+    if df.empty:
+        return df
+
+    # Pre-build period boundaries per (fiscal_year) so we don't recompute.
+    sw = list(six_week_january_years or ())
+    fy_periods: dict[int, list] = {}
+    for fy in df["fiscal_year"].dropna().astype(int).unique():
+        fy_periods[int(fy)] = build_fiscal_year(int(fy), sw)
+
+    rows = []
+    for rec in df.to_dict("records"):
+        fy = int(rec.get("fiscal_year") or 0)
+        if fy not in fy_periods:
+            continue
+        cc = rec.get("cost_center") or ""
+        acct = rec.get("account_number") or ""
+        for i in range(1, 13):
+            rev = rec.get(f"SalesPeriod{i}") or 0
+            cost = rec.get(f"CostsPeriod{i}") or 0
+            if not rev and not cost:
+                continue
+            p = fy_periods[fy][i - 1]
+            if p.end < start or p.start > end:
+                continue
+            rev_f = float(rev or 0)
+            cost_f = float(cost or 0)
+            rows.append({
+                "invoice_date": pd.Timestamp(p.start),
+                "fiscal_year": fy,
+                "fiscal_period": p.period,
+                "fiscal_period_name": p.name,
+                "account_number": acct,
+                "cost_center": cc,
+                "salesperson_desc": LEGACY_REP_LABEL,
+                "revenue": rev_f,
+                "gross_profit": rev_f - cost_f,
+                "invoice_number": None,
+            })
+    return pd.DataFrame(rows)
 
 
 def load_open_orders(

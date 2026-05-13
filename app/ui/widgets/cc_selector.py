@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.config.models import DatabaseConfig
-from app.data.loaders import load_cost_centers
+from app.data.loaders import load_all_cost_centers
 from app.ui.theme import TEXT_MUTED
 
 
@@ -42,7 +42,7 @@ class _CCLoader(QThread):
 
     def run(self) -> None:  # noqa: D401
         try:
-            self.loaded.emit(load_cost_centers(self._db))
+            self.loaded.emit(load_all_cost_centers(self._db))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 

@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 
 from app.config.models import AppConfig, DatabaseConfig
 from app.config.store import save_config
-from app.data.loaders import load_cost_centers
+from app.data.loaders import load_all_cost_centers
 from app.ui.theme import TEXT_MUTED
 from app.ui.views._header import ViewHeader
 
@@ -50,7 +50,7 @@ class _CCLoader(QThread):
 
     def run(self) -> None:
         try:
-            self.loaded.emit(load_cost_centers(self._db))
+            self.loaded.emit(load_all_cost_centers(self._db))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"{type(exc).__name__}: {exc}")
 
@@ -120,10 +120,12 @@ class CCMappingView(QWidget):
         title = QLabel("No cost centers loaded")
         title.setStyleSheet("font-size: 16px; font-weight: 600;")
         body = QLabel(
-            "Cost centers come from <code>vw_CostCenterCLydeMRKCodeXREF</code> "
-            "in <i>NRF_REPORTS</i>. Press <b>Reload from database</b> to "
-            "populate this list. If your database connection isn't configured "
-            "yet, set it up in <b>Settings → Database</b>."
+            "Cost centers come from <code>dbo.ITEM.[ICCTR]</code> in "
+            "<i>NRF_REPORTS</i> (master list — includes sample <code>1xx</code> "
+            "codes), with friendly names from <code>vw_CostCenterCLydeMRKCodeXREF</code>. "
+            "Press <b>Reload from database</b> to populate this list. If your "
+            "database connection isn't configured yet, set it up in "
+            "<b>Settings → Database</b>."
         )
         body.setWordWrap(True)
         body.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 13px;")

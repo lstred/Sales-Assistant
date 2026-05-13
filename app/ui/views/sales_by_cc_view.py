@@ -45,7 +45,7 @@ class SalesByCostCenterView(QWidget):
         body = QHBoxLayout()
         body.setSpacing(12)
         self.filter_bar = SalesFilterBar(get_db, cfg=cfg)
-        self.filter_bar.sales_loaded.connect(self._on_loaded)
+        self.filter_bar.sales_loaded_with_prior.connect(self._on_loaded_with_prior)
         body.addWidget(self.filter_bar)
 
         self.model = PandasModel()
@@ -59,24 +59,38 @@ class SalesByCostCenterView(QWidget):
         body.addWidget(self.table, 1)
         root.addLayout(body, 1)
 
-    def _on_loaded(self, df: pd.DataFrame) -> None:
+    def _on_loaded_with_prior(self, df: pd.DataFrame, prior: pd.DataFrame | None) -> None:
         if df is None or df.empty:
             self.model.set_dataframe(pd.DataFrame())
             self._set_kpis(0, 0, 0, 0)
             return
         cc = (
-            df.groupby(["cost_center", "fiscal_year", "fiscal_period", "fiscal_period_name"], as_index=False)
+            df.groupby("cost_center", as_index=False)
               .agg(revenue=("revenue", "sum"),
                    gross_profit=("gross_profit", "sum"),
                    invoice_lines=("invoice_number", "count"),
                    accounts=("account_number", pd.Series.nunique))
-              .sort_values(["cost_center", "fiscal_year", "fiscal_period"])
+              .sort_values("revenue", ascending=False)
         )
-        cc["gp_pct"] = (cc["gross_profit"] / cc["revenue"] * 100).round(1)
-        cc = cc[[
-            "cost_center", "fiscal_year", "fiscal_period", "fiscal_period_name",
-            "revenue", "gross_profit", "gp_pct", "invoice_lines", "accounts",
-        ]]
+        cc["gp_pct"] = (cc["gross_profit"] / cc["revenue"].replace(0, pd.NA) * 100).round(1)
+
+        if prior is not None and not prior.empty:
+            prior_cc = (
+                prior.groupby("cost_center", as_index=False)
+                     .agg(prior_revenue=("revenue", "sum"))
+            )
+            cc = cc.merge(prior_cc, on="cost_center", how="left")
+            denom = cc["prior_revenue"].replace(0, pd.NA)
+            cc["yoy_pct"] = ((cc["revenue"] - cc["prior_revenue"]) / denom * 100).round(1)
+            cc = cc[[
+                "cost_center", "revenue", "prior_revenue", "yoy_pct",
+                "gross_profit", "gp_pct", "invoice_lines", "accounts",
+            ]]
+        else:
+            cc = cc[[
+                "cost_center", "revenue", "gross_profit", "gp_pct",
+                "invoice_lines", "accounts",
+            ]]
         self.model.set_dataframe(cc)
         self._set_kpis(
             float(df["revenue"].sum() or 0),

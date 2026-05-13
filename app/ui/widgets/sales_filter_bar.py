@@ -14,7 +14,7 @@ UX rules baked in here so every screen behaves the same:
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Callable
 
 from PySide6.QtCore import QDate, QThread, Signal
@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
 import pandas as pd
 
 from app.config.models import AppConfig, DatabaseConfig
-from app.data.loaders import load_invoiced_sales
+from app.data.loaders import load_blended_sales
 from app.services.fiscal_calendar import (
     last_full_period,
     last_n_full_periods_range,
@@ -54,19 +54,24 @@ class _SalesLoader(QThread):
         ccs: list[str],
         prior_start: date | None,
         prior_end: date | None,
+        six_week_january_years: list[int] | None = None,
     ) -> None:
         super().__init__()
         self._db = db
         self._start, self._end, self._ccs = start, end, ccs
         self._prior_start, self._prior_end = prior_start, prior_end
+        self._sw = list(six_week_january_years or ())
 
     def run(self) -> None:  # noqa: D401
         try:
-            cur = load_invoiced_sales(self._db, self._start, self._end, self._ccs or None)
+            cur = load_blended_sales(
+                self._db, self._start, self._end, self._ccs or None, self._sw
+            )
             prior = None
             if self._prior_start is not None and self._prior_end is not None:
-                prior = load_invoiced_sales(
-                    self._db, self._prior_start, self._prior_end, self._ccs or None
+                prior = load_blended_sales(
+                    self._db, self._prior_start, self._prior_end,
+                    self._ccs or None, self._sw,
                 )
             self.loaded.emit(cur, prior)
         except Exception as exc:  # noqa: BLE001
@@ -151,6 +156,7 @@ class SalesFilterBar(QFrame):
             root.addLayout(row)
 
         self.compare_prior = QCheckBox("Also load prior year (for comparison)")
+        self.compare_prior.setChecked(True)
         root.addWidget(self.compare_prior)
 
         self.status = QLabel("Loading…")
@@ -208,22 +214,25 @@ class SalesFilterBar(QFrame):
             return
         prior_start = prior_end = None
         if self.compare_prior.isChecked():
-            # Same number of days, shifted back ~1 year
-            from datetime import timedelta
-            span = e - s
-            prior_end = s - timedelta(days=1)
+            # Same span, shifted exactly one calendar year back (handles leap-day).
             try:
-                prior_end = prior_end.replace(year=prior_end.year)  # already a year back
-                prior_start = prior_end - span
+                prior_start = s.replace(year=s.year - 1)
             except ValueError:
-                prior_start = prior_end - span
+                prior_start = s - timedelta(days=365)
+            try:
+                prior_end = e.replace(year=e.year - 1)
+            except ValueError:
+                prior_end = e - timedelta(days=365)
 
         scope = ", ".join(ccs) if ccs else "all CCs"
         self.status.setText(f"Loading {s} → {e} for {scope}…")
         self.run_btn.setEnabled(False)
         self.run_requested.emit(s, e, ccs)
 
-        self._loader = _SalesLoader(self._get_db(), s, e, ccs, prior_start, prior_end)
+        sw = list(self._cfg.fiscal.six_week_january_years) if self._cfg else []
+        self._loader = _SalesLoader(
+            self._get_db(), s, e, ccs, prior_start, prior_end, sw
+        )
         self._loader.loaded.connect(self._on_loaded)
         self._loader.failed.connect(self._on_failed)
         self._loader.start()

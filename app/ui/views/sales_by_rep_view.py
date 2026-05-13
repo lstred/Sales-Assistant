@@ -47,7 +47,7 @@ class SalesByRepView(QWidget):
         body = QHBoxLayout()
         body.setSpacing(12)
         self.filter_bar = SalesFilterBar(get_db, cfg=cfg)
-        self.filter_bar.sales_loaded.connect(self._on_loaded)
+        self.filter_bar.sales_loaded_with_prior.connect(self._on_loaded_with_prior)
         body.addWidget(self.filter_bar)
 
         self.model = PandasModel()
@@ -61,7 +61,7 @@ class SalesByRepView(QWidget):
         body.addWidget(self.table, 1)
         root.addLayout(body, 1)
 
-    def _on_loaded(self, df: pd.DataFrame) -> None:
+    def _on_loaded_with_prior(self, df: pd.DataFrame, prior: pd.DataFrame | None) -> None:
         if df is None or df.empty:
             self.model.set_dataframe(pd.DataFrame())
             self._set_kpis(0, 0, 0, 0)
@@ -75,8 +75,23 @@ class SalesByRepView(QWidget):
                    accounts=("account_number", pd.Series.nunique))
               .sort_values("revenue", ascending=False)
         )
-        rep["gp_pct"] = (rep["gross_profit"] / rep["revenue"] * 100).round(1)
-        rep = rep[["rep_label", "revenue", "gross_profit", "gp_pct", "invoice_lines", "accounts"]]
+        rep["gp_pct"] = (rep["gross_profit"] / rep["revenue"].replace(0, pd.NA) * 100).round(1)
+
+        if prior is not None and not prior.empty:
+            prior_rep = (
+                prior.assign(rep_label=lambda d: d["salesperson_desc"].fillna("(unassigned)").replace("", "(unassigned)"))
+                     .groupby("rep_label", as_index=False)
+                     .agg(prior_revenue=("revenue", "sum"))
+            )
+            rep = rep.merge(prior_rep, on="rep_label", how="left")
+            denom = rep["prior_revenue"].replace(0, pd.NA)
+            rep["yoy_pct"] = ((rep["revenue"] - rep["prior_revenue"]) / denom * 100).round(1)
+            rep = rep[[
+                "rep_label", "revenue", "prior_revenue", "yoy_pct",
+                "gross_profit", "gp_pct", "invoice_lines", "accounts",
+            ]]
+        else:
+            rep = rep[["rep_label", "revenue", "gross_profit", "gp_pct", "invoice_lines", "accounts"]]
         self.model.set_dataframe(rep)
         self._set_kpis(
             float(df["revenue"].sum() or 0),

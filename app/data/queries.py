@@ -25,6 +25,27 @@ GROUP BY cost_center
 ORDER BY cost_center
 """
 
+# Master list of every cost center the warehouse actually books items into.
+# The XREF view above only exposes new-system CCs that have a Clyde mapping,
+# so it omits sample CCs (codes starting with '1') and any CC that's been
+# created post-go-live but never mapped. We get the authoritative list from
+# ITEM.[ICCTR] and left-join the XREF for the friendly name.
+ALL_COST_CENTERS = """
+SELECT  cost_center,
+        MAX(cost_center_name) AS cost_center_name
+FROM (
+    SELECT  LTRIM(RTRIM(i.[ICCTR]))                AS cost_center,
+            LTRIM(RTRIM(x.[CostCenterName]))       AS cost_center_name
+    FROM    dbo.ITEM AS i
+    LEFT JOIN dbo.vw_CostCenterCLydeMRKCodeXREF AS x
+        ON  LTRIM(RTRIM(x.[CostCenter])) = LTRIM(RTRIM(i.[ICCTR]))
+    WHERE   ISNULL(LTRIM(RTRIM(i.[ICCTR])), '') <> ''
+      AND   i.[IINVEN] = 'Y'
+) t
+GROUP BY cost_center
+ORDER BY cost_center
+"""
+
 # ----------------------------------------------------------------- reps roster
 REPS_ROSTER = """
 SELECT  LTRIM(RTRIM(s.[YSLMN#])) AS salesman_number,
