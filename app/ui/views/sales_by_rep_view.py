@@ -19,7 +19,7 @@ from app.ui.widgets.sales_filter_bar import SalesFilterBar
 
 
 class SalesByRepView(QWidget):
-    def __init__(self, get_db, parent=None) -> None:
+    def __init__(self, cfg=None, get_db=None, parent=None) -> None:
         super().__init__(parent)
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -46,7 +46,7 @@ class SalesByRepView(QWidget):
 
         body = QHBoxLayout()
         body.setSpacing(12)
-        self.filter_bar = SalesFilterBar(get_db)
+        self.filter_bar = SalesFilterBar(get_db, cfg=cfg)
         self.filter_bar.sales_loaded.connect(self._on_loaded)
         body.addWidget(self.filter_bar)
 

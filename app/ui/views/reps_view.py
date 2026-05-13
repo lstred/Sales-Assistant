@@ -114,6 +114,10 @@ class RepsView(QWidget):
 
         self._all_df: pd.DataFrame | None = None
 
+        # Auto-load on first show — never present an empty screen.
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self.reload)
+
     def reload(self) -> None:
         self.refresh_btn.setEnabled(False)
         self.status.setText("Loading reps from database…")

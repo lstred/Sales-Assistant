@@ -10,13 +10,15 @@ from __future__ import annotations
 from typing import Callable
 
 import pandas as pd
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QPushButton,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -87,7 +89,38 @@ class CCMappingView(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.setAlternatingRowColors(True)
-        root.addWidget(self.table, 1)
+
+        # Empty-state card shown when there are no sample CCs to map.
+        self.empty_state = QFrame()
+        self.empty_state.setObjectName("card")
+        es = QVBoxLayout(self.empty_state)
+        es.setContentsMargins(28, 28, 28, 28)
+        es.setSpacing(10)
+        es_title = QLabel("Nothing to map yet")
+        es_title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        es_body = QLabel(
+            "Sample cost centers are codes that begin with <b>1</b> (for "
+            "example <code>110</code>, <code>120</code>); product cost "
+            "centers begin with <b>0</b> (for example <code>010</code>).<br><br>"
+            "Press <b>Reload from database</b> to pull the current cost-center "
+            "list from <i>NRF_REPORTS</i>. If no sample CCs appear, none have "
+            "been set up yet — confirm the convention with the warehouse team "
+            "or use the search filter on a sales screen to verify which codes "
+            "exist."
+        )
+        es_body.setWordWrap(True)
+        es_body.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 13px;")
+        es.addWidget(es_title)
+        es.addWidget(es_body)
+        es.addStretch(1)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.empty_state)  # index 0
+        self.stack.addWidget(self.table)        # index 1
+        root.addWidget(self.stack, 1)
+
+        # Auto-load on first show so the screen is never blank.
+        QTimer.singleShot(0, self._reload)
 
     # --------------------------------------------------------------- actions
     def _reload(self) -> None:
@@ -117,6 +150,16 @@ class CCMappingView(QWidget):
         product_codes = sorted(c for c in codes[codes.str.startswith("0")].tolist() if c)
 
         sample_rows = self._df[sample_mask].sort_values("cost_center").reset_index(drop=True)
+        if len(sample_rows) == 0:
+            sample_first = codes.head(8).tolist()
+            self.status.setText(
+                f"No sample CCs (codes starting with '1') in {len(codes):,} cost "
+                f"centers loaded. First few codes: {sample_first}"
+            )
+            self.stack.setCurrentIndex(0)
+            return
+
+        self.stack.setCurrentIndex(1)
         self.table.setRowCount(len(sample_rows))
         for r, row in sample_rows.iterrows():
             code = str(row["cost_center"]).strip()

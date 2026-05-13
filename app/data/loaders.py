@@ -91,6 +91,16 @@ def load_old_sales(
     )
 
 
+def load_open_orders(
+    db: DatabaseConfig,
+    cost_centers: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """Open (un-invoiced) order lines. Useful for pipeline insights only —
+    never counted as salesman credit until the invoice posts."""
+    cc_csv = ",".join(c for c in (cost_centers or ()) if c)
+    return read_dataframe(db, queries.OPEN_ORDERS_LINES, params={"cc_csv": cc_csv})
+
+
 # ----------------------------------------------------------------- displays
 def load_display_types(db: DatabaseConfig) -> pd.DataFrame:
     return read_dataframe(db, queries.DISPLAY_TYPES)

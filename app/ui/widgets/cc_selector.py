@@ -51,11 +51,19 @@ class CostCenterSelector(QWidget):
     selection_changed = Signal(list)  # list[str] of selected CC codes
     loaded = Signal(int)               # number of CCs loaded
 
-    def __init__(self, get_db: Callable[[], DatabaseConfig], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        get_db: Callable[[], DatabaseConfig],
+        parent: QWidget | None = None,
+        *,
+        autoload: bool = True,
+        select_all_after_load: bool = True,
+    ) -> None:
         super().__init__(parent)
         self._get_db = get_db
         self._loader: _CCLoader | None = None
         self._df: pd.DataFrame | None = None
+        self._select_all_after_load = select_all_after_load
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -71,18 +79,24 @@ class CostCenterSelector(QWidget):
         title_row.addWidget(self.count_label)
         root.addLayout(title_row)
 
-        # Action row
-        actions = QHBoxLayout()
-        self.refresh_btn = QPushButton("Reload")
+        # Action rows — split across two lines so labels never clip in the
+        # narrow filter card.
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
         self.all_btn = QPushButton("All")
         self.none_btn = QPushButton("None")
+        self.refresh_btn = QPushButton("Reload")
+        for b in (self.all_btn, self.none_btn, self.refresh_btn):
+            row1.addWidget(b, 1)
+        root.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
         self.products_btn = QPushButton("Products only")
         self.samples_btn = QPushButton("Samples only")
-        for b in (self.refresh_btn, self.all_btn, self.none_btn,
-                  self.products_btn, self.samples_btn):
-            actions.addWidget(b)
-        actions.addStretch(1)
-        root.addLayout(actions)
+        for b in (self.products_btn, self.samples_btn):
+            row2.addWidget(b, 1)
+        root.addLayout(row2)
 
         self.refresh_btn.clicked.connect(self.reload)
         self.all_btn.clicked.connect(lambda: self._set_all(True, None))
@@ -105,6 +119,9 @@ class CostCenterSelector(QWidget):
         root.addWidget(self.view, 1)
 
         self.model.itemChanged.connect(self._on_item_changed)
+
+        if autoload:
+            self.reload()
 
     # --------------------------------------------------------------- public
     def selected_codes(self) -> list[str]:
@@ -134,10 +151,16 @@ class CostCenterSelector(QWidget):
             it = QStandardItem(label)
             it.setData(code, Qt.ItemDataRole.UserRole)
             it.setCheckable(True)
-            it.setCheckState(Qt.CheckState.Unchecked)
+            initially_checked = self._select_all_after_load
+            it.setCheckState(
+                Qt.CheckState.Checked if initially_checked else Qt.CheckState.Unchecked
+            )
             it.setEditable(False)
             self.model.appendRow(it)
-        self.count_label.setText(f"{len(df):,} loaded")
+        self.count_label.setText(
+            f"{len(df):,} loaded · "
+            f"{sum(1 for r in range(self.model.rowCount()) if self.model.item(r).checkState() == Qt.CheckState.Checked):,} selected"
+        )
         self.loaded.emit(len(df))
         self.selection_changed.emit(self.selected_codes())
 
@@ -146,7 +169,17 @@ class CostCenterSelector(QWidget):
         self.count_label.setText(f"failed: {msg}")
 
     def _on_item_changed(self, _item: QStandardItem) -> None:
+        self._refresh_count()
         self.selection_changed.emit(self.selected_codes())
+
+    def _refresh_count(self) -> None:
+        if self._df is None:
+            return
+        sel = sum(
+            1 for r in range(self.model.rowCount())
+            if self.model.item(r).checkState() == Qt.CheckState.Checked
+        )
+        self.count_label.setText(f"{len(self._df):,} loaded · {sel:,} selected")
 
     def _apply_filter(self, text: str) -> None:
         needle = text.strip().lower()
@@ -165,4 +198,5 @@ class CostCenterSelector(QWidget):
             elif prefix is not None:
                 it.setCheckState(Qt.CheckState.Unchecked)
         self.model.blockSignals(False)
+        self._refresh_count()
         self.selection_changed.emit(self.selected_codes())

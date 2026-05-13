@@ -52,6 +52,14 @@ WHERE   ISNULL(LTRIM(RTRIM(b.[BSACCT])), '') <> ''
 # Used for everything that needs by-day / by-rep / by-CC bucketing.
 # ``:cc_csv`` is a comma-separated list of cost-center codes; pass an empty
 # string to disable the filter.
+#
+# Filtering rules (locked-in business logic):
+#   * ``ORDER# > 0`` — discard blank/zero-order rows entirely; they are not
+#     valid orders.
+#   * ``INVOICE# > 0`` — only invoiced (shipped/billed) lines count toward
+#     salesman credit and reported revenue. Open (unshipped) orders still
+#     have an ORDER# > 0 but no invoice yet — those are loaded separately
+#     via :data:`OPEN_ORDERS_LINES` for use in insights / pipeline views.
 INVOICED_SALES_LINES = """
 SELECT  TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD])         AS invoice_yyyymmdd,
         LTRIM(RTRIM(o.[ACCOUNT#I]))                          AS account_number,
@@ -68,8 +76,33 @@ JOIN    dbo.ITEM    AS i ON i.[ItemNumber] = o.[ITEM_MFGR_COLOR_PAT]
 WHERE   o.[N_NOT_INVENTORY] = 'Y'
   AND   i.[IINVEN] = 'Y'
   AND   TRY_CONVERT(int, o.[ACCOUNT#I]) > 1
+  AND   TRY_CONVERT(int, o.[ORDER#])    > 0
   AND   TRY_CONVERT(int, o.[INVOICE#])  > 0
   AND   TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD]) BETWEEN :start_yyyymmdd AND :end_yyyymmdd
+  AND   ( :cc_csv = ''
+          OR LTRIM(RTRIM(i.[ICCTR])) IN
+             (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(:cc_csv, ',')) )
+"""
+
+# Open orders: real orders (ORDER# > 0) that have **not** yet been invoiced.
+# Useful for pipeline / "what's about to ship" insights — never counted as
+# salesman credit until the invoice posts.
+OPEN_ORDERS_LINES = """
+SELECT  TRY_CONVERT(int, o.[ORDER_ENTRY_DATE_YYYYMMDD])     AS order_entry_yyyymmdd,
+        LTRIM(RTRIM(o.[ACCOUNT#I]))                          AS account_number,
+        LTRIM(RTRIM(i.[ICCTR]))                              AS cost_center,
+        LTRIM(RTRIM(o.[SALESPERSON]))                        AS salesperson_number,
+        LTRIM(RTRIM(o.[SALESPERSON_DESC]))                   AS salesperson_desc,
+        TRY_CONVERT(int, o.[ORDER#])                         AS order_number,
+        TRY_CONVERT(int, o.[LINE#I])                         AS line_number,
+        TRY_CONVERT(decimal(18,2), o.[ENTENDED_PRICE_NO_FUNDS]) AS open_revenue
+FROM    dbo._ORDERS AS o
+JOIN    dbo.ITEM    AS i ON i.[ItemNumber] = o.[ITEM_MFGR_COLOR_PAT]
+WHERE   o.[N_NOT_INVENTORY] = 'Y'
+  AND   i.[IINVEN] = 'Y'
+  AND   TRY_CONVERT(int, o.[ACCOUNT#I]) > 1
+  AND   TRY_CONVERT(int, o.[ORDER#])    > 0
+  AND   ISNULL(TRY_CONVERT(int, o.[INVOICE#]), 0) = 0
   AND   ( :cc_csv = ''
           OR LTRIM(RTRIM(i.[ICCTR])) IN
              (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(:cc_csv, ',')) )

@@ -102,6 +102,32 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS ai_analyses (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        title           TEXT NOT NULL,
+        question        TEXT NOT NULL,
+        answer          TEXT NOT NULL,
+        scope_label     TEXT NOT NULL DEFAULT '',  -- e.g. "all CCs · 4/14/2026 → 5/13/2026"
+        cost_centers    TEXT NOT NULL DEFAULT '',  -- comma-separated CC codes
+        date_start      TEXT,                      -- ISO date
+        date_end        TEXT,                      -- ISO date
+        rows_in_scope   INTEGER NOT NULL DEFAULT 0,
+        prompt_tokens   INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens    INTEGER NOT NULL DEFAULT 0,
+        model           TEXT NOT NULL DEFAULT '',
+        question_hash   TEXT NOT NULL DEFAULT '',  -- sha1 of (question + scope_label)
+        pinned          INTEGER NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_ai_analyses_created ON ai_analyses(created_at DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_ai_analyses_hash ON ai_analyses(question_hash)
+    """,
 )
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2

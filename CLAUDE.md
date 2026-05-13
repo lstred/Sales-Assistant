@@ -286,6 +286,37 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 Newest first.
 
+- **2026-05-13** — Polish round (UX feedback from running app):
+  - **SQL data quality**: `INVOICED_SALES_LINES` now also requires
+    `TRY_CONVERT(int, [ORDER#]) > 0` (orders with blank/zero `ORDER#` are
+    discarded entirely). Added new query `OPEN_ORDERS_LINES` and loader
+    `load_open_orders` for un-invoiced orders (`ORDER# > 0` and
+    `INVOICE# = 0/NULL`) — used for pipeline insights only, never for
+    salesman credit.
+  - **Auto-load on launch**: every data-driven view now populates itself
+    on first show. `RepsView` reloads via `QTimer.singleShot(0)`,
+    `CCMappingView` auto-reloads and shows an instructional empty-state
+    card when no sample CCs are present, and `SalesFilterBar` auto-loads
+    its CC list, defaults selection to *All*, and auto-fires *Run* once
+    the CCs arrive.
+  - **Smart default date range**: `SalesFilterBar` defaults to the last
+    12 fully-completed fiscal periods (rolling year ending at the last
+    closed fiscal month). Added `last_full_period` and
+    `last_n_full_periods_range` to `app.services.fiscal_calendar`. New
+    presets row exposes Last full FM, Last 3/6 FM, Rolling year, YTD,
+    Last 30d. Added a *vs prior year* checkbox that simultaneously loads
+    a parallel range one year back for comparison.
+  - **CC selector layout**: action buttons are now split across two rows
+    so labels never clip in the narrow filter card; live "X selected"
+    count next to "loaded".
+  - **AI analysis history (persistence)**: new `ai_analyses` SQLite table
+    + `app.storage.repos.save_ai_analysis` / `list_ai_analyses` /
+    `find_ai_analysis_by_hash` / `set_pinned` / `delete_ai_analysis`. The
+    *Ask the AI* view now has a left-side **Saved analyses** pane with
+    search, click-to-restore, right-click pin/delete, and an inline
+    "you already asked this" banner when a question matches a previously
+    saved Q&A for the same scope. Schema bumped to version 2.
+
 - **2026-05-13** — Major UX expansion based on user feedback:
   - Reusable cost-center **multi-select widget** (`app/ui/widgets/cc_selector.py`)
     with All/None/Products-only/Samples-only shortcuts and a search filter.

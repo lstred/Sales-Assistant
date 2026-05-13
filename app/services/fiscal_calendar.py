@@ -143,3 +143,37 @@ def period_for_invoice_yyyymmdd(
     if len(s) != 8:
         raise ValueError(f"Expected YYYYMMDD, got {yyyymmdd!r}")
     return find_period(date(int(s[0:4]), int(s[4:6]), int(s[6:8])), six_week_january_years)
+
+
+def last_full_period(
+    today: date,
+    six_week_january_years: Iterable[int] = (),
+) -> FiscalPeriod:
+    """The most recently *completed* fiscal period as of ``today``."""
+    current = find_period(today, six_week_january_years)
+    fy, p = current.fiscal_year, current.period - 1
+    if p < 1:
+        fy -= 1
+        p = 12
+    return build_fiscal_year(fy, six_week_january_years)[p - 1]
+
+
+def last_n_full_periods_range(
+    today: date,
+    n: int = 12,
+    six_week_january_years: Iterable[int] = (),
+) -> tuple[date, date]:
+    """``(start, end)`` covering the last ``n`` *fully completed* fiscal
+    periods ending immediately before the period that contains ``today``.
+
+    With ``n=12`` and a ``today`` of May 13 2026 (FY27 P4), the range is
+    FY26 P4 (May 4 2025) through FY27 P3 (May 2 2026) — i.e. a clean
+    rolling year of completed fiscal months.
+    """
+    end_period = last_full_period(today, six_week_january_years)
+    start_fy, start_p = end_period.fiscal_year, end_period.period - (n - 1)
+    while start_p < 1:
+        start_fy -= 1
+        start_p += 12
+    start_period = build_fiscal_year(start_fy, six_week_january_years)[start_p - 1]
+    return start_period.start, end_period.end
