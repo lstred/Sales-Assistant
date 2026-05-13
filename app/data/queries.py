@@ -3,8 +3,10 @@
 Conventions:
 * Always parameterize with ``:name`` markers; never f-string user values.
 * Bracket non-standard identifiers (``[BSACCT]``, ``[D@MFGR]``, ``[$DESC]``).
-* Apply standard filters (closed-account guard, future-dated guard, etc.)
-  inside the loaders, not here.
+* For *invoiced* sales we use ``INVOICE_DATE_YYYYMMDD`` and require
+  ``INVOICE# > 0`` (the line actually shipped / billed).
+  ``ORDER_ENTRY_DATE_YYYYMMDD`` is order-placed date and is **not** used
+  for fiscal-period bucketing.
 """
 
 # ----------------------------------------------------------------- cost centers
@@ -27,8 +29,6 @@ ORDER BY s.[YNAME]
 """
 
 # ------------------------------------------------------ rep assignments view
-# Joined view of BILLSLMN + SALESMAN + BILLTO so callers get everything
-# they need in one trip.
 REP_ASSIGNMENTS = """
 SELECT  LTRIM(RTRIM(b.[BSSLMN]))            AS salesman_number,
         LTRIM(RTRIM(s.[YNAME]))             AS salesman_name,
@@ -48,36 +48,34 @@ WHERE   ISNULL(LTRIM(RTRIM(b.[BSACCT])), '') <> ''
   AND   ISNULL(LTRIM(RTRIM(b.[BSCODE])), '') <> ''
 """
 
-# ------------------------------------------- new-system sales (post-2025-08-04)
-# Aggregated per (account, cost_center, year, month) — granular enough to
-# compare against ClydeMarketingHistory (which is monthly) without dragging
-# every single order line into the metric layer.
-NEW_SYSTEM_SALES_MONTHLY = """
-SELECT  LTRIM(RTRIM(o.[ACCOUNT#I]))                          AS account_number,
+# ------------------------------------------- invoiced sales (line-level detail)
+# Used for everything that needs by-day / by-rep / by-CC bucketing.
+# ``:cc_csv`` is a comma-separated list of cost-center codes; pass an empty
+# string to disable the filter.
+INVOICED_SALES_LINES = """
+SELECT  TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD])         AS invoice_yyyymmdd,
+        LTRIM(RTRIM(o.[ACCOUNT#I]))                          AS account_number,
         LTRIM(RTRIM(i.[ICCTR]))                              AS cost_center,
-        LEFT(CAST(o.[ORDER_ENTRY_DATE_YYYYMMDD] AS VARCHAR(8)), 4) AS year,
-        SUBSTRING(CAST(o.[ORDER_ENTRY_DATE_YYYYMMDD] AS VARCHAR(8)), 5, 2) AS month,
-        SUM(TRY_CONVERT(decimal(18,2), o.[ENTENDED_PRICE_NO_FUNDS])) AS revenue,
-        SUM(TRY_CONVERT(decimal(18,2), o.[LINE_GPD_WITHOUT_FUNDS]))  AS gross_profit,
-        COUNT(DISTINCT CAST(o.[ORDER#] AS VARCHAR(20))
-                       + '-'
-                       + CAST(o.[LINE#I] AS VARCHAR(10)))            AS order_lines
+        LTRIM(RTRIM(o.[SALESPERSON]))                        AS salesperson_number,
+        LTRIM(RTRIM(o.[SALESPERSON_DESC]))                   AS salesperson_desc,
+        TRY_CONVERT(int, o.[INVOICE#])                       AS invoice_number,
+        TRY_CONVERT(int, o.[ORDER#])                         AS order_number,
+        TRY_CONVERT(int, o.[LINE#I])                         AS line_number,
+        TRY_CONVERT(decimal(18,2), o.[ENTENDED_PRICE_NO_FUNDS]) AS revenue,
+        TRY_CONVERT(decimal(18,2), o.[LINE_GPD_WITHOUT_FUNDS])  AS gross_profit
 FROM    dbo._ORDERS AS o
 JOIN    dbo.ITEM    AS i ON i.[ItemNumber] = o.[ITEM_MFGR_COLOR_PAT]
 WHERE   o.[N_NOT_INVENTORY] = 'Y'
   AND   i.[IINVEN] = 'Y'
   AND   TRY_CONVERT(int, o.[ACCOUNT#I]) > 1
-  AND   LEFT(ISNULL(LTRIM(RTRIM(i.[ICCTR])), ''), 1) <> '1'
-  AND   TRY_CONVERT(int, o.[ORDER_ENTRY_DATE_YYYYMMDD]) BETWEEN :start_yyyymmdd AND :end_yyyymmdd
-GROUP BY
-        LTRIM(RTRIM(o.[ACCOUNT#I])),
-        LTRIM(RTRIM(i.[ICCTR])),
-        LEFT(CAST(o.[ORDER_ENTRY_DATE_YYYYMMDD] AS VARCHAR(8)), 4),
-        SUBSTRING(CAST(o.[ORDER_ENTRY_DATE_YYYYMMDD] AS VARCHAR(8)), 5, 2)
+  AND   TRY_CONVERT(int, o.[INVOICE#])  > 0
+  AND   TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD]) BETWEEN :start_yyyymmdd AND :end_yyyymmdd
+  AND   ( :cc_csv = ''
+          OR LTRIM(RTRIM(i.[ICCTR])) IN
+             (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(:cc_csv, ',')) )
 """
 
 # ------------------------------------- old-system summarized sales (≤ go-live)
-# Returned long-form (period 1..12) for easier consumption in pandas.
 OLD_SYSTEM_SALES = """
 SELECT  LTRIM(RTRIM(h.[MarketingCode]))     AS marketing_code,
         x.[CostCenter]                       AS cost_center,

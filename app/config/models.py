@@ -80,16 +80,31 @@ class ScheduleConfig(BaseModel):
     quiet_hours_end: str = "07:00"
 
 
+class FiscalCalendarConfig(BaseModel):
+    """Overrides for the NRF 4-4-5 fiscal calendar.
+
+    Defaults are correct: FY starts Sunday Feb 1; months are 4-4-5 weeks
+    repeating; FY27 anchor is Feb 1 2026. The only thing that varies is the
+    rare 6-week January used to realign with the calendar year — list those
+    fiscal-year labels here.
+    """
+
+    six_week_january_years: list[int] = Field(default_factory=list)
+    """Fiscal years (e.g. 2027) where January is 6 weeks instead of 5."""
+
+
 class AppConfig(BaseModel):
     schema_version: int = 1
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    fiscal: FiscalCalendarConfig = Field(default_factory=FiscalCalendarConfig)
 
     # User-maintained mappings (free-form, edited in UI later):
     sample_to_product_cc: dict[str, str] = Field(default_factory=dict)
-    """Map sample cost-center code -> product cost-center code."""
+    """Map sample cost-center code (starts with '1') -> product cost-center
+    code (starts with '0')."""
 
     core_displays_by_cc: dict[str, list[str]] = Field(default_factory=dict)
     """Map cost-center code -> list of CLASSES.CLCODE values that count as 'core' displays."""

@@ -221,15 +221,29 @@ local SQLite DB (relational data).
 - **Parameterize all SQL** with `text()` + `:param`. Never f-string user
   values into SQL.
 - **All quantities are normalized to SY** in the loader layer.
+- **Cost-center conventions**: codes starting with `'0'` are **product**
+  cost centers; codes starting with `'1'` are **sample** cost centers.
+  Sample CCs are mapped to their sponsoring product CC via
+  `AppConfig.sample_to_product_cc` (edited in the *CC Mapping* view).
+- **Invoice-driven sales**: anything bucketed by fiscal month/period uses
+  `INVOICE_DATE_YYYYMMDD` from `_ORDERS` and **filters to `INVOICE# > 0`**.
+  `ORDER_ENTRY_DATE_YYYYMMDD` is order-placed date, not used for
+  fiscal-period bucketing.
+- **Fiscal calendar**: 4-4-5 weekly pattern, every fiscal month starts on a
+  Sunday, anchor = Sunday Feb 1 2026 (FY 2027 P1). January is occasionally
+  6 weeks to realign with the calendar year — manage via
+  `FiscalCalendarConfig.six_week_january_years` in `AppConfig`. Never
+  hard-code month boundaries; call `app.services.fiscal_calendar`.
 - **Apply standard filters in loaders** (`IINVEN='Y'`, exclude remnants,
-  exclude cost centers starting with `'1'`, exclude future-dated rows, drop
-  closed accounts from penalty metrics but keep for context).
+  exclude cost centers starting with `'1'` from product-revenue metrics,
+  exclude future-dated rows, drop closed accounts from penalty metrics
+  but keep for context).
 - **No secrets on disk.** Email passwords, AI API keys → `keyring` only.
   The config JSON only stores non-secret references (host, port, username,
   model name).
 - **AI access scope:** the AI may only read/answer about a rep's own
-  accounts and metrics. The prompt-builder enforces this; do not pass
-  unrelated reps' data into a per-rep AI call.
+  accounts and metrics in per-rep flows. The Ask-the-AI view is for the
+  manager and may see all data. The prompt-builder enforces per-rep scoping.
 - **AI responds only on chains it originated.** Verify thread ownership via
   the local `conversations` table before generating any reply.
 - **Territory-aware comparisons:** any cross-rep comparison must normalize
@@ -271,6 +285,30 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 ## 9. Change log
 
 Newest first.
+
+- **2026-05-13** — Major UX expansion based on user feedback:
+  - Reusable cost-center **multi-select widget** (`app/ui/widgets/cc_selector.py`)
+    with All/None/Products-only/Samples-only shortcuts and a search filter.
+  - Reusable **`SalesFilterBar`** that combines the CC selector with a
+    date-range picker (with 7d / 30d / 90d / YTD presets) and runs the
+    `load_invoiced_sales` worker in the background.
+  - **New views**: `SalesByRepView`, `SalesByCostCenterView`,
+    `CCMappingView` (Sample CC starts with `'1'` → Product CC starts with
+    `'0'`), `WeeklyEmailView` (one draft per rep for the selected CCs and
+    period), `AIChatView` (manager-side ad-hoc Q&A over the loaded data with
+    a live token estimate), `FiscalCalendarView` (browse any FY, flag
+    6-week January overrides).
+  - **Sales source switched to invoice-driven**: `INVOICED_SALES_LINES` now
+    requires `INVOICE# > 0` and uses `INVOICE_DATE_YYYYMMDD` for fiscal-period
+    bucketing. The old monthly aggregator was removed; loaders provide
+    derived `fiscal_year`, `fiscal_period`, `fiscal_period_name` columns
+    via the new fiscal-calendar service.
+  - **Fiscal calendar service** (`app/services/fiscal_calendar.py`):
+    4-4-5 weekly pattern, every month starts on a Sunday, anchor =
+    Sunday Feb 1 2026 = FY 2027 P1. Supports rare 6-week-January overrides
+    via `FiscalCalendarConfig.six_week_january_years` in `AppConfig`.
+  - **Token estimator** (`app/ai/token_estimator.py`) — used by the AI Chat
+    view to show data/system/total token estimates before sending.
 
 - **2026-05-13** — Major scope expansion. Locked stack: PySide6 desktop +
   custom QSS theme; SQLite local state; SMTP+IMAP email; OpenAI default

@@ -19,19 +19,31 @@ from app.notifications.email_client import EmailClient
 from app.ui.dialogs.ai_settings_dialog import AISettingsDialog
 from app.ui.dialogs.db_settings_dialog import DatabaseSettingsDialog
 from app.ui.dialogs.email_settings_dialog import EmailSettingsDialog
+from app.ui.views.ai_chat_view import AIChatView
+from app.ui.views.cc_mapping_view import CCMappingView
 from app.ui.views.conversations_view import ConversationsView
 from app.ui.views.dashboard_view import DashboardView
+from app.ui.views.fiscal_calendar_view import FiscalCalendarView
 from app.ui.views.reps_view import RepsView
+from app.ui.views.sales_by_cc_view import SalesByCostCenterView
+from app.ui.views.sales_by_rep_view import SalesByRepView
 from app.ui.views.settings_view import SettingsView
+from app.ui.views.weekly_email_view import WeeklyEmailView
 from app.ui.widgets.sidebar import Sidebar
 from app.ui.widgets.status_bar import AppStatusBar
 
 
 NAV_ITEMS = [
-    ("dashboard", "Dashboard"),
-    ("reps", "Sales Reps"),
+    ("dashboard",     "Dashboard"),
+    ("reps",          "Sales Reps"),
+    ("sales_by_rep",  "Sales by Rep"),
+    ("sales_by_cc",   "Sales by Cost Center"),
     ("conversations", "Conversations"),
-    ("settings", "Settings"),
+    ("ai_chat",       "Ask the AI"),
+    ("weekly_email",  "Weekly Email"),
+    ("cc_mapping",    "CC Mapping"),
+    ("fiscal",        "Fiscal Calendar"),
+    ("settings",      "Settings"),
 ]
 
 
@@ -89,17 +101,29 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.dashboard_view = DashboardView()
         self.reps_view = RepsView(get_db=lambda: self._cfg.database)
+        self.sales_by_rep_view = SalesByRepView(get_db=lambda: self._cfg.database)
+        self.sales_by_cc_view = SalesByCostCenterView(get_db=lambda: self._cfg.database)
         self.conversations_view = ConversationsView()
+        self.ai_chat_view = AIChatView(self._cfg, get_db=lambda: self._cfg.database)
+        self.weekly_email_view = WeeklyEmailView(self._cfg, get_db=lambda: self._cfg.database)
+        self.cc_mapping_view = CCMappingView(self._cfg, get_db=lambda: self._cfg.database)
+        self.fiscal_view = FiscalCalendarView(self._cfg)
         self.settings_view = SettingsView()
         self.settings_view.open_db.connect(self._open_db_dialog)
         self.settings_view.open_email.connect(self._open_email_dialog)
         self.settings_view.open_ai.connect(self._open_ai_dialog)
 
         self._views: dict[str, QWidget] = {
-            "dashboard": self.dashboard_view,
-            "reps": self.reps_view,
+            "dashboard":     self.dashboard_view,
+            "reps":          self.reps_view,
+            "sales_by_rep":  self.sales_by_rep_view,
+            "sales_by_cc":   self.sales_by_cc_view,
             "conversations": self.conversations_view,
-            "settings": self.settings_view,
+            "ai_chat":       self.ai_chat_view,
+            "weekly_email":  self.weekly_email_view,
+            "cc_mapping":    self.cc_mapping_view,
+            "fiscal":        self.fiscal_view,
+            "settings":      self.settings_view,
         }
         for w in self._views.values():
             self.stack.addWidget(w)
