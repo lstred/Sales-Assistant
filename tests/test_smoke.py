@@ -68,3 +68,68 @@ def test_find_period_for_known_dates() -> None:
     p3 = find_period(date(2026, 5, 13))  # mid-May → FY27 P4 (May, weeks=4)
     assert p3.fiscal_year == 2027 and p3.name == "May"
 
+
+def test_unpivot_old_sales_uses_rep_map() -> None:
+    import pandas as pd
+    from datetime import date
+    from app.data.loaders import _unpivot_old_sales, LEGACY_REP_LABEL
+
+    raw = pd.DataFrame([{
+        "marketing_code": "X",
+        "cost_center": "010",
+        "cost_center_name": "CARPET RESIDENTIAL",
+        "fiscal_year": 2026,
+        "old_customer_number": "OLD-1",
+        "account_number": "ACCT-1",
+        "account_name": "Test Customer",
+        **{f"SalesPeriod{i}": (1000 if i == 4 else 0) for i in range(1, 13)},
+        **{f"CostsPeriod{i}": (700 if i == 4 else 0) for i in range(1, 13)},
+        "TotalSales": 1000, "TotalCost": 700, "Profit": 300,
+    }])
+    rep_map = {("ACCT-1", "010"): "JANE DOE"}
+    out = _unpivot_old_sales(
+        raw, date(2025, 1, 1), date(2025, 12, 31), None, [], rep_map
+    )
+    assert not out.empty
+    assert (out["salesperson_desc"] == "JANE DOE").all()
+    assert (out["account_number"] == "ACCT-1").all()
+    assert out["revenue"].sum() == 1000.0
+    assert out["gross_profit"].sum() == 300.0
+
+    # Without rep map ? falls back to legacy label
+    out2 = _unpivot_old_sales(
+        raw, date(2025, 1, 1), date(2025, 12, 31), None, [], {}
+    )
+    assert (out2["salesperson_desc"] == LEGACY_REP_LABEL).all()
+
+
+def test_sales_cache_round_trip(tmp_path, monkeypatch) -> None:
+    import pandas as pd
+    from datetime import date
+    monkeypatch.setattr("app.storage.sales_cache.state_db_path", lambda: tmp_path / "cache.sqlite")
+    from app.storage import sales_cache
+
+    df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    key = sales_cache.make_key(date(2025, 1, 1), date(2025, 1, 31), ["010", "011"])
+    assert sales_cache.get(key) is None
+    ts = sales_cache.put(key, df)
+    hit = sales_cache.get(key)
+    assert hit is not None
+    cached_df, cached_ts = hit
+    assert list(cached_df.columns) == ["a", "b"]
+    assert len(cached_df) == 3
+    assert cached_df["a"].sum() == 6
+    # Stored timestamp is truncated to seconds in SQLite.
+    assert abs((cached_ts - ts).total_seconds()) < 1.0
+    assert sales_cache.has_any() is True
+    n = sales_cache.clear_all()
+    assert n == 1
+    assert sales_cache.get(key) is None
+
+
+def test_make_key_is_order_independent() -> None:
+    from datetime import date
+    from app.storage import sales_cache
+    a = sales_cache.make_key(date(2025, 1, 1), date(2025, 1, 31), ["011", "010"])
+    b = sales_cache.make_key(date(2025, 1, 1), date(2025, 1, 31), ["010", "011"])
+    assert a == b

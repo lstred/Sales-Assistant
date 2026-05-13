@@ -286,6 +286,40 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 Newest first.
 
+- **2026-05-13** — Premium polish + persistence round:
+  - **Sales views restricted to product CCs** (`'0'` prefix). New
+    `code_prefix_filter` parameter on `CostCenterSelector` + `SalesFilterBar`;
+    Sales by Rep, Sales by Cost Center, Weekly Email, and Ask the AI all
+    pass `code_prefix_filter="0"`. Sample / display data is reserved for
+    insights & correlation features per the new convention.
+  - **CC selector simplified** — only **Select all** + **Deselect all**.
+    The four-way *None / Reload / Products only / Samples only* button
+    cluster is gone; users tick rows individually instead. The `Reload`
+    affordance moves to the parent's *Refresh from DB* button.
+  - **Legacy sales now attributed to the current rep** (and customer).
+    `_unpivot_old_sales` accepts an `(account, cost_center) → rep_name`
+    map built from `dbo.BILLSLMN`/`dbo.SALESMAN` in `load_blended_sales`.
+    Each pre-cutoff `ClydeMarketingHistory` row is assigned to whoever
+    currently owns that account+CC. Accounts with no current assignment
+    fall back to `(legacy / pre-Aug 2025)`. Fixes the screenshot's
+    "all $189M of prior-year revenue lumped on one row" issue.
+  - **Persistent sales cache** — new `app/storage/sales_cache.py` (SQLite
+    table `sales_cache`, pickled DataFrame + ISO refresh timestamp,
+    keyed by `start|end|sorted-CCs`). `SalesFilterBar` checks the cache
+    on every run; cache hit short-circuits the warehouse round-trip and
+    shows *Last refreshed …* below the status. New **Refresh from DB**
+    button forces a fresh fetch + cache-write. Cache failures are
+    non-fatal (data still flows).
+  - **Startup refresh prompt** — on launch, `MainWindow` waits 250 ms
+    after show, and if `sales_cache.has_any()` it presents a
+    `QMessageBox` with the latest refresh timestamp and two buttons
+    (*Use cached* default / *Refresh from DB*). Refresh clears the
+    cache so every view repopulates fresh.
+  - **Orphaned code removed**: dropped `SalesFilterBar.reload_cost_centers`
+    (no callers). `KpiCard.set_caption` retained.
+  - **Tests added** for legacy rep attribution, sales-cache round-trip,
+    and order-independent cache keys (11/11 pass).
+
 - **2026-05-13** — Empty-Dashboard / partial-sales / sample-CC fixes:
   - **Blended sales loader**: new `load_blended_sales(db, start, end, ccs,
     six_week_jan_years)` in `app/data/loaders.py`. For dates ≥

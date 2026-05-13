@@ -58,12 +58,14 @@ class CostCenterSelector(QWidget):
         *,
         autoload: bool = True,
         select_all_after_load: bool = True,
+        code_prefix_filter: str | None = None,
     ) -> None:
         super().__init__(parent)
         self._get_db = get_db
         self._loader: _CCLoader | None = None
         self._df: pd.DataFrame | None = None
         self._select_all_after_load = select_all_after_load
+        self._prefix_filter = (code_prefix_filter or "").strip()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -79,30 +81,18 @@ class CostCenterSelector(QWidget):
         title_row.addWidget(self.count_label)
         root.addLayout(title_row)
 
-        # Action rows — split across two lines so labels never clip in the
-        # narrow filter card.
-        row1 = QHBoxLayout()
-        row1.setSpacing(6)
-        self.all_btn = QPushButton("All")
-        self.none_btn = QPushButton("None")
-        self.refresh_btn = QPushButton("Reload")
-        for b in (self.all_btn, self.none_btn, self.refresh_btn):
-            row1.addWidget(b, 1)
-        root.addLayout(row1)
+        # Two minimalist actions: Select all / Deselect all. Manager picks
+        # individual codes by ticking rows directly.
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.all_btn = QPushButton("Select all")
+        self.none_btn = QPushButton("Deselect all")
+        for b in (self.all_btn, self.none_btn):
+            btn_row.addWidget(b, 1)
+        root.addLayout(btn_row)
 
-        row2 = QHBoxLayout()
-        row2.setSpacing(6)
-        self.products_btn = QPushButton("Products only")
-        self.samples_btn = QPushButton("Samples only")
-        for b in (self.products_btn, self.samples_btn):
-            row2.addWidget(b, 1)
-        root.addLayout(row2)
-
-        self.refresh_btn.clicked.connect(self.reload)
-        self.all_btn.clicked.connect(lambda: self._set_all(True, None))
-        self.none_btn.clicked.connect(lambda: self._set_all(False, None))
-        self.products_btn.clicked.connect(lambda: self._set_all(True, "0"))
-        self.samples_btn.clicked.connect(lambda: self._set_all(True, "1"))
+        self.all_btn.clicked.connect(lambda: self._set_all(True))
+        self.none_btn.clicked.connect(lambda: self._set_all(False))
 
         # Filter
         self.search = QLineEdit()
@@ -118,11 +108,6 @@ class CostCenterSelector(QWidget):
         self.view.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
         root.addWidget(self.view, 1)
 
-        self.model.itemChanged.connect(self._on_item_changed)
-
-        if autoload:
-            self.reload()
-
     # --------------------------------------------------------------- public
     def selected_codes(self) -> list[str]:
         return [
@@ -132,7 +117,6 @@ class CostCenterSelector(QWidget):
         ]
 
     def reload(self) -> None:
-        self.refresh_btn.setEnabled(False)
         self.count_label.setText("loading…")
         self._loader = _CCLoader(self._get_db())
         self._loader.loaded.connect(self._on_loaded)
@@ -141,8 +125,9 @@ class CostCenterSelector(QWidget):
 
     # --------------------------------------------------------------- internal
     def _on_loaded(self, df: pd.DataFrame) -> None:
+        if self._prefix_filter and df is not None and not df.empty:
+            df = df[df["cost_center"].astype(str).str.startswith(self._prefix_filter)]
         self._df = df
-        self.refresh_btn.setEnabled(True)
         self.model.clear()
         for _, row in df.iterrows():
             code = str(row.get("cost_center", "")).strip()
@@ -165,7 +150,6 @@ class CostCenterSelector(QWidget):
         self.selection_changed.emit(self.selected_codes())
 
     def _on_failed(self, msg: str) -> None:
-        self.refresh_btn.setEnabled(True)
         self.count_label.setText(f"failed: {msg}")
 
     def _on_item_changed(self, _item: QStandardItem) -> None:
@@ -188,15 +172,11 @@ class CostCenterSelector(QWidget):
             visible = (not needle) or needle in it.text().lower()
             self.view.setRowHidden(r, not visible)
 
-    def _set_all(self, checked: bool, prefix: str | None) -> None:
+    def _set_all(self, checked: bool) -> None:
         self.model.blockSignals(True)
         for r in range(self.model.rowCount()):
             it = self.model.item(r)
-            code = it.data(Qt.ItemDataRole.UserRole) or ""
-            if prefix is None or str(code).startswith(prefix):
-                it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-            elif prefix is not None:
-                it.setCheckState(Qt.CheckState.Unchecked)
+            it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
         self.model.blockSignals(False)
         self._refresh_count()
         self.selection_changed.emit(self.selected_codes())

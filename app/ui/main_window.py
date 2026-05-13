@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QSize, Qt, QThread, Signal
+from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QMainWindow,
+    QMessageBox,
     QStackedWidget,
     QWidget,
 )
@@ -16,6 +17,7 @@ from app.config.models import AppConfig
 from app.config.store import save_config
 from app.data.db import ping as db_ping
 from app.notifications.email_client import EmailClient
+from app.storage import sales_cache
 from app.ui.dialogs.ai_settings_dialog import AISettingsDialog
 from app.ui.dialogs.db_settings_dialog import DatabaseSettingsDialog
 from app.ui.dialogs.email_settings_dialog import EmailSettingsDialog
@@ -147,6 +149,29 @@ class MainWindow(QMainWindow):
         # Kick off non-blocking liveness checks
         self._checker: _StatusChecker | None = None
         self.refresh_status_indicators()
+
+        # Once the window is up, ask whether to refresh stale cached data.
+        QTimer.singleShot(250, self._maybe_prompt_refresh)
+
+    def _maybe_prompt_refresh(self) -> None:
+        ts = sales_cache.latest_refresh()
+        if ts is None:
+            return
+        when = ts.strftime("%B %d, %Y at %I:%M %p").replace(" 0", " ")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Refresh sales data?")
+        box.setText(
+            f"Cached sales data is available from <b>{when}</b>.<br><br>"
+            "Use the cached data for an instant load, or refresh from the "
+            "warehouse now (slower)?"
+        )
+        use_cached = box.addButton("Use cached", QMessageBox.ButtonRole.AcceptRole)
+        refresh = box.addButton("Refresh from DB", QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(use_cached)
+        box.exec()
+        if box.clickedButton() is refresh:
+            sales_cache.clear_all()
 
     # ------------------------------------------------------------ navigation
     def _navigate(self, key: str) -> None:

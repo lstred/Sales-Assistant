@@ -122,7 +122,7 @@ class AIChatView(QWidget):
 
         body = QHBoxLayout()
         body.setSpacing(12)
-        self.filter_bar = SalesFilterBar(get_db, cfg=self._cfg)
+        self.filter_bar = SalesFilterBar(get_db, cfg=self._cfg, code_prefix_filter="0")
         self.filter_bar.sales_loaded.connect(self._on_loaded)
         body.addWidget(self.filter_bar)
 

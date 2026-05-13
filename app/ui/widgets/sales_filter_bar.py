@@ -14,7 +14,7 @@ UX rules baked in here so every screen behaves the same:
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Callable
 
 from PySide6.QtCore import QDate, QThread, Signal
@@ -38,6 +38,7 @@ from app.services.fiscal_calendar import (
     last_full_period,
     last_n_full_periods_range,
 )
+from app.storage import sales_cache
 from app.ui.theme import TEXT_MUTED
 from app.ui.widgets.cc_selector import CostCenterSelector
 
@@ -92,6 +93,7 @@ class SalesFilterBar(QFrame):
         *,
         autoload: bool = True,
         autorun: bool = True,
+        code_prefix_filter: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("card")
@@ -103,12 +105,18 @@ class SalesFilterBar(QFrame):
         self._loader: _SalesLoader | None = None
         self._autorun = autorun
         self._has_autorun = False
+        self._last_cache_ts = None  # type: datetime | None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(12)
 
-        self.cc = CostCenterSelector(get_db, autoload=autoload, select_all_after_load=True)
+        self.cc = CostCenterSelector(
+            get_db,
+            autoload=autoload,
+            select_all_after_load=True,
+            code_prefix_filter=code_prefix_filter,
+        )
         self.cc.loaded.connect(self._on_cc_loaded)
         root.addWidget(self.cc, 1)
 
@@ -164,10 +172,21 @@ class SalesFilterBar(QFrame):
         self.status.setWordWrap(True)
         root.addWidget(self.status)
 
+        self.cache_label = QLabel("")
+        self.cache_label.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
+        self.cache_label.setWordWrap(True)
+        root.addWidget(self.cache_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
         self.run_btn = QPushButton("Run")
         self.run_btn.setProperty("primary", True)
-        self.run_btn.clicked.connect(self._run)
-        root.addWidget(self.run_btn)
+        self.run_btn.clicked.connect(lambda: self._run(force_refresh=False))
+        self.refresh_btn = QPushButton("Refresh from DB")
+        self.refresh_btn.clicked.connect(lambda: self._run(force_refresh=True))
+        btn_row.addWidget(self.run_btn, 1)
+        btn_row.addWidget(self.refresh_btn, 1)
+        root.addLayout(btn_row)
 
     # --------------------------------------------------------------- public
     def selected_codes(self) -> list[str]:
@@ -177,9 +196,6 @@ class SalesFilterBar(QFrame):
         s = self.start_edit.date().toPython()
         e = self.end_edit.date().toPython()
         return s, e
-
-    def reload_cost_centers(self) -> None:
-        self.cc.reload()
 
     # --------------------------------------------------------------- presets
     def _apply_preset(self, kind) -> None:
@@ -204,9 +220,9 @@ class SalesFilterBar(QFrame):
     def _on_cc_loaded(self, _count: int) -> None:
         if self._autorun and not self._has_autorun:
             self._has_autorun = True
-            self._run()
+            self._run(force_refresh=False)
 
-    def _run(self) -> None:
+    def _run(self, *, force_refresh: bool = False) -> None:
         ccs = self.selected_codes()
         s, e = self.date_range()
         if e < s:
@@ -224,9 +240,32 @@ class SalesFilterBar(QFrame):
             except ValueError:
                 prior_end = e - timedelta(days=365)
 
+        # Cache hit short-circuit (skipped on explicit Refresh).
+        if not force_refresh:
+            cur_key = sales_cache.make_key(s, e, ccs)
+            cur_hit = sales_cache.get(cur_key)
+            prior_hit = None
+            if prior_start is not None and prior_end is not None:
+                prior_hit = sales_cache.get(
+                    sales_cache.make_key(prior_start, prior_end, ccs)
+                )
+            if cur_hit and (prior_start is None or prior_hit):
+                cur_df, ts = cur_hit
+                prior_df = prior_hit[0] if prior_hit else None
+                self._last_cache_ts = ts
+                self.status.setText(
+                    f"{len(cur_df):,} cached lines"
+                    + (f" · prior {len(prior_df):,}" if prior_df is not None else "")
+                )
+                self._refresh_cache_label()
+                self.sales_loaded.emit(cur_df)
+                self.sales_loaded_with_prior.emit(cur_df, prior_df)
+                return
+
         scope = ", ".join(ccs) if ccs else "all CCs"
         self.status.setText(f"Loading {s} → {e} for {scope}…")
         self.run_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
         self.run_requested.emit(s, e, ccs)
 
         sw = list(self._cfg.fiscal.six_week_january_years) if self._cfg else []
@@ -239,14 +278,40 @@ class SalesFilterBar(QFrame):
 
     def _on_loaded(self, df: pd.DataFrame, prior: pd.DataFrame | None) -> None:
         self.run_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
+        # Persist to cache so a future open is instant.
+        s, e = self.date_range()
+        ccs = self.selected_codes()
+        try:
+            ts = sales_cache.put(sales_cache.make_key(s, e, ccs), df)
+            self._last_cache_ts = ts
+            if prior is not None:
+                try:
+                    ps = s.replace(year=s.year - 1)
+                    pe = e.replace(year=e.year - 1)
+                except ValueError:
+                    ps, pe = s - timedelta(days=365), e - timedelta(days=365)
+                sales_cache.put(sales_cache.make_key(ps, pe, ccs), prior)
+        except Exception:  # noqa: BLE001 — caching failures are non-fatal
+            pass
         suffix = ""
         if prior is not None:
             suffix = f" · prior {len(prior):,} lines"
         self.status.setText(f"{len(df):,} invoiced lines{suffix}.")
+        self._refresh_cache_label()
         self.sales_loaded.emit(df)
         self.sales_loaded_with_prior.emit(df, prior)
 
     def _on_failed(self, msg: str) -> None:
         self.run_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
         self.status.setText(f"Failed — {msg}")
         self.failed.emit(msg)
+
+    def _refresh_cache_label(self) -> None:
+        if self._last_cache_ts is None:
+            self.cache_label.setText("")
+            return
+        self.cache_label.setText(
+            f"Last refreshed {self._last_cache_ts.strftime('%b %d, %Y at %I:%M %p').lstrip('0')}"
+        )
