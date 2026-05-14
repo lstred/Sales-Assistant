@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -33,6 +35,9 @@ from app.ui.views.sales_by_rep_view import SalesByRepView
 from app.ui.views.settings_view import SettingsView
 from app.ui.views.weekly_email_view import WeeklyEmailView
 from app.ui.widgets.sidebar import Sidebar
+
+
+log = logging.getLogger(__name__)
 from app.ui.widgets.status_bar import AppStatusBar
 
 
@@ -134,6 +139,10 @@ class MainWindow(QMainWindow):
         for w in self._views.values():
             self.stack.addWidget(w)
 
+        # Dashboard's "Refresh all data" button fans out to every other
+        # view that knows how to reload itself.
+        self.dashboard_view.refresh_all_requested.connect(self._refresh_all_views)
+
         h.addWidget(self.sidebar)
         h.addWidget(self.stack, 1)
 
@@ -173,6 +182,21 @@ class MainWindow(QMainWindow):
         if box.clickedButton() is refresh:
             sales_cache.clear_all()
             invoice_cache.clear_all()
+            self._refresh_all_views()
+
+    def _refresh_all_views(self) -> None:
+        """Trigger a fresh load on every view that exposes ``refresh_data()``
+        or owns a :class:`SalesFilterBar` named ``filter_bar``."""
+        for view in self._views.values():
+            try:
+                if hasattr(view, "refresh_data") and callable(view.refresh_data):
+                    view.refresh_data()
+                    continue
+                bar = getattr(view, "filter_bar", None)
+                if bar is not None and hasattr(bar, "refresh_data"):
+                    bar.refresh_data()
+            except Exception:  # noqa: BLE001
+                log.exception("refresh_data failed for %s", type(view).__name__)
 
     # ------------------------------------------------------------ navigation
     def _navigate(self, key: str) -> None:

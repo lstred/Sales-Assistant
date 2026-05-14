@@ -186,10 +186,7 @@ class SalesFilterBar(QFrame):
         self.run_btn = QPushButton("Run")
         self.run_btn.setProperty("primary", True)
         self.run_btn.clicked.connect(lambda: self._run(force_refresh=False))
-        self.refresh_btn = QPushButton("Refresh from DB")
-        self.refresh_btn.clicked.connect(lambda: self._run(force_refresh=True))
         btn_row.addWidget(self.run_btn, 1)
-        btn_row.addWidget(self.refresh_btn, 1)
         root.addLayout(btn_row)
 
     # --------------------------------------------------------------- public
@@ -271,14 +268,6 @@ class SalesFilterBar(QFrame):
         scope = ", ".join(ccs) if ccs else "all CCs"
         self.status.setText(f"Loading {s} → {e} for {scope}…")
         self.run_btn.setEnabled(False)
-        self.refresh_btn.setEnabled(False)
-        if force_refresh:
-            # Wipe per-month invoice cache too so the warehouse is hit fresh.
-            try:
-                from app.storage import invoice_cache
-                invoice_cache.clear_all()
-            except Exception:  # noqa: BLE001
-                pass
         self.run_requested.emit(s, e, ccs)
 
         sw = list(self._cfg.fiscal.six_week_january_years) if self._cfg else []
@@ -292,7 +281,6 @@ class SalesFilterBar(QFrame):
 
     def _on_loaded(self, df: pd.DataFrame, prior: pd.DataFrame | None) -> None:
         self.run_btn.setEnabled(True)
-        self.refresh_btn.setEnabled(True)
         # Persist to cache so a future open is instant.
         s, e = self.date_range()
         ccs = self.selected_codes()
@@ -323,7 +311,6 @@ class SalesFilterBar(QFrame):
 
     def _on_failed(self, msg: str) -> None:
         self.run_btn.setEnabled(True)
-        self.refresh_btn.setEnabled(True)
         self.status.setText(f"Failed — {msg}")
         self.failed.emit(msg)
 
@@ -334,3 +321,10 @@ class SalesFilterBar(QFrame):
         self.cache_label.setText(
             f"Last refreshed {self._last_cache_ts.strftime('%b %d, %Y at %I:%M %p').lstrip('0')}"
         )
+
+    # Called by the global “Refresh” button on the Dashboard. Caches have
+    # already been cleared by that point; we just re-fire the loader.
+    def refresh_data(self) -> None:
+        self._last_cache_ts = None
+        self._refresh_cache_label()
+        self._run(force_refresh=True)

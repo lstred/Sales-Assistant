@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 from app.config.models import AppConfig, DatabaseConfig
 from app.data.loaders import load_blended_sales, load_open_orders
 from app.services.fiscal_calendar import last_full_period
+from app.storage import invoice_cache, sales_cache
 from app.ui.views._header import ViewHeader
 from app.ui.widgets.cards import KpiCard
 
@@ -74,6 +75,8 @@ class _DashboardLoader(QThread):
 
 
 class DashboardView(QWidget):
+    refresh_all_requested = Signal()
+
     def __init__(
         self,
         cfg: AppConfig | None = None,
@@ -98,8 +101,13 @@ class DashboardView(QWidget):
             ),
             1,
         )
-        self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.clicked.connect(self._reload)
+        self.refresh_btn = QPushButton("Refresh all data from database")
+        self.refresh_btn.setProperty("primary", True)
+        self.refresh_btn.setToolTip(
+            "Wipes the local sales cache and re-fetches from SQL Server.\n"
+            "Affects every screen in the app."
+        )
+        self.refresh_btn.clicked.connect(self._refresh_everything)
         header_row.addWidget(self.refresh_btn)
         root.addLayout(header_row)
 
@@ -164,3 +172,16 @@ class DashboardView(QWidget):
         for k in ("lfm_revenue", "ytd_revenue", "open_orders", "active_reps"):
             self.cards[k].set_value("—")
             self.cards[k].set_caption(f"Failed: {msg}")
+
+    # ----------------------------------------------------- global refresh
+    def _refresh_everything(self) -> None:
+        """Clear every local cache and re-warm. Triggers reload across
+        every view via the ``refresh_all_requested`` signal which
+        :class:`MainWindow` wires up to each data-driven view."""
+        try:
+            invoice_cache.clear_all()
+            sales_cache.clear_all()
+        except Exception:  # noqa: BLE001
+            pass
+        self._reload()
+        self.refresh_all_requested.emit()

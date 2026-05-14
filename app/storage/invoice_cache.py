@@ -37,7 +37,7 @@ from app.data.db import read_dataframe
 log = logging.getLogger(__name__)
 
 _TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS invoice_month_cache (
+CREATE TABLE IF NOT EXISTS invoice_month_cache_v2 (
     year         INTEGER NOT NULL,
     month        INTEGER NOT NULL,
     code_prefix  TEXT    NOT NULL,
@@ -101,7 +101,7 @@ def _fetch_month(
 def _get_cached(year: int, month: int, code_prefix: str) -> pd.DataFrame | None:
     with closing(_connect()) as conn:
         row = conn.execute(
-            "SELECT payload FROM invoice_month_cache "
+            "SELECT payload FROM invoice_month_cache_v2 "
             "WHERE year=? AND month=? AND code_prefix=?",
             (year, month, (code_prefix or "").strip()),
         ).fetchone()
@@ -117,7 +117,7 @@ def _put_cached(year: int, month: int, code_prefix: str, df: pd.DataFrame) -> No
     payload = pickle.dumps(df, protocol=pickle.HIGHEST_PROTOCOL)
     with closing(_connect()) as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO invoice_month_cache "
+            "INSERT OR REPLACE INTO invoice_month_cache_v2 "
             "(year, month, code_prefix, fetched_at, rows, payload) "
             "VALUES (?, ?, ?, datetime('now'), ?, ?)",
             (year, month, (code_prefix or "").strip(), int(len(df)), payload),
@@ -176,13 +176,13 @@ def get_for_range(
 
 def has_any() -> bool:
     with closing(_connect()) as conn:
-        row = conn.execute("SELECT COUNT(*) FROM invoice_month_cache").fetchone()
+        row = conn.execute("SELECT COUNT(*) FROM invoice_month_cache_v2").fetchone()
     return bool(row and row[0])
 
 
 def clear_all() -> int:
     with closing(_connect()) as conn:
-        cur = conn.execute("DELETE FROM invoice_month_cache")
+        cur = conn.execute("DELETE FROM invoice_month_cache_v2")
         conn.commit()
         return int(cur.rowcount or 0)
 
@@ -191,6 +191,6 @@ def stats() -> tuple[int, int]:
     """Return ``(months_cached, total_rows)``."""
     with closing(_connect()) as conn:
         row = conn.execute(
-            "SELECT COUNT(*), COALESCE(SUM(rows), 0) FROM invoice_month_cache"
+            "SELECT COUNT(*), COALESCE(SUM(rows), 0) FROM invoice_month_cache_v2"
         ).fetchone()
     return (int(row[0] or 0), int(row[1] or 0))

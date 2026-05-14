@@ -286,6 +286,33 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 Newest first.
 
+- **2026-05-14** — Missing-revenue fix + single global Refresh:
+  - **Removed `N_NOT_INVENTORY='Y'` and `i.[IINVEN]='Y'` filters** from
+    `INVOICED_SALES_LINES` and `OPEN_ORDERS_LINES`. Together they were
+    silently dropping **$21.65M / 38,894 lines** of perfectly valid
+    invoiced sales (freight, services, custom items, non-stocked SKUs)
+    in the Aug 2025 → May 2026 window alone. Sales by Rep / Sales by CC
+    now reconcile to the warehouse aggregate exactly. The remaining
+    YoY decline (FY26-rolling vs FY25-rolling) is a real business
+    result, not a query artefact. Sample CCs (`'1xx'`) continue to be
+    excluded from product views via the `code_prefix='0'` filter.
+  - **Single global Refresh button.** Per-page *Refresh from DB*
+    buttons removed from `SalesFilterBar`. The dashboard now hosts the
+    only refresh affordance — *Refresh all data from database* in the
+    page header. Clicking it (a) clears `sales_cache` + `invoice_cache`
+    in one shot, (b) re-fires the dashboard loader, and (c) emits
+    `refresh_all_requested`. `MainWindow._refresh_all_views` fans the
+    signal out to every view that owns a `filter_bar` (Sales by Rep,
+    Sales by CC, Weekly Email, Ask the AI) by calling its new
+    `SalesFilterBar.refresh_data()` helper. `_maybe_prompt_refresh`'s
+    *Refresh from DB* path also funnels through `_refresh_all_views`,
+    so a startup-time refresh now warms every screen consistently.
+  - **Cache schema versioned.** `sales_cache.make_key` now prefixes
+    with `v2|` and the per-month invoice cache table is renamed
+    `invoice_month_cache_v2`. Stale results from the previous
+    aggressive-filter era are silently ignored without manual cleanup.
+  - 13/13 tests still pass.
+
 - **2026-05-13** — AI key fix, legacy-revenue gap, instant repeat loads:
   - **`LocalProtocolError: Illegal header value …Bearer sk-proj-…\n`** —
     a trailing newline in a paste-from-clipboard API key crashed httpx

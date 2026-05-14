@@ -43,7 +43,9 @@ def make_key(
 ) -> str:
     ccs = ",".join(sorted({str(c).strip() for c in (cost_centers or ()) if c}))
     prefix = (code_prefix or "").strip()
-    return f"{start.isoformat()}|{end.isoformat()}|{ccs}|p={prefix}"
+    # ``v`` bumps when the underlying SQL filter set changes so older
+    # cached results are silently invalidated.
+    return f"v2|{start.isoformat()}|{end.isoformat()}|{ccs}|p={prefix}"
 
 
 def get(key: str) -> tuple[pd.DataFrame, datetime] | None:

@@ -81,12 +81,14 @@ WHERE   ISNULL(LTRIM(RTRIM(b.[BSACCT])), '') <> ''
 # string to disable the filter.
 #
 # Filtering rules (locked-in business logic):
-#   * ``ORDER# > 0`` — discard blank/zero-order rows entirely; they are not
-#     valid orders.
-#   * ``INVOICE# > 0`` — only invoiced (shipped/billed) lines count toward
-#     salesman credit and reported revenue. Open (unshipped) orders still
-#     have an ORDER# > 0 but no invoice yet — those are loaded separately
-#     via :data:`OPEN_ORDERS_LINES` for use in insights / pipeline views.
+#   * ``ORDER# > 0`` and ``INVOICE# > 0`` — only invoiced (shipped/billed)
+#     lines count toward salesman credit and reported revenue. Open orders
+#     load via :data:`OPEN_ORDERS_LINES` for pipeline insights only.
+#   * ``ACCOUNT#I > 1`` — exclude warehouse POs (account 1 = own warehouse).
+#   * ``code_prefix`` — when set, restricts to cost centers starting with
+#     the given prefix (``'0'`` for product). This keeps sample CCs (``'1xx'``)
+#     out of revenue tables without dropping legitimate non-inventoried
+#     line items (freight, services, custom items) that *are* real revenue.
 INVOICED_SALES_LINES = """
 SELECT  TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD])         AS invoice_yyyymmdd,
         LTRIM(RTRIM(o.[ACCOUNT#I]))                          AS account_number,
@@ -99,9 +101,7 @@ SELECT  TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD])         AS invoice_yyyymmdd,
         TRY_CONVERT(decimal(18,2), o.[LINE_GPD_WITHOUT_FUNDS])  AS gross_profit
 FROM    dbo._ORDERS AS o
 JOIN    dbo.ITEM    AS i ON i.[ItemNumber] = o.[ITEM_MFGR_COLOR_PAT]
-WHERE   o.[N_NOT_INVENTORY] = 'Y'
-  AND   i.[IINVEN] = 'Y'
-  AND   TRY_CONVERT(int, o.[ACCOUNT#I]) > 1
+WHERE   TRY_CONVERT(int, o.[ACCOUNT#I]) > 1
   AND   TRY_CONVERT(int, o.[ORDER#])    > 0
   AND   TRY_CONVERT(int, o.[INVOICE#])  > 0
   AND   TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD]) BETWEEN :start_yyyymmdd AND :end_yyyymmdd
@@ -125,9 +125,7 @@ SELECT  TRY_CONVERT(int, o.[ORDER_ENTRY_DATE_YYYYMMDD])     AS order_entry_yyyym
         TRY_CONVERT(decimal(18,2), o.[ENTENDED_PRICE_NO_FUNDS]) AS open_revenue
 FROM    dbo._ORDERS AS o
 JOIN    dbo.ITEM    AS i ON i.[ItemNumber] = o.[ITEM_MFGR_COLOR_PAT]
-WHERE   o.[N_NOT_INVENTORY] = 'Y'
-  AND   i.[IINVEN] = 'Y'
-  AND   TRY_CONVERT(int, o.[ACCOUNT#I]) > 1
+WHERE   TRY_CONVERT(int, o.[ACCOUNT#I]) > 1
   AND   TRY_CONVERT(int, o.[ORDER#])    > 0
   AND   ISNULL(TRY_CONVERT(int, o.[INVOICE#]), 0) = 0
   AND   ( :cc_csv = ''
