@@ -160,30 +160,18 @@ class SalesFilterBar(QFrame):
         date_label.setStyleSheet("font-weight: 600;")
         root.addWidget(date_label)
 
-        # Smart defaults: start from app-wide defaults if set, otherwise the
-        # last full year of completed fiscal periods.
+        # Always default to fiscal YTD (FY start → end of last completed
+        # fiscal period) regardless of any previously saved date range.
+        # Saved dates from config are applied only when "Apply to all pages"
+        # is clicked explicitly, keeping the on-launch view always current.
         sw = self._cfg.fiscal.six_week_january_years if self._cfg else []
-        default_start = default_end = None
-        if self._cfg is not None:
-            d = self._cfg.defaults
-            if d.start_iso and d.end_iso:
-                try:
-                    default_start = date.fromisoformat(d.start_iso)
-                    default_end = date.fromisoformat(d.end_iso)
-                except ValueError:
-                    default_start = default_end = None
-        if default_start is None or default_end is None:
-            # Default: fiscal YTD from FY start through end of last completed
-            # fiscal period, so the manager always sees clean full-month data.
-            try:
-                _last_p = last_full_period(date.today(), sw)
-                _fy = _last_p.fiscal_year
-                _fy_start = fy_start_date(_fy, sw)
-                default_start = _fy_start
-                default_end = _last_p.end
-            except Exception:  # noqa: BLE001
-                default_end = date.today()
-                default_start = date(default_end.year, 1, 1)
+        try:
+            _last_p = last_full_period(date.today(), sw)
+            default_start = fy_start_date(_last_p.fiscal_year, sw)
+            default_end = _last_p.end
+        except Exception:  # noqa: BLE001
+            default_end = date.today()
+            default_start = date(default_end.year, 1, 1)
 
         self.start_edit = QDateEdit()
         self.start_edit.setCalendarPopup(True)

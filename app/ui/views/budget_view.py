@@ -199,6 +199,7 @@ class _SettingsPanel(QWidget):
 
     compute_requested = Signal()
     saved = Signal()
+    upload_applied = Signal()  # emitted when a rep-CC override file is successfully loaded
 
     def __init__(self, cfg: AppConfig, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -477,6 +478,7 @@ class _SettingsPanel(QWidget):
                 "CC-level % used as fallback for any unspecified rep × CC pairs."
             )
             self._upload_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #16A34A;")
+            self.upload_applied.emit()  # tell BudgetView to recompute with new overrides
         else:
             self._upload_status.setText("Upload produced no usable rows — check the file.")
             self._upload_status.setStyleSheet(f"font-size: 11px; color: #DC2626;")
@@ -593,6 +595,7 @@ class BudgetView(QWidget):
         self._settings.setMaximumWidth(440)
         self._settings.compute_requested.connect(self._on_compute)
         self._settings.saved.connect(self._on_saved)
+        self._settings.upload_applied.connect(self._on_upload_applied)
         splitter.addWidget(self._settings)
 
         # Right: results panel
@@ -736,6 +739,20 @@ class BudgetView(QWidget):
 
     def _on_saved(self) -> None:
         self._status_label.setText("Settings saved.")
+
+    def _on_upload_applied(self) -> None:
+        """Re-run budget calculations using the newly loaded rep-CC overrides."""
+        if self._prior_df is None:
+            # Data hasn't been loaded yet — the next Compute will pick up the overrides
+            self._status_label.setText(
+                "Override file loaded. Click Compute to apply it to the forecast."
+            )
+            return
+        self._recompute()
+        n = len(self._settings.rep_cc_growth_pct())
+        self._status_label.setText(
+            f"Forecast recomputed with {n} rep × CC override(s) applied."
+        )
 
     def _switch_mode(self, mode: str) -> None:
         self._current_mode = mode

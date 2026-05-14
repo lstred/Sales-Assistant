@@ -294,6 +294,17 @@ read those plus this file's earlier sections for full context.
     one year earlier.  The "YTD" quick-preset in `SalesFilterBar` was also
     updated to use this fiscal definition (was calendar Jan 1 → today).
     `fy_start_date` added to imports in `sales_filter_bar.py`.
+  - **Fiscal YTD is now always the on-launch default**, regardless of any
+    previously saved `start_iso`/`end_iso` in `config.json`.  Saved dates
+    are only applied when the user explicitly clicks "Apply to all pages" on
+    the Dashboard — so the dates shown on first open are always current and
+    clean, not stale from a prior session.
+  - **Upload → auto-recompute wired up**.  `_SettingsPanel` now emits an
+    `upload_applied` signal immediately after a valid file is loaded.
+    `BudgetView` connects this signal to `_on_upload_applied`, which calls
+    `_recompute()` if prior-year data is already loaded, or shows an
+    instructional status label if Compute hasn't been run yet.  Previously
+    the overrides were stored but the table was never refreshed.
   - **Rep-level growth upload** added to the Budget & Forecast view's
     settings panel (`app/ui/views/budget_view.py`):
     - New card **"Rep-Level Growth Override (Upload)"** appears above the
