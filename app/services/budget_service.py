@@ -1,16 +1,32 @@
 """Budget / Forecast computation service.
 
-Given prior-year blended sales, a map of CC → growth-percentage, and a
-12-value monthly seasonality list (P1=Feb through P12=Jan), produces budget
-rows at three levels of granularity:
+Given prior-year blended sales, growth percentages, and a 12-value monthly
+seasonality list (P1=Feb through P12=Jan), this service produces budget rows
+at three levels of granularity:
 
-  * By Cost Center (``compute_budget_by_cc``)
-  * By Sales Rep   (``compute_budget_by_rep``)
-  * By Account     (``compute_budget_by_account``)
+  * By Cost Center  (``compute_budget_by_cc``)
+  * By Sales Rep    (``compute_budget_by_rep``)
+  * By Account      (``compute_budget_by_account``)
 
-Rep and account budgets are derived from each entity's share of prior-year
-sales within their cost center(s), then multiplied by the same CC-level
-growth factor and seasonality curve.
+Two growth-percentage modes are supported — they can be mixed:
+
+  1. **CC-level fallback** (``cc_growth_pct: dict[str, float]``):
+     A single growth % applied to every rep in that CC.  Used as the
+     default when no rep-level override exists.
+
+  2. **Rep+CC override** (``rep_cc_growth_pct: dict[tuple[str,str], float]``):
+     Per-(rep_number, cc_code) growth %.  When present, this takes
+     priority over the CC-level fallback for that rep.  The CC-level
+     budget becomes the *sum* of its individual rep budgets.
+
+Upload format for rep-level overrides (CSV or Excel):
+  Columns (case-insensitive, whitespace-trimmed):
+    • ``rep_number``   — SALESMAN.YSLMN# (e.g. ``42``)
+    • ``cost_center``  — CC code (e.g. ``010``)
+    • ``growth_pct``   — numeric growth or decline % (e.g. ``10`` for +10 %,
+                         ``-5`` for −5 %)
+  One row per rep × CC combination.  Missing combinations fall back to the
+  CC-level growth % from the manual table.
 """
 
 from __future__ import annotations
@@ -54,38 +70,128 @@ class BudgetRow:
     vs_budget: float = 0.0          # ytd_actual − ytd_budget
 
 
+# ---------------------------------------------------------------- upload helper
+
+def parse_rep_cc_upload(path: str) -> tuple[dict[tuple[str, str], float], list[str]]:
+    """Parse a CSV or Excel file with rep-level growth overrides.
+
+    Expected columns (case-insensitive): ``rep_number``, ``cost_center``,
+    ``growth_pct``.  Returns ``({(rep_number, cc): pct}, errors)`` where
+    ``errors`` is a list of human-readable problems found during parsing.
+    """
+    import os
+    errors: list[str] = []
+    result: dict[tuple[str, str], float] = {}
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in (".xlsx", ".xls"):
+            df = pd.read_excel(path, dtype=str)
+        else:
+            df = pd.read_csv(path, dtype=str)
+    except Exception as exc:  # noqa: BLE001
+        return {}, [f"Could not open file: {exc}"]
+
+    # Normalize column names
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    missing = [c for c in ("rep_number", "cost_center", "growth_pct") if c not in df.columns]
+    if missing:
+        return {}, [
+            f"Missing required column(s): {', '.join(missing)}. "
+            "File must have columns: rep_number, cost_center, growth_pct"
+        ]
+
+    for i, row in df.iterrows():
+        raw_rep = row.get("rep_number", "")
+        raw_cc = row.get("cost_center", "")
+        raw_pct = row.get("growth_pct", "")
+        # pandas reads empty cells as NaN even with dtype=str
+        rep = "" if pd.isna(raw_rep) else str(raw_rep).strip()
+        cc = "" if pd.isna(raw_cc) else str(raw_cc).strip()
+        pct_str = "" if pd.isna(raw_pct) else str(raw_pct).strip().replace("%", "")
+        if not rep or not cc:
+            errors.append(f"Row {i + 2}: rep_number or cost_center is blank — skipped.")
+            continue
+        try:
+            pct = float(pct_str)
+        except ValueError:
+            errors.append(f"Row {i + 2}: growth_pct '{pct_str}' is not a number — skipped.")
+            continue
+        result[(rep, cc)] = pct
+
+    return result, errors
+
+
 # ---------------------------------------------------------------- internal helpers
+
+def _effective_growth(
+    rep_num: str,
+    cc: str,
+    rep_cc_growth_pct: dict[tuple[str, str], float],
+    cc_growth_pct: dict[str, float],
+) -> float:
+    """Return the growth % to apply: rep-CC override if present, else CC default."""
+    return rep_cc_growth_pct.get((rep_num, cc), cc_growth_pct.get(cc, 0.0))
+
 
 def _cc_aggregates(
     prior_df: pd.DataFrame | None,
     cc_growth_pct: dict[str, float],
     cc_names: dict[str, str],
+    rep_cc_growth_pct: dict[tuple[str, str], float] | None = None,
+    acct_rep_map: dict[tuple[str, str], tuple[str, str]] | None = None,
 ) -> dict[str, dict]:
     """Aggregate prior_df by cost_center and compute CC-level budget amounts.
 
+    When rep_cc_growth_pct is provided the CC budget is the weighted sum of
+    per-rep budgets (each rep's prior sales × their individual growth factor).
+    Otherwise the simpler CC-level factor applies uniformly.
+
     Returns a dict  cc_code → {cc_code, cc_name, prior, growth_pct, budget,
                                 dollar_change}
-    for every CC that either has prior sales OR has a configured growth %.
+    where ``growth_pct`` is the *effective blended* rate at CC level.
     """
+    rep_overrides = rep_cc_growth_pct or {}
     result: dict[str, dict] = {}
 
     if prior_df is not None and not prior_df.empty:
         grouped = (
-            prior_df.groupby("cost_center", as_index=False)["revenue"]
-            .sum()
+            prior_df.groupby("cost_center", as_index=False)["revenue"].sum()
         )
         for _, row in grouped.iterrows():
             cc = str(row["cost_center"]).strip()
             if not cc:
                 continue
             prior = float(row["revenue"] or 0)
-            pct = cc_growth_pct.get(cc, 0.0)
-            budget = prior * (1.0 + pct / 100.0)
+
+            if rep_overrides and acct_rep_map:
+                # Build rep-level prior sums for this CC
+                rep_prior: dict[str, float] = {}
+                for r in prior_df[prior_df["cost_center"] == cc].itertuples(index=False):
+                    acct = str(getattr(r, "account_number", "") or "").strip()
+                    info = acct_rep_map.get((acct, cc))
+                    if info:
+                        num = info[0]
+                        rep_prior[num] = rep_prior.get(num, 0.0) + float(getattr(r, "revenue", 0) or 0)
+
+                budget = sum(
+                    rp * (1.0 + _effective_growth(num, cc, rep_overrides, cc_growth_pct) / 100.0)
+                    for num, rp in rep_prior.items()
+                )
+                # For unassigned lines, use CC-level factor
+                unassigned_prior = prior - sum(rep_prior.values())
+                if unassigned_prior > 0:
+                    budget += unassigned_prior * (1.0 + cc_growth_pct.get(cc, 0.0) / 100.0)
+                blended_pct = (budget / prior - 1.0) * 100.0 if prior > 0 else cc_growth_pct.get(cc, 0.0)
+            else:
+                pct = cc_growth_pct.get(cc, 0.0)
+                budget = prior * (1.0 + pct / 100.0)
+                blended_pct = pct
+
             result[cc] = {
                 "cc_code": cc,
                 "cc_name": cc_names.get(cc, cc),
                 "prior": prior,
-                "growth_pct": pct,
+                "growth_pct": blended_pct,
                 "budget": budget,
                 "dollar_change": budget - prior,
             }
@@ -132,9 +238,16 @@ def compute_budget_by_cc(
     cc_growth_pct: dict[str, float],
     seasonality_pct: Sequence[float],
     cc_names: dict[str, str],
+    rep_cc_growth_pct: dict[tuple[str, str], float] | None = None,
+    assignments_df: pd.DataFrame | None = None,
 ) -> list[BudgetRow]:
-    """One BudgetRow per cost center (codes starting with '0')."""
-    cc_data = _cc_aggregates(prior_df, cc_growth_pct, cc_names)
+    """One BudgetRow per cost center.
+
+    When ``rep_cc_growth_pct`` is provided the CC budget is the sum of
+    per-rep budgets within the CC.
+    """
+    acct_rep = _build_acct_rep_map(assignments_df) if rep_cc_growth_pct else None
+    cc_data = _cc_aggregates(prior_df, cc_growth_pct, cc_names, rep_cc_growth_pct, acct_rep)
     rows: list[BudgetRow] = []
     for cc, d in sorted(cc_data.items()):
         budget = d["budget"]
@@ -158,13 +271,14 @@ def compute_budget_by_rep(
     cc_growth_pct: dict[str, float],
     seasonality_pct: Sequence[float],
     cc_names: dict[str, str],
+    rep_cc_growth_pct: dict[tuple[str, str], float] | None = None,
 ) -> list[BudgetRow]:
     """One BudgetRow per (rep, cost_center) pair.
 
-    Each rep's budget share within a CC is proportional to their prior-year
-    sales in that CC (same logic as the account view, one level up).
+    Each rep's budget = their prior-year sales in that CC × their effective
+    growth % (rep-level override first, CC-level fallback second).
     """
-    cc_data = _cc_aggregates(prior_df, cc_growth_pct, cc_names)
+    rep_overrides = rep_cc_growth_pct or {}
     acct_rep = _build_acct_rep_map(assignments_df)
 
     # Attribute prior sales to reps via account ownership
@@ -181,49 +295,55 @@ def compute_budget_by_rep(
                 rep_cc_prior[(num, cc)] = rep_cc_prior.get((num, cc), 0.0) + rev
                 rep_names[num] = name
 
-    rows: list[BudgetRow] = []
-    for cc, d in sorted(cc_data.items()):
-        cc_budget = d["budget"]
-        cc_prior = d["prior"]
-        cc_monthly = _monthly_budget(cc_budget, seasonality_pct)
+    # Collect all CCs that appear either in prior sales or in cc_growth_pct
+    all_ccs = sorted(
+        {cc for (_, cc) in rep_cc_prior}
+        | set(cc_growth_pct.keys())
+        | {cc for (_, cc) in rep_overrides}
+    )
 
-        # All reps with prior sales in this CC
-        cc_reps = {
+    rows: list[BudgetRow] = []
+    for cc in all_ccs:
+        cc_rep_priors = {
             num: prior
             for (num, c), prior in rep_cc_prior.items()
             if c == cc
         }
+        cc_prior_total = sum(cc_rep_priors.values())
 
-        if not cc_reps or cc_prior == 0:
+        if not cc_rep_priors:
+            # No prior sales — use CC-level factor for an empty placeholder
+            pct = cc_growth_pct.get(cc, 0.0)
             rows.append(
                 BudgetRow(
                     cc_code=cc,
-                    cc_name=d["cc_name"],
+                    cc_name=cc_names.get(cc, cc),
                     rep_number="",
                     rep_name="(unassigned)",
-                    prior_year_sales=cc_prior,
-                    growth_pct=d["growth_pct"],
-                    dollar_change=d["dollar_change"],
-                    budget_full_year=cc_budget,
-                    monthly_budget=cc_monthly,
+                    prior_year_sales=0.0,
+                    growth_pct=pct,
+                    dollar_change=0.0,
+                    budget_full_year=0.0,
+                    monthly_budget=[0.0] * 12,
                 )
             )
             continue
 
-        for num, rep_prior in sorted(cc_reps.items()):
-            share = rep_prior / cc_prior if cc_prior > 0 else 0.0
-            rep_budget = cc_budget * share
+        for num, rep_prior in sorted(cc_rep_priors.items()):
+            pct = _effective_growth(num, cc, rep_overrides, cc_growth_pct)
+            rep_budget = rep_prior * (1.0 + pct / 100.0)
+            rep_monthly = _monthly_budget(rep_budget, seasonality_pct)
             rows.append(
                 BudgetRow(
                     cc_code=cc,
-                    cc_name=d["cc_name"],
+                    cc_name=cc_names.get(cc, cc),
                     rep_number=num,
                     rep_name=rep_names.get(num, num),
                     prior_year_sales=rep_prior,
-                    growth_pct=d["growth_pct"],
+                    growth_pct=pct,
                     dollar_change=rep_budget - rep_prior,
                     budget_full_year=rep_budget,
-                    monthly_budget=[m * share for m in cc_monthly],
+                    monthly_budget=rep_monthly,
                 )
             )
     return rows
@@ -236,9 +356,14 @@ def compute_budget_by_account(
     cc_growth_pct: dict[str, float],
     seasonality_pct: Sequence[float],
     cc_names: dict[str, str],
+    rep_cc_growth_pct: dict[tuple[str, str], float] | None = None,
 ) -> list[BudgetRow]:
-    """One BudgetRow per (account, cost_center) pair."""
-    cc_data = _cc_aggregates(prior_df, cc_growth_pct, cc_names)
+    """One BudgetRow per (account, cost_center) pair.
+
+    Each account's budget inherits its rep's effective growth % (rep-level
+    override if present, CC-level fallback otherwise).
+    """
+    rep_overrides = rep_cc_growth_pct or {}
     acct_rep = _build_acct_rep_map(assignments_df)
 
     # Aggregate prior sales by (account, cost_center)
@@ -251,51 +376,57 @@ def compute_budget_by_account(
             if acct and cc:
                 acct_cc_prior[(acct, cc)] = acct_cc_prior.get((acct, cc), 0.0) + rev
 
+    # Group by CC
+    from collections import defaultdict
+    cc_accts: dict[str, dict[str, float]] = defaultdict(dict)
+    for (acct, cc), prior in acct_cc_prior.items():
+        cc_accts[cc][acct] = prior
+
+    all_ccs = sorted(
+        set(cc_accts.keys()) | set(cc_growth_pct.keys())
+        | {cc for (_, cc) in rep_overrides}
+    )
+
     rows: list[BudgetRow] = []
-    for cc, d in sorted(cc_data.items()):
-        cc_budget = d["budget"]
-        cc_prior = d["prior"]
-        cc_monthly = _monthly_budget(cc_budget, seasonality_pct)
+    for cc in all_ccs:
+        accts_in_cc = cc_accts.get(cc, {})
 
-        cc_accts = {
-            acct: prior
-            for (acct, c), prior in acct_cc_prior.items()
-            if c == cc
-        }
-
-        if not cc_accts or cc_prior == 0:
+        if not accts_in_cc:
+            pct = cc_growth_pct.get(cc, 0.0)
             rows.append(
                 BudgetRow(
                     cc_code=cc,
-                    cc_name=d["cc_name"],
-                    prior_year_sales=cc_prior,
-                    growth_pct=d["growth_pct"],
-                    dollar_change=d["dollar_change"],
-                    budget_full_year=cc_budget,
-                    monthly_budget=cc_monthly,
+                    cc_name=cc_names.get(cc, cc),
+                    prior_year_sales=0.0,
+                    growth_pct=pct,
+                    dollar_change=0.0,
+                    budget_full_year=0.0,
+                    monthly_budget=[0.0] * 12,
                 )
             )
             continue
 
-        for acct, acct_prior in sorted(cc_accts.items()):
-            share = acct_prior / cc_prior if cc_prior > 0 else 0.0
-            acct_budget = cc_budget * share
-            info = account_info.get(acct, {})
+        for acct, acct_prior in sorted(accts_in_cc.items()):
             rep_info = acct_rep.get((acct, cc), ("", ""))
+            rep_num = rep_info[0]
+            pct = _effective_growth(rep_num, cc, rep_overrides, cc_growth_pct)
+            acct_budget = acct_prior * (1.0 + pct / 100.0)
+            acct_monthly = _monthly_budget(acct_budget, seasonality_pct)
+            info = account_info.get(acct, {})
             rows.append(
                 BudgetRow(
                     cc_code=cc,
-                    cc_name=d["cc_name"],
-                    rep_number=rep_info[0],
+                    cc_name=cc_names.get(cc, cc),
+                    rep_number=rep_num,
                     rep_name=rep_info[1],
                     account_new=acct,
                     account_old=str(info.get("old", "") or "").strip(),
                     account_name=str(info.get("name", "") or "").strip().lstrip("*").strip(),
                     prior_year_sales=acct_prior,
-                    growth_pct=d["growth_pct"],
+                    growth_pct=pct,
                     dollar_change=acct_budget - acct_prior,
                     budget_full_year=acct_budget,
-                    monthly_budget=[m * share for m in cc_monthly],
+                    monthly_budget=acct_monthly,
                 )
             )
     return rows

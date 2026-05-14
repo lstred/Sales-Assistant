@@ -46,6 +46,7 @@ from app.services.budget_service import (
     compute_budget_by_account,
     compute_budget_by_cc,
     compute_budget_by_rep,
+    parse_rep_cc_upload,
     rows_to_dataframe,
 )
 from app.services.fiscal_calendar import (
@@ -202,6 +203,7 @@ class _SettingsPanel(QWidget):
     def __init__(self, cfg: AppConfig, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._cfg = cfg
+        self._rep_cc_overrides: dict[tuple[str, str], float] = {}
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         outer = QVBoxLayout(self)
@@ -321,6 +323,66 @@ class _SettingsPanel(QWidget):
         self.save_btn = QPushButton("Save Settings")
         self.save_btn.clicked.connect(self._save)
         lay.addWidget(self.save_btn)
+
+        # --- Rep-CC growth upload card ---
+        up_card = QFrame()
+        up_card.setObjectName("card")
+        up_lay = QVBoxLayout(up_card)
+        up_lay.setContentsMargins(12, 12, 12, 12)
+        up_lay.setSpacing(8)
+        up_title = QLabel("Rep-Level Growth Override (Upload)")
+        up_title.setStyleSheet("font-weight: 700; font-size: 13px;")
+        up_lay.addWidget(up_title)
+        up_sub = QLabel(
+            "Upload a CSV or Excel file to set a unique growth % per rep per cost center. "
+            "Overrides the CC-level table above for matching rep+CC pairs. "
+            "Missing combinations fall back to the CC-level %."
+        )
+        up_sub.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
+        up_sub.setWordWrap(True)
+        up_lay.addWidget(up_sub)
+
+        # Format spec box
+        spec = QLabel(
+            "<b>Required columns (exact names, case-insensitive):</b><br>"
+            "&nbsp;&nbsp;<b>rep_number</b> — salesman number (e.g. <tt>42</tt>)<br>"
+            "&nbsp;&nbsp;<b>cost_center</b> — CC code (e.g. <tt>010</tt>)<br>"
+            "&nbsp;&nbsp;<b>growth_pct</b> — growth or decline % (<tt>10</tt> = +10 %, <tt>-5</tt> = −5 %)<br>"
+            "One row per rep × CC pair. Extra columns are ignored."
+        )
+        spec.setStyleSheet(
+            f"background: #EFF6FF; border: 1px solid #BFDBFE; border-radius: 6px; "
+            f"padding: 8px; font-size: 11px; color: {TEXT};"
+        )
+        spec.setWordWrap(True)
+        up_lay.addWidget(spec)
+
+        up_btn_row = QHBoxLayout()
+        up_btn_row.setSpacing(6)
+        self._upload_btn = QPushButton("⬆  Upload CSV / Excel")
+        self._upload_btn.clicked.connect(self._upload_overrides)
+        up_btn_row.addWidget(self._upload_btn, 1)
+        self._dl_template_btn = QPushButton("⬇  Template")
+        self._dl_template_btn.clicked.connect(self._download_template)
+        up_btn_row.addWidget(self._dl_template_btn)
+        up_lay.addLayout(up_btn_row)
+
+        self._upload_status = QLabel("No file loaded — using CC-level growth % for all reps.")
+        self._upload_status.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
+        self._upload_status.setWordWrap(True)
+        up_lay.addWidget(self._upload_status)
+
+        self._upload_preview = QTableWidget(0, 3)
+        self._upload_preview.setHorizontalHeaderLabels(["Rep #", "CC", "Growth %"])
+        self._upload_preview.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._upload_preview.verticalHeader().setVisible(False)
+        self._upload_preview.setAlternatingRowColors(True)
+        self._upload_preview.setMaximumHeight(140)
+        self._upload_preview.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._upload_preview.setVisible(False)
+        up_lay.addWidget(self._upload_preview)
+
+        lay.addWidget(up_card)
         lay.addStretch()
 
     # ------------------------------------------------------------ public
@@ -340,6 +402,10 @@ class _SettingsPanel(QWidget):
                 except ValueError:
                     out[cc] = 0.0
         return out
+
+    def rep_cc_growth_pct(self) -> dict[tuple[str, str], float]:
+        """Rep-CC override map from uploaded file (empty if no file loaded)."""
+        return dict(self._rep_cc_overrides)
 
     def seasonality_pct(self) -> list[float]:
         result = []
@@ -378,6 +444,77 @@ class _SettingsPanel(QWidget):
             float(item.text().replace("%", "").strip())
         except ValueError:
             item.setText("0.00")
+
+    # ------------------------------------------------------------ upload
+    def _upload_overrides(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Rep-CC Growth Override File",
+            str(Path.home()),
+            "Spreadsheets (*.csv *.xlsx *.xls)",
+        )
+        if not path:
+            return
+        overrides, errors = parse_rep_cc_upload(path)
+        if errors:
+            detail = "\n".join(errors[:10])
+            if len(errors) > 10:
+                detail += f"\n… and {len(errors) - 10} more."
+            reply = QMessageBox.warning(
+                self, "Upload warnings",
+                f"{len(overrides)} overrides loaded with {len(errors)} warning(s):\n\n{detail}",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            )
+            if reply == QMessageBox.StandardButton.Cancel:
+                return
+        if not overrides and not errors:
+            QMessageBox.information(self, "Empty file", "No valid rows found in the file.")
+            return
+        self._rep_cc_overrides = overrides
+        self._refresh_upload_preview()
+        if overrides:
+            self._upload_status.setText(
+                f"{len(overrides)} rep × CC override(s) loaded from {os.path.basename(path)}. "
+                "CC-level % used as fallback for any unspecified rep × CC pairs."
+            )
+            self._upload_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #16A34A;")
+        else:
+            self._upload_status.setText("Upload produced no usable rows — check the file.")
+            self._upload_status.setStyleSheet(f"font-size: 11px; color: #DC2626;")
+
+    def _refresh_upload_preview(self) -> None:
+        data = sorted(self._rep_cc_overrides.items())
+        self._upload_preview.setRowCount(len(data))
+        for i, ((rep, cc), pct) in enumerate(data):
+            self._upload_preview.setItem(i, 0, _non_editable(rep, Qt.AlignmentFlag.AlignLeft))
+            self._upload_preview.setItem(i, 1, _non_editable(cc, Qt.AlignmentFlag.AlignLeft))
+            self._upload_preview.setItem(i, 2, _non_editable(f"{pct:+.2f}%"))
+        self._upload_preview.setVisible(bool(data))
+
+    def _download_template(self) -> None:
+        """Save a blank template CSV so the manager knows the exact format."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Upload Template",
+            str(Path.home() / "budget_override_template.csv"),
+            "CSV files (*.csv)",
+        )
+        if not path:
+            return
+        template = (
+            "rep_number,cost_center,growth_pct\n"
+            "# Instructions:\n"
+            "#   rep_number  — salesman number exactly as it appears in Sales Reps (e.g. 42)\n"
+            "#   cost_center — product CC code (e.g. 010)\n"
+            "#   growth_pct  — numeric % (e.g. 10 for +10%, -5 for -5%)\n"
+            "#   Remove these comment lines before uploading.\n"
+            "42,010,10.0\n"
+            "42,020,-5.0\n"
+            "17,010,12.5\n"
+        )
+        try:
+            Path(path).write_text(template)
+            self._upload_status.setText(f"Template saved: {os.path.basename(path)}")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Save failed", str(exc))
 
     def _on_sea_item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() != 1:
@@ -609,16 +746,21 @@ class BudgetView(QWidget):
     def _recompute(self) -> None:
         growth = self._settings.growth_pct_map()
         seasonality = self._settings.seasonality_pct()
+        rep_cc = self._settings.rep_cc_growth_pct() or None  # None = no overrides
 
         self._rows_by_cc = compute_budget_by_cc(
-            self._prior_df, growth, seasonality, self._cc_names
+            self._prior_df, growth, seasonality, self._cc_names,
+            rep_cc_growth_pct=rep_cc,
+            assignments_df=self._assignments_df,
         )
         self._rows_by_rep = compute_budget_by_rep(
-            self._prior_df, self._assignments_df, growth, seasonality, self._cc_names
+            self._prior_df, self._assignments_df, growth, seasonality, self._cc_names,
+            rep_cc_growth_pct=rep_cc,
         )
         self._rows_by_acct = compute_budget_by_account(
             self._prior_df, self._assignments_df, self._account_info,
             growth, seasonality, self._cc_names,
+            rep_cc_growth_pct=rep_cc,
         )
 
         for rows, gby in (

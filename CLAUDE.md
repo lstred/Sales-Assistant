@@ -284,18 +284,60 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 ## 9. Change log
 
-Newest first. Older entries are condensed at the bottom of the list \u2014
+Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
-- **2026-05-14 (latest)** \u2014 Default date range, leaderboard cleanup, Budget & Forecast view:
-  - **Default filter date range** in `SalesFilterBar` changed to **12 months ending yesterday** (rolling calendar year, not fiscal periods). The "Rolling year" preset still uses fiscal periods.
-  - **Master leaderboard shoutouts removed.** Per-rep AI shout-out column eliminated; table now shows rank, rep, last-week $, and week-to-date $ only.
+- **2026-05-14 (latest)** — Rep-level budget upload + fiscal YTD default filter:
+  - **Default filter date range** changed to **fiscal YTD**: from the start
+    of the current fiscal year through the end of the last fully-completed
+    fiscal period.  Prior-year comparison covers the same fiscal YTD range
+    one year earlier.  The "YTD" quick-preset in `SalesFilterBar` was also
+    updated to use this fiscal definition (was calendar Jan 1 → today).
+    `fy_start_date` added to imports in `sales_filter_bar.py`.
+  - **Rep-level growth upload** added to the Budget & Forecast view's
+    settings panel (`app/ui/views/budget_view.py`):
+    - New card **"Rep-Level Growth Override (Upload)"** appears above the
+      CC growth table with a clear column-format spec, a **Download
+      Template** button, and a **Upload CSV / Excel** button.
+    - Upload accepts `.csv`, `.xlsx`, `.xls`.  Exact required columns
+      (case-insensitive): `rep_number`, `cost_center`, `growth_pct`.
+    - After parsing, a compact preview table shows the loaded overrides;
+      the upload-status label turns green on success.  Warning dialog lets
+      the manager decide whether to keep partial results when some rows are
+      invalid.
+    - **`parse_rep_cc_upload(path)`** helper in `budget_service.py`:
+      reads the file, normalises columns, handles NaN empty cells, validates
+      numeric growth %, returns `({(rep_num, cc): pct}, errors)`.
+    - **`_SettingsPanel.rep_cc_growth_pct()`** method exposes the loaded
+      override map to `BudgetView`.
+    - **Budget service** (`app/services/budget_service.py`) extended:
+      - `compute_budget_by_cc`, `compute_budget_by_rep`,
+        `compute_budget_by_account` each accept
+        `rep_cc_growth_pct: dict[tuple[str,str], float] | None = None`.
+      - When a `(rep_num, cc)` key is present: rep budget = rep prior ×
+        (1 + override/100) — direct, not via CC proportional share.
+      - CC budget = *sum of its reps' budgets* when overrides are present;
+        unassigned lines use the CC-level fallback.
+      - `_effective_growth(rep_num, cc, rep_overrides, cc_defaults)` helper.
+      - `_cc_aggregates` recalculated to handle blended growth rates.
+    - `compute_budget_by_cc` now also accepts `assignments_df` so it can
+      attribute prior sales to reps when computing CC totals from overrides.
+    - **22/22 tests pass** (4 new: `test_parse_rep_cc_upload_from_csv`,
+      `test_parse_rep_cc_upload_skips_bad_rows`,
+      `test_budget_rep_cc_override_takes_priority`,
+      `test_budget_cc_level_fallback_when_no_override`).
+
+- **2026-05-14** — Default date range, leaderboard cleanup, Budget & Forecast view:
+  - **Default filter date range** in `SalesFilterBar` set to **12 months
+    ending yesterday** (superseded by fiscal YTD in the entry above).
+  - **Master leaderboard shoutouts removed.** Per-rep AI shout-out column
+    eliminated; table now shows rank, rep, last-week $, and week-to-date $ only.
   - **Budget & Forecast view** (`app/ui/views/budget_view.py`) added as a new sidebar entry:
-    - Settings panel (left): budget fiscal year spinner, CC growth % table (editable per CC), monthly seasonality % table (P1=Feb\u2026P12=Jan, must sum to 100), Save Settings.
+    - Settings panel (left): budget fiscal year spinner, CC growth % table (editable per CC), monthly seasonality % table (P1=Feb…P12=Jan, must sum to 100), Save Settings.
     - Results panel (right): toggle by Cost Center / Sales Rep / Customer; Download CSV and Download Excel buttons.
-    - **Three-level cascade**: CC budget = prior year \u00d7 (1 + growth%). Rep and account budgets distributed proportionally by prior-year sales share within each CC. Monthly budgets = full-year budget \u00d7 seasonality %.
+    - **Three-level cascade**: CC budget = prior year × (1 + growth%). Rep and account budgets distributed proportionally by prior-year sales share within each CC. Monthly budgets = full-year budget × seasonality %.
     - Default YTD display: Prior Year Full, Growth %, $ Change, Budget Full Year + (current FY only) Prior YTD, Budget YTD, Actual YTD, Vs Budget.
-    - Downloads: full fiscal year with 12 monthly columns (Feb Budget\u2026Jan Budget). Export mode picker lets user choose CC/Rep/Customer at download time. Excel export uses openpyxl with dark header, auto-width, currency format.
+    - Downloads: full fiscal year with 12 monthly columns (Feb Budget…Jan Budget). Export mode picker lets user choose CC/Rep/Customer at download time. Excel export uses openpyxl with dark header, auto-width, currency format.
     - **`BudgetConfig`** added to `AppConfig`: `budget_fiscal_year`, `cc_growth_pct`, `monthly_seasonality_pct`.
     - **`app/services/budget_service.py`** (new): `BudgetRow` dataclass, `compute_budget_by_cc/rep/account`, `add_ytd_actuals`, `rows_to_dataframe`.
     - `openpyxl` added to venv.

@@ -37,6 +37,7 @@ from app.data.loaders import load_blended_sales
 from app.services.fiscal_calendar import (
     last_full_period,
     last_n_full_periods_range,
+    fy_start_date,
 )
 from app.services.singleflight import sales_singleflight
 from app.storage import sales_cache
@@ -172,12 +173,17 @@ class SalesFilterBar(QFrame):
                 except ValueError:
                     default_start = default_end = None
         if default_start is None or default_end is None:
-            yesterday = date.today() - timedelta(days=1)
+            # Default: fiscal YTD from FY start through end of last completed
+            # fiscal period, so the manager always sees clean full-month data.
             try:
-                default_start = yesterday.replace(year=yesterday.year - 1)
-            except ValueError:
-                default_start = yesterday - timedelta(days=365)
-            default_end = yesterday
+                _last_p = last_full_period(date.today(), sw)
+                _fy = _last_p.fiscal_year
+                _fy_start = fy_start_date(_fy, sw)
+                default_start = _fy_start
+                default_end = _last_p.end
+            except Exception:  # noqa: BLE001
+                default_end = date.today()
+                default_start = date(default_end.year, 1, 1)
 
         self.start_edit = QDateEdit()
         self.start_edit.setCalendarPopup(True)
@@ -252,7 +258,13 @@ class SalesFilterBar(QFrame):
             s, e = last_n_full_periods_range(today, kind, sw)
             self._set_dates(s, e)
         elif kind == "ytd":
-            self._set_dates(date(today.year, 1, 1), today)
+            # Fiscal YTD: FY start → end of last completed fiscal period
+            try:
+                last_p = last_full_period(today, sw)
+                fy_s = fy_start_date(last_p.fiscal_year, sw)
+                self._set_dates(fy_s, last_p.end)
+            except Exception:
+                self._set_dates(date(today.year, 1, 1), today)
         elif isinstance(kind, int) and kind < 0:
             self._set_dates(today.fromordinal(today.toordinal() + kind), today)
 
