@@ -282,11 +282,15 @@ class AIChatView(QWidget):
         try:
             sel = set(self.filter_bar.selected_codes())
             if sel and self._cfg is not None:
-                # Sample → product map; reverse it for "samples that feed
-                # the selected product CC(s)".
+                from app.services.manager_analytics import (
+                    normalise_sample_product_pairs,
+                )
+                # Normalised so direction-of-entry in CC Mapping doesn't matter.
+                pairs = normalise_sample_product_pairs(
+                    self._cfg.sample_to_product_cc
+                )
                 related_samples = sorted({
-                    s_cc for s_cc, p_cc in self._cfg.sample_to_product_cc.items()
-                    if p_cc in sel
+                    s_cc for s_cc, p_cc in pairs.items() if p_cc in sel
                 })
                 related_displays = sorted({
                     code

@@ -284,7 +284,33 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 ## 9. Change log
 
-Newest first.
+Newest first. Older entries are condensed at the bottom of the list \u2014
+read those plus this file's earlier sections for full context.
+
+- **2026-05-14 (late PM)** \u2014 Sample-attribution + display-table fix:
+  - **`dbo.BCACCT` does not exist**. The display-placement query was
+    pointing at the wrong table. The actual customer-display table is
+    `dbo.BILL_CD` (with `BCACCT`/`BCCODE`/`BCCAT` columns). Fixed in
+    `app/data/queries.py::DISPLAY_PLACEMENTS`. Loader now returns
+    20,516 placements and core-display coverage is no longer zero.
+  - **Samples were credited to nobody** because almost every sample
+    line in `_ORDERS` has a blank `SALESPERSON_DESC` (samples are
+    pulled by inside-sales, not the rep). New attribution logic in
+    `compute_rep_scorecards` looks each sample row up by
+    *(account, sample_cc \u2192 product_cc)* in `BILLSLMN` to find the rep
+    who owns that account on the sponsoring product CC, with a
+    fallback to "any product CC owner" for samples whose CC has no
+    explicit mapping. Live test on rep MARK LOMONACO: 0 \u2192 2,138
+    sample lines.
+  - **CC-mapping direction-of-entry is now forgiving**. New helper
+    `normalise_sample_product_pairs(mapping)` returns
+    `{sample_cc: product_cc}` regardless of which side the user typed
+    it on, by inspecting the leading digit (`'1'` = sample,
+    `'0'` = product). The `CCMappingView` header copy was rewritten to
+    explain this. `AIChatView` now uses the same normaliser when
+    expanding scope to "samples that feed the selected product CC".
+  - **Tests**. New `test_normalise_sample_product_pairs_either_direction`
+    and `test_samples_attributed_via_account_ownership`. **18/18 pass.**
 
 - **2026-05-14 (PM)** — Bug-fix + polish round (master leaderboard,
   outliers, samples/displays, account labels):
@@ -450,346 +476,85 @@ Newest first.
     a running QThread.
   - 14/14 tests still pass.
 
-- **2026-05-14** — Crash fix + per-view feedback + fiscal-aware KPIs:
-  - **Native crash on Refresh fixed**: every QThread-owning view (and the
-    `CostCenterSelector`/`SalesFilterBar` widgets) used the
-    `self._loader = QThread(...)` pattern. When a refresh fired while a
-    previous loader was still running, the old reference was overwritten,
-    Python GC'd the still-running QThread, and PySide6 took the whole
-    process down. All sites now hold a `self._loaders: list[...]` and
-    each thread connects its `finished` signal to remove itself, so
-    multiple in-flight loaders coexist safely. Affected files:
-    `dashboard_view`, `reps_view`, `cc_mapping_view`,
-    `core_displays_view`, `ai_chat_view`, `cc_selector`,
-    `sales_filter_bar`.
-  - **Per-screen loading feedback in the sidebar.** Each nav button now
-    appends a status glyph: `⟳` (loading), `✓` (loaded), `!` (failed).
-    `Sidebar.set_status(key, state)` is the public API.
-    `SalesFilterBar` and `DashboardView` emit `busy_state_changed(str)`,
-    which `MainWindow` wires to the matching sidebar key. The startup
-    "Apply to all pages" / "Refresh" flow now visibly reports progress
-    for every screen as it loads.
-  - **Fiscal YTD KPI** — replaced the calendar `date(today.year,1,1)`
-    YTD card on the Dashboard with a true fiscal YTD using
-    `fy_start_date(fiscal_year_for(today))`. Caption now reads
-    `FY27 YTD · since 2026-02-01`.
-  - **Dashboard KPIs respect global default filters.** `_DashboardLoader`
-    now honors `cfg.defaults.cost_centers` for every blended-sales call
-    (LFM, fiscal YTD, open orders, active reps) and adds a new
-    **Selected range** KPI that computes total revenue across
-    `cfg.defaults.start_iso → end_iso` (or shows "—" if no default range
-    is set). All KPIs reflect the manager's chosen scope, not the entire
-    warehouse.
-  - **AI scope expanded** to include indirectly relevant context. When
-    the manager has selected product CC(s) in *Ask the AI*, the user
-    message now also lists (a) the **sample CCs that map to those
-    products** via `AppConfig.sample_to_product_cc`, and (b) the
-    **core display codes** registered for those CCs via
-    `AppConfig.core_displays_by_cc`. The AI can reason about
-    sample-pull and display correlations without the manager having to
-    surface them manually.
-  - 14/14 tests pass.
+- **2026-05-14** \u2014 Earlier same-day rounds (condensed):
+  - **Crash fix on Refresh** \u2014 every QThread-owning view now holds a
+    `self._loaders: list[...]` and connects each thread's `finished` to
+    self-removal, so concurrent loaders never get GC'd mid-run.
+  - **Per-screen sidebar status glyphs** (`\u27f3`/`\u2713`/`!`) via
+    `Sidebar.set_status(key, state)` driven by `busy_state_changed`.
+  - **Fiscal YTD KPI** uses `fy_start_date(fiscal_year_for(today))`.
+  - **Dashboard KPIs honor `cfg.defaults.cost_centers`** + new
+    *Selected range* KPI for `cfg.defaults.start_iso\u2192end_iso`.
+  - **Singleflight loader dedup** (`app/services/singleflight.py`) keyed
+    `(start, end, ccs, code_prefix)` collapses concurrent identical
+    queries across all views \u2014 ~3-4x refresh speedup.
+  - **Global default filters** (`AppConfig.defaults: GlobalFiltersConfig`)
+    + Dashboard *Default filters* card with *Apply to all pages* and
+    *Save as default*. `SalesFilterBar.apply_filters(start, end, ccs)`
+    + `refresh_data()` are the public APIs.
+  - **Removed `N_NOT_INVENTORY='Y'` and `IINVEN='Y'` filters** from
+    `INVOICED_SALES_LINES`/`OPEN_ORDERS_LINES` \u2014 they were silently
+    dropping $21.65M / 38,894 valid invoiced lines (freight, services,
+    custom, non-stock) in one rolling year. Sales now reconcile to the
+    warehouse aggregate.
+  - **Single global Refresh** \u2014 only the Dashboard hosts the refresh
+    button; `MainWindow._refresh_all_views` fans out to every
+    `filter_bar.refresh_data()`. Cache schema bumped to `v2|`.
 
-- **2026-05-14** — Faster refresh + global default filters:
-  - **Singleflight loader dedup** (`app/services/singleflight.py`). All
-    `SalesFilterBar` instances funnel `load_blended_sales` calls through
-    a process-wide `SingleFlight` keyed by
-    `(start, end, cost_centers, code_prefix)`. When the global Refresh
-    fans out to all four sales-driven views simultaneously, only **one**
-    SQL query actually runs — the other three threads wait on the same
-    `threading.Event` and receive the same DataFrame. Refresh time
-    drops by ~3-4x in practice. Added a smoke test
-    (`test_singleflight_collapses_concurrent_calls`) that fires 8
-    concurrent threads and asserts the work fn ran exactly once.
-  - **Global default filters** (`AppConfig.defaults: GlobalFiltersConfig`).
-    Persisted: `start_iso`, `end_iso`, `cost_centers: list[str]`,
-    `vs_prior_year: bool`. Empty start/end means "auto = last 12
-    fiscal periods". Empty CC list means "all CCs".
-  - **"Default filters" card on the Dashboard**
-    (`app/ui/widgets/global_filters_card.py`). Date pickers, vs-prior
-    toggle, embedded `CostCenterSelector` (product CCs only). Two
-    actions:
-      - **Apply to all pages** — emits
-        `DashboardView.apply_global_filters_requested(start, end, ccs)`,
-        which `MainWindow._apply_global_filters` fans out to every
-        view's `filter_bar.apply_filters(start, end, ccs)`. Each filter
-        bar updates its own date pickers + CC checklist and re-runs.
-        Combined with singleflight + cache, all four pages reload in
-        a single SQL hit.
-      - **Save as default** — emits
-        `save_global_filters_requested(...)`, which `MainWindow`
-        persists to `AppConfig.defaults` via `save_config`. Next
-        launch every `SalesFilterBar` opens already pre-filtered.
-  - **`SalesFilterBar.apply_filters(start, end, ccs)`** — public API for
-    programmatic filter changes; pairs with `refresh_data()` for
-    cache-bypass refresh. Filter bar constructor now reads
-    `cfg.defaults.{start_iso, end_iso, cost_centers, vs_prior_year}`
-    on construction so every page opens consistent.
-  - **`CostCenterSelector.set_selected_codes(codes)`** + new
-    `default_selected=` constructor arg. `None`/empty list means
-    "select all" (matches loader semantics).
-  - 14/14 tests pass.
-
-- **2026-05-14** — Missing-revenue fix + single global Refresh:
-  - **Removed `N_NOT_INVENTORY='Y'` and `i.[IINVEN]='Y'` filters** from
-    `INVOICED_SALES_LINES` and `OPEN_ORDERS_LINES`. Together they were
-    silently dropping **$21.65M / 38,894 lines** of perfectly valid
-    invoiced sales (freight, services, custom items, non-stocked SKUs)
-    in the Aug 2025 → May 2026 window alone. Sales by Rep / Sales by CC
-    now reconcile to the warehouse aggregate exactly. The remaining
-    YoY decline (FY26-rolling vs FY25-rolling) is a real business
-    result, not a query artefact. Sample CCs (`'1xx'`) continue to be
-    excluded from product views via the `code_prefix='0'` filter.
-  - **Single global Refresh button.** Per-page *Refresh from DB*
-    buttons removed from `SalesFilterBar`. The dashboard now hosts the
-    only refresh affordance — *Refresh all data from database* in the
-    page header. Clicking it (a) clears `sales_cache` + `invoice_cache`
-    in one shot, (b) re-fires the dashboard loader, and (c) emits
-    `refresh_all_requested`. `MainWindow._refresh_all_views` fans the
-    signal out to every view that owns a `filter_bar` (Sales by Rep,
-    Sales by CC, Weekly Email, Ask the AI) by calling its new
-    `SalesFilterBar.refresh_data()` helper. `_maybe_prompt_refresh`'s
-    *Refresh from DB* path also funnels through `_refresh_all_views`,
-    so a startup-time refresh now warms every screen consistently.
-  - **Cache schema versioned.** `sales_cache.make_key` now prefixes
-    with `v2|` and the per-month invoice cache table is renamed
-    `invoice_month_cache_v2`. Stale results from the previous
-    aggressive-filter era are silently ignored without manual cleanup.
-  - 13/13 tests still pass.
-
-- **2026-05-13** — AI key fix, legacy-revenue gap, instant repeat loads:
-  - **`LocalProtocolError: Illegal header value …Bearer sk-proj-…\n`** —
-    a trailing newline in a paste-from-clipboard API key crashed httpx
-    when building the `Authorization` header. Fixed defensively in three
-    layers: `OpenAIProvider.__init__` strips whitespace before storing
-    the key; `AISettingsDialog.commit_secrets` and `_on_test` strip
-    before writing to keyring; `factory.build_provider` strips on read.
-    Existing bad keys are auto-recovered on next *Test connection*.
-  - **Legacy revenue was being silently truncated** by the inner JOIN
-    against `dbo.vw_CostCenterCLydeMRKCodeXREF` — any marketing code
-    without a CC mapping in that view was dropped from the blended
-    rolling-year totals. `OLD_SYSTEM_SALES` now `LEFT JOIN`s the XREF
-    and synthesises `cost_center = '0' + marketing_code` and
-    `cost_center_name = '(unmapped marketing code …)'` when no mapping
-    exists, so unmapped codes still flow through (and stay visible to
-    the manager so they can be properly mapped via the CC Mapping view).
-  - **Per-month invoice cache** — new `app/storage/invoice_cache.py`.
-    Invoiced lines (`INVOICE# > 0`) are immutable once posted, so any
-    closed historical month is now persisted in
-    `invoice_month_cache(year, month, code_prefix)` and served from
-    local SQLite on every subsequent load. Only the **current calendar
-    month** still hits the warehouse. CC filters are applied in pandas
-    after retrieval, so changing the CC selection on a previously-loaded
-    range is essentially free. `load_invoiced_sales` is the single entry
-    point that uses this; `load_blended_sales` benefits transparently.
-    `MainWindow._maybe_prompt_refresh` "Refresh from DB" and
-    `SalesFilterBar` "Refresh from DB" both wipe the month cache so a
-    forced refresh actually re-hits SQL Server.
-  - Added 2 tests (cache key includes prefix; immutable months served
-    from disk after first fetch). 13/13 pass.
-
-- **2026-05-13** — Product-CC enforcement + autoload fix:
-  - **CC selector now actually autoloads.** `CostCenterSelector` accepted
-    `autoload=True` but never invoked `reload()` — every screen showed
-    "not loaded" and an empty checklist. Constructor now schedules
-    `QTimer.singleShot(0, self.reload)` and reconnects
-    `model.itemChanged → _on_item_changed` (signals are blocked while
-    rows are populated to avoid N spurious emits). Fixes the
-    "CC filters are blank" complaint across Sales by Rep, Sales by CC,
-    Weekly Email, and Ask the AI.
-  - **Sample CCs (`'1xx'`) can no longer leak into product tables.**
-    A new `code_prefix` parameter has been plumbed end-to-end:
-    `INVOICED_SALES_LINES` and `OPEN_ORDERS_LINES` queries take
-    `:code_prefix`; `load_invoiced_sales` / `load_open_orders` /
-    `load_blended_sales` / `_unpivot_old_sales` accept `code_prefix=""`;
-    `SalesFilterBar` stores its `code_prefix_filter` and forwards it to
-    the loader **and** the cache key. So even when the user clicks
-    *Deselect all* (empty CC list = "everything"), product-only views
-    still hard-exclude `'1xx'` codes both in the warehouse query and the
-    legacy unpivot.
-  - **Cache key now includes the prefix** (`…|p=0`), so a product-only
-    cache and an unfiltered cache cannot collide. Existing caches from
-    the previous round are silently invalidated by the key change.
-
-- **2026-05-13** — Premium polish + persistence round:
-  - **Sales views restricted to product CCs** (`'0'` prefix). New
-    `code_prefix_filter` parameter on `CostCenterSelector` + `SalesFilterBar`;
-    Sales by Rep, Sales by Cost Center, Weekly Email, and Ask the AI all
-    pass `code_prefix_filter="0"`. Sample / display data is reserved for
-    insights & correlation features per the new convention.
-  - **CC selector simplified** — only **Select all** + **Deselect all**.
-    The four-way *None / Reload / Products only / Samples only* button
-    cluster is gone; users tick rows individually instead. The `Reload`
-    affordance moves to the parent's *Refresh from DB* button.
-  - **Legacy sales now attributed to the current rep** (and customer).
-    `_unpivot_old_sales` accepts an `(account, cost_center) → rep_name`
-    map built from `dbo.BILLSLMN`/`dbo.SALESMAN` in `load_blended_sales`.
-    Each pre-cutoff `ClydeMarketingHistory` row is assigned to whoever
-    currently owns that account+CC. Accounts with no current assignment
-    fall back to `(legacy / pre-Aug 2025)`. Fixes the screenshot's
-    "all $189M of prior-year revenue lumped on one row" issue.
-  - **Persistent sales cache** — new `app/storage/sales_cache.py` (SQLite
-    table `sales_cache`, pickled DataFrame + ISO refresh timestamp,
-    keyed by `start|end|sorted-CCs`). `SalesFilterBar` checks the cache
-    on every run; cache hit short-circuits the warehouse round-trip and
-    shows *Last refreshed …* below the status. New **Refresh from DB**
-    button forces a fresh fetch + cache-write. Cache failures are
-    non-fatal (data still flows).
-  - **Startup refresh prompt** — on launch, `MainWindow` waits 250 ms
-    after show, and if `sales_cache.has_any()` it presents a
-    `QMessageBox` with the latest refresh timestamp and two buttons
-    (*Use cached* default / *Refresh from DB*). Refresh clears the
-    cache so every view repopulates fresh.
-  - **Orphaned code removed**: dropped `SalesFilterBar.reload_cost_centers`
-    (no callers). `KpiCard.set_caption` retained.
-  - **Tests added** for legacy rep attribution, sales-cache round-trip,
-    and order-independent cache keys (11/11 pass).
-
-- **2026-05-13** — Empty-Dashboard / partial-sales / sample-CC fixes:
-  - **Blended sales loader**: new `load_blended_sales(db, start, end, ccs,
-    six_week_jan_years)` in `app/data/loaders.py`. For dates ≥
-    `NEW_SYSTEM_CUTOFF` (`2025-08-04`) it pulls line-level invoiced sales
-    from `_ORDERS`; for dates before the cutoff it falls back to the
-    summarized `dbo.ClydeMarketingHistory` table, unpivoting
-    `SalesPeriod1..12` / `CostsPeriod1..12` into one row per (account ×
-    cost center × fiscal period). Legacy rows have no rep attribution and
-    are tagged `salesperson_desc = "(legacy / pre-Aug 2025)"`. The new
-    `data_source` column is either `"new"` or `"legacy"`. Fixes the
-    "all sales views show ~$100M instead of ~$180M" complaint —
-    historical pre-cutoff portion of the rolling-year window is now
-    included.
-  - **`SalesFilterBar` switched to blended loader**: every screen that
-    uses it (Sales by Rep, Sales by CC, Weekly Email, Ask the AI)
-    now sees blended totals. **"Also load prior year"** is on by default
-    and now shifts the range exactly one calendar year back (handles
-    leap-day) so YoY columns make sense even when the prior range
-    crosses the cutoff.
-  - **All cost centers in selectors**: new SQL `ALL_COST_CENTERS` (from
-    `dbo.ITEM.[ICCTR]`, left-joined to the XREF view for friendly names)
-    and loader `load_all_cost_centers`. Both `CostCenterSelector` (used
-    by `SalesFilterBar`) and `CCMappingView` now use this — sample CCs
-    that start with `'1'` are surfaced and the *Maps to (Parent CC)*
-    dropdown contains every code, not just the 23 from the XREF view.
-    Empty-state copy in CC Mapping updated to mention `dbo.ITEM`.
-  - **Vs prior year columns**: `SalesByRepView` and
-    `SalesByCostCenterView` now subscribe to
-    `sales_loaded_with_prior(current, prior)` instead of the legacy
-    `sales_loaded(current)`. Each surfaces a `prior_revenue` column and a
-    `yoy_pct` column (Δ% vs prior year). When prior data is missing the
-    columns are blank.
-  - **Dashboard populated**: `DashboardView` now accepts `cfg` + `get_db`,
-    runs a `_DashboardLoader` `QThread` on first show, and shows real
-    KPIs — Last full fiscal month revenue (blended), YTD revenue
-    (blended), Open orders ($) + line count, and Active reps (distinct
-    `salesperson_desc` over the last 90 days). A *Refresh* button reruns
-    the load. Conversation / action-item / needs-review cards remain
-    `0` until those features land. `KpiCard.set_caption()` added so the
-    card sub-text can be updated post-load (e.g., "FY27 P3 · April").
-
-- **2026-05-13** — Invisible-window / pythonw fix:
-  - **App data path moved** to `~\Documents\SalesAssistant` because a
-    managed-IT policy was silently deleting any new file under
-    `%APPDATA%\SalesAssistant` ~1s after process exit (verified by
-    writing test files to several alternate paths — only the original
-    `%APPDATA%\SalesAssistant` lost them). `app/app_paths.py` now uses
-    `Path.home() / "Documents" / "SalesAssistant"`.
-  - **pythonw-safe logging**: `_configure_logging` skips the
-    `StreamHandler(sys.stderr)` when `sys.stderr is None` (the
-    pythonw.exe case), uses `logging.basicConfig(force=True)`, and
-    installs a `sys.excepthook` so unhandled exceptions land in the
-    log. The original silent crash was traceable to
-    `StreamHandler(sys.stderr)` raising on `None` before `MainWindow.show()`.
-  - `MainWindow.show()` now also calls `raise_()` and
-    `activateWindow()`, and logs the post-show
-    `isVisible()` state for diagnosis.
-
-- **2026-05-13** — Bugfix + feature round (running-app feedback):
-  - **DB error fix**: removed non-existent `o.[SALESPERSON]` column from
-    `INVOICED_SALES_LINES` and `OPEN_ORDERS_LINES`. The warehouse only
-    exposes `o.[SALESPERSON_DESC]`; the rep number lives in
-    `BILLSLMN.BSSLMN` and is joined separately when needed. Updated
-    `sales_by_rep_view` and `weekly_email_view` to group by
-    `salesperson_desc` only.
-  - **CC duplicates fix**: `vw_CostCenterCLydeMRKCodeXREF` returns one
-    row per (CC × ClydeMarketingCode) — previously surfaced 137 rows for
-    23 CCs. `COST_CENTER_XREF` now `GROUP BY cost_center` so each CC
-    appears exactly once. The CC selector and CC Mapping view also dedupe
-    defensively before rendering.
-  - **CC Mapping reworked**: now lists *all* cost centers (not just
-    "starts-with-1"), with a search box, *Show only unmapped* toggle,
-    parent-name preview column, save/load round-trip into
-    `AppConfig.sample_to_product_cc`. Empty-state card explains where the
-    data comes from when the warehouse returns nothing.
-  - **New view: Core Displays**: assign one or more cost centers to each
-    display (`CLASSES.CLCAT='DT'`). Persists in
-    `AppConfig.core_displays_by_cc`. Master/detail layout — pick a
-    display row, tick the cost centers that consider it core. Auto-loads
-    on first show.
-
-- **2026-05-13** — Polish round (UX feedback from running app):
-  - **SQL data quality**: `INVOICED_SALES_LINES` now also requires
-    `TRY_CONVERT(int, [ORDER#]) > 0` (orders with blank/zero `ORDER#` are
-    discarded entirely). Added new query `OPEN_ORDERS_LINES` and loader
-    `load_open_orders` for un-invoiced orders (`ORDER# > 0` and
-    `INVOICE# = 0/NULL`) — used for pipeline insights only, never for
-    salesman credit.
-  - **Auto-load on launch**: every data-driven view now populates itself
-    on first show. `RepsView` reloads via `QTimer.singleShot(0)`,
-    `CCMappingView` auto-reloads and shows an instructional empty-state
-    card when no sample CCs are present, and `SalesFilterBar` auto-loads
-    its CC list, defaults selection to *All*, and auto-fires *Run* once
-    the CCs arrive.
-  - **Smart default date range**: `SalesFilterBar` defaults to the last
-    12 fully-completed fiscal periods (rolling year ending at the last
-    closed fiscal month). Added `last_full_period` and
-    `last_n_full_periods_range` to `app.services.fiscal_calendar`. New
-    presets row exposes Last full FM, Last 3/6 FM, Rolling year, YTD,
-    Last 30d. Added a *vs prior year* checkbox that simultaneously loads
-    a parallel range one year back for comparison.
-  - **CC selector layout**: action buttons are now split across two rows
-    so labels never clip in the narrow filter card; live "X selected"
-    count next to "loaded".
-  - **AI analysis history (persistence)**: new `ai_analyses` SQLite table
-    + `app.storage.repos.save_ai_analysis` / `list_ai_analyses` /
-    `find_ai_analysis_by_hash` / `set_pinned` / `delete_ai_analysis`. The
-    *Ask the AI* view now has a left-side **Saved analyses** pane with
-    search, click-to-restore, right-click pin/delete, and an inline
-    "you already asked this" banner when a question matches a previously
-    saved Q&A for the same scope. Schema bumped to version 2.
-
-- **2026-05-13** — Major UX expansion based on user feedback:
-  - Reusable cost-center **multi-select widget** (`app/ui/widgets/cc_selector.py`)
-    with All/None/Products-only/Samples-only shortcuts and a search filter.
-  - Reusable **`SalesFilterBar`** that combines the CC selector with a
-    date-range picker (with 7d / 30d / 90d / YTD presets) and runs the
-    `load_invoiced_sales` worker in the background.
-  - **New views**: `SalesByRepView`, `SalesByCostCenterView`,
-    `CCMappingView` (Sample CC starts with `'1'` → Product CC starts with
-    `'0'`), `WeeklyEmailView` (one draft per rep for the selected CCs and
-    period), `AIChatView` (manager-side ad-hoc Q&A over the loaded data with
-    a live token estimate), `FiscalCalendarView` (browse any FY, flag
-    6-week January overrides).
-  - **Sales source switched to invoice-driven**: `INVOICED_SALES_LINES` now
-    requires `INVOICE# > 0` and uses `INVOICE_DATE_YYYYMMDD` for fiscal-period
-    bucketing. The old monthly aggregator was removed; loaders provide
-    derived `fiscal_year`, `fiscal_period`, `fiscal_period_name` columns
-    via the new fiscal-calendar service.
-  - **Fiscal calendar service** (`app/services/fiscal_calendar.py`):
-    4-4-5 weekly pattern, every month starts on a Sunday, anchor =
-    Sunday Feb 1 2026 = FY 2027 P1. Supports rare 6-week-January overrides
-    via `FiscalCalendarConfig.six_week_january_years` in `AppConfig`.
-  - **Token estimator** (`app/ai/token_estimator.py`) — used by the AI Chat
-    view to show data/system/total token estimates before sending.
-
-- **2026-05-13** — Major scope expansion. Locked stack: PySide6 desktop +
-  custom QSS theme; SQLite local state; SMTP+IMAP email; OpenAI default
-  with provider abstraction; keyring for secrets. Added new tables
-  introduced by user: `vw_CostCenterCLydeMRKCodeXREF`, `ClydeMarketingHistory`,
-  `BILLTO` (esp. `BBANK2` & leading-`*` closed-account flag), `SALESMAN`,
-  display tracking via `CLASSES`/`BCACCT` with `CLCAT='DT'`. Added §5b
-  (old-system semantics + fiscal-year-starts-Feb), §5c (displays), §5d
-  (app-side config), §7 (local SQLite schema), and §1/§3/§6 form-factor
-  + UI-quality requirements. Initial app skeleton committed.
-- **2026-05-13** — Initial scaffold: `.gitignore`, `README.md`, `CLAUDE.md`,
-  and existing `NEW_APP_CONTEXT_PROMPT.md`. Repo:
+- **2026-05-13** \u2014 Earlier rounds (condensed):
+  - **OpenAI key newline crash** \u2014 strip whitespace in
+    `OpenAIProvider.__init__`, `AISettingsDialog.commit_secrets/_on_test`,
+    and `factory.build_provider`.
+  - **Legacy revenue gap fix** \u2014 `OLD_SYSTEM_SALES` now `LEFT JOIN`s
+    `vw_CostCenterCLydeMRKCodeXREF` and synthesises `cost_center =
+    '0' + marketing_code` for unmapped codes.
+  - **Per-month invoice cache** (`app/storage/invoice_cache.py`,
+    `invoice_month_cache_v2`). Closed historical months come from
+    SQLite; only the current calendar month hits the warehouse.
+  - **CC selector autoload** \u2014 `QTimer.singleShot(0, self.reload)`
+    on construction; signals blocked during populate.
+  - **`code_prefix` plumbed end-to-end** through queries, loaders,
+    `SalesFilterBar`, and the cache key (`\u2026|p=0`). Sample CCs (`'1xx'`)
+    can never leak into product views, even when "all" is selected.
+  - **Premium polish round** \u2014 `Select all` + `Deselect all` only on
+    the CC selector; legacy sales now attributed via current
+    `(account, cost_center)` ownership in `BILLSLMN`/`SALESMAN`;
+    persistent `sales_cache` (SQLite, pickled DataFrame, keyed
+    `start|end|sorted-CCs`) with startup *Use cached / Refresh from DB*
+    prompt.
+  - **Empty-Dashboard fix** \u2014 new `load_blended_sales(...)` blends
+    new-system `_ORDERS` rows (\u2265 `NEW_SYSTEM_CUTOFF` 2025-08-04) with
+    pre-cutoff `ClydeMarketingHistory` rows unpivoted to monthly
+    granularity. Loaders return `data_source` \u2208 `{"new","legacy"}`.
+    Dashboard now runs `_DashboardLoader` and shows real KPIs.
+  - **Invisible-window / pythonw fix** \u2014 app data path moved to
+    `~\\Documents\\SalesAssistant` (managed-IT was wiping
+    `%APPDATA%\\SalesAssistant`); `_configure_logging` skips
+    `StreamHandler(sys.stderr)` when `sys.stderr is None`;
+    `MainWindow.show()` calls `raise_()` + `activateWindow()`.
+  - **DB error fix** \u2014 dropped non-existent `o.[SALESPERSON]` from
+    `INVOICED_SALES_LINES` and `OPEN_ORDERS_LINES`; rep number lives in
+    `BILLSLMN.BSSLMN` only.
+  - **CC duplicates fix** \u2014 `COST_CENTER_XREF` now `GROUP BY
+    cost_center` (one row per CC).
+  - **CC Mapping view + Core Displays view** added.
+  - **Auto-load on launch** for every data-driven view.
+  - **Smart default date range** \u2014 last 12 fully-completed fiscal
+    periods; presets (Last full FM / 3 / 6 / Rolling year / YTD / 30d).
+  - **AI analysis history** \u2014 `ai_analyses` table + Saved Analyses
+    pane in Ask the AI (search, restore, pin, dedupe banner). Schema
+    bumped to v2.
+  - **Major UX expansion** \u2014 reusable `CostCenterSelector`,
+    `SalesFilterBar` (CC + date range + presets), new views
+    (`SalesByRepView`, `SalesByCostCenterView`, `CCMappingView`,
+    `WeeklyEmailView`, `AIChatView`, `FiscalCalendarView`).
+  - **Fiscal calendar service** \u2014 4-4-5 weekly pattern, anchor
+    Sunday Feb 1 2026 = FY 2027 P1. Six-week-January override via
+    `FiscalCalendarConfig.six_week_january_years`.
+  - **Initial scaffold + scope lock-in** \u2014 PySide6 desktop, custom
+    QSS, SQLite local state, SMTP+IMAP, OpenAI default + provider
+    abstraction, keyring for secrets. Tables surfaced:
+    `vw_CostCenterCLydeMRKCodeXREF`, `ClydeMarketingHistory`, `BILLTO`
+    (with `BBANK2` + leading-`*` closed-account flag), `SALESMAN`,
+    display tracking via `CLASSES`/`BILL_CD` (`CLCAT='DT'`). Repo:
   https://github.com/lstred/Sales-Assistant.

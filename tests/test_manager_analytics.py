@@ -5,6 +5,7 @@ import pandas as pd
 from app.services.manager_analytics import (
     compute_rep_scorecards,
     format_account_label,
+    normalise_sample_product_pairs,
 )
 
 
@@ -57,3 +58,39 @@ def test_account_label_short_and_long() -> None:
         == "50285"
     )
     assert format_account_label(rec, style="long") == "50285 \u00b7 ABC (#1234)"
+
+def test_normalise_sample_product_pairs_either_direction() -> None:
+    # User typed product->sample (the wrong way around in the UI)
+    assert normalise_sample_product_pairs({'010': '141'}) == {'141': '010'}
+    # User typed sample->product (the canonical direction)
+    assert normalise_sample_product_pairs({'141': '010'}) == {'141': '010'}
+    # Mixed dict, only valid pairs survive
+    assert normalise_sample_product_pairs(
+        {'010': '141', '141': '010', '011': '010', '': 'x'}
+    ) == {'141': '010'}
+
+
+def test_samples_attributed_via_account_ownership() -> None:
+    import pandas as pd
+    # Product sales: rep A owns acct 100 on CC 010
+    sales = pd.DataFrame([{
+        'salesperson_desc': 'A', 'account_number': '100', 'cost_center': '010',
+        'revenue': 1000.0, 'gross_profit': 200.0,
+        'invoice_date': pd.Timestamp('2026-04-15'),
+    }])
+    # Sample line on account 100 / CC 141 with BLANK salesperson_desc
+    samples = pd.DataFrame([{
+        'salesperson_desc': '', 'account_number': '100', 'cost_center': '141',
+        'revenue': 0.0, 'gross_profit': 0.0,
+        'invoice_date': pd.Timestamp('2026-04-15'),
+    }] * 5)
+    assignments = pd.DataFrame([{
+        'salesman_name': 'A', 'salesman_number': '1', 'cost_center': '010',
+        'account_number': '100', 'old_account_number': '99',
+        'account_name': 'X', 'is_closed': False,
+    }])
+    cards = compute_rep_scorecards(
+        sales, assignments_df=assignments, samples_df=samples,
+        sample_to_product_cc={'141': '010'},
+    )
+    assert cards['A'].sample_lines == 5, cards['A'].sample_lines

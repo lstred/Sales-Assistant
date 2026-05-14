@@ -147,6 +147,25 @@ def _normalise_sales(df: pd.DataFrame | None) -> pd.DataFrame:
     return out
 
 
+def normalise_sample_product_pairs(
+    mapping: dict[str, str] | None,
+) -> dict[str, str]:
+    """Return a ``{sample_cc: product_cc}`` dict regardless of which side
+    the user typed in. Sample CCs always start with ``'1'``; product CCs
+    always start with ``'0'``. If a pair has both keys starting the same
+    way (or neither side is a sample), it is dropped."""
+    out: dict[str, str] = {}
+    for k, v in (mapping or {}).items():
+        ks, vs = str(k or "").strip(), str(v or "").strip()
+        if not ks or not vs:
+            continue
+        if ks.startswith("1") and vs.startswith("0"):
+            out[ks] = vs
+        elif vs.startswith("1") and ks.startswith("0"):
+            out[vs] = ks
+    return out
+
+
 # ----------------------------------------------------------------- core
 def compute_rep_scorecards(
     sales_df: pd.DataFrame,
@@ -156,6 +175,7 @@ def compute_rep_scorecards(
     displays_df: pd.DataFrame | None = None,
     samples_df: pd.DataFrame | None = None,
     core_displays_by_cc: dict[str, list[str]] | None = None,
+    sample_to_product_cc: dict[str, str] | None = None,
     today: date | None = None,
 ) -> dict[str, RepScorecard]:
     """Compute one :class:`RepScorecard` per rep from already-loaded
@@ -282,14 +302,49 @@ def compute_rep_scorecards(
             if acct in accts:
                 accounts_with_core.setdefault(rep, set()).add(acct)
 
-    # Samples per rep (count of sample-CC lines)
+    # Samples per rep. Sample order lines almost always have a blank
+    # ``salesperson_desc`` (samples are pulled by inside-sales / customer
+    # service, not the rep), so attribute by *account ownership* on the
+    # mapped product CC instead of by ``rep_key``.
     samples_per_rep_lines: dict[str, int] = {}
     samples_per_rep_revenue: dict[str, float] = {}
     if samples_df is not None and not samples_df.empty:
         s = _normalise_sales(samples_df)
-        for rep, sub in s[s["rep_key"] != ""].groupby("rep_key"):
-            samples_per_rep_lines[rep] = int(len(sub))
-            samples_per_rep_revenue[rep] = float(sub["revenue"].sum() or 0)
+        sample_to_product = normalise_sample_product_pairs(sample_to_product_cc)
+        # Build (account_number, cost_center) -> rep_key from assignments.
+        rep_by_acct_cc: dict[tuple[str, str], str] = {}
+        # And a fallback (account_number) -> rep_key (any product CC) for
+        # samples whose CC has no explicit mapping.
+        rep_by_acct_any: dict[str, str] = {}
+        if assignments_df is not None and not assignments_df.empty:
+            ax = assignments_df.copy()
+            ax["salesman_name"] = ax["salesman_name"].fillna("").astype(str).str.strip()
+            ax["account_number"] = ax["account_number"].fillna("").astype(str).str.strip()
+            ax["cost_center"] = ax["cost_center"].fillna("").astype(str).str.strip()
+            ax = ax[ax["salesman_name"] != ""]
+            for r in ax.itertuples(index=False):
+                acct = r.account_number
+                cc = r.cost_center
+                rep = r.salesman_name
+                if acct and cc:
+                    rep_by_acct_cc.setdefault((acct, cc), rep)
+                if acct and acct not in rep_by_acct_any and cc.startswith("0"):
+                    rep_by_acct_any[acct] = rep
+        for r in s.itertuples(index=False):
+            acct = getattr(r, "account_number", "") or ""
+            sample_cc = getattr(r, "cost_center", "") or ""
+            if not acct:
+                continue
+            product_cc = sample_to_product.get(sample_cc, "")
+            rep = (
+                rep_by_acct_cc.get((acct, product_cc), "") if product_cc else ""
+            ) or rep_by_acct_any.get(acct, "")
+            if not rep:
+                continue
+            samples_per_rep_lines[rep] = samples_per_rep_lines.get(rep, 0) + 1
+            samples_per_rep_revenue[rep] = (
+                samples_per_rep_revenue.get(rep, 0.0) + float(r.revenue or 0)
+            )
 
     # Per-account YoY for top-mover lists (only need the rep's own accts).
     acct_curr = (

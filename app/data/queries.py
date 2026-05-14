@@ -182,7 +182,7 @@ SELECT  LTRIM(RTRIM(b.[BCACCT]))   AS account_number,
         LTRIM(RTRIM(b.[BCCODE]))   AS display_code,
         LTRIM(RTRIM(c.[CLDESC]))   AS display_desc,
         b.[DateFormatted]          AS placed_on
-FROM    dbo.BCACCT AS b
+FROM    dbo.BILL_CD AS b
 LEFT JOIN dbo.CLASSES AS c
     ON  LTRIM(RTRIM(c.[CLCODE])) = LTRIM(RTRIM(b.[BCCODE]))
    AND  LTRIM(RTRIM(c.[CLCAT]))  = 'DT'

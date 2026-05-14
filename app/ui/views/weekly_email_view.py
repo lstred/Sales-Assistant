@@ -309,6 +309,7 @@ class WeeklyEmailView(QWidget):
             displays_df=self._displays_df,
             samples_df=self._samples_df,
             core_displays_by_cc=self._cfg.core_displays_by_cc,
+            sample_to_product_cc=self._cfg.sample_to_product_cc,
         )
         s, e = self.filter_bar.date_range()
         try:

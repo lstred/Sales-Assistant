@@ -70,9 +70,11 @@ class CCMappingView(QWidget):
         root.addWidget(
             ViewHeader(
                 "Cost Center Mapping",
-                "Assign any cost center to a parent product cost center. "
-                "Used to roll up sample / sub-line spending back to the "
-                "product line that sponsors it.",
+                "Pair each sample cost center (codes starting with \u20181\u2019) with "
+                "its sponsoring product cost center (codes starting with \u20180\u2019). "
+                "Sample sales are attributed back to the rep who owns the "
+                "account on the product CC. Direction doesn't matter \u2014 the "
+                "app figures it out from the leading digit.",
             )
         )
 
