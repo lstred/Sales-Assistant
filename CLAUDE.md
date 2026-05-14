@@ -295,9 +295,19 @@ read those plus this file's earlier sections for full context.
     successors. Fixed in `load_blended_sales`: `rep_map` is now always built
     from `load_rep_assignments()` (regardless of whether the date range
     includes pre-cutoff legacy data), and applied to new-system rows via
-    `apply()` — any `(account_number, cost_center)` in BILLSLMN has its
-    `salesperson_desc` overridden with the current owner's name. Rows for
-    accounts with no BILLSLMN entry keep their original `salesperson_desc`.
+    a **vectorized merge** — any `(account_number, cost_center)` in BILLSLMN
+    has its `salesperson_desc` overridden with the current owner's name. Rows
+    for accounts with no BILLSLMN entry keep their original `salesperson_desc`.
+  - **Critical index bug fixed**: `load_invoiced_sales` returns a
+    boolean-filtered slice of the per-month cache, giving a non-sequential
+    index (e.g. rows 0, 5, 12…). The vectorized merge produces a fresh
+    RangeIndex. `override.where(override != "", orig)` was aligning by pandas
+    label and returning NaN for every fallback → ~90% of revenue appearing as
+    "(unassigned)". Fixed by `reset_index(drop=True)` before the merge and
+    using `merged["salesperson_desc"]` (same rows, same order, clean index) as
+    the fallback source. Result: unassigned is now <0.1% (genuinely unmapped).
+  - **Performance**: attribution is O(n log n) merge, not O(n) row-by-row
+    `apply`. Full fiscal YTD (95k rows, all CCs) loads in ~2.3 seconds.
   - **Price class added to sales data and rep scorecards.**
     - `INVOICED_SALES_LINES` query now returns `price_class` (`ITEM.[IPRCCD]`);
       ITEM was already joined so no extra join needed.

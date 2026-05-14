@@ -187,19 +187,31 @@ def load_blended_sales(
         if new_df is not None and not new_df.empty:
             new_df = new_df.copy()
             # Re-attribute each line to the CURRENT account owner per BILLSLMN
-            # using a vectorized merge (not per-row apply — that would be O(n)
-            # Python-level iteration over 270k+ rows and take many minutes).
+            # using a vectorized merge.
+            #
+            # Index note: load_invoiced_sales may return a boolean-filtered
+            # slice of the per-month cache, giving a non-sequential index
+            # (e.g. rows 0, 5, 12…). After the left-merge, `merged` gets a
+            # fresh RangeIndex (0..N-1). We MUST reset new_df's index first
+            # so that the final assignment aligns correctly; otherwise
+            # override.where(…, orig) would use pandas label-alignment and
+            # produce NaN everywhere the fallback fires.
             if rep_map_df is not None and not rep_map_df.empty:
-                new_df["account_number"] = new_df["account_number"].fillna("").astype(str).str.strip()
-                new_df["cost_center"] = new_df["cost_center"].fillna("").astype(str).str.strip()
+                new_df = new_df.reset_index(drop=True)
+                new_df["account_number"] = (
+                    new_df["account_number"].fillna("").astype(str).str.strip()
+                )
+                new_df["cost_center"] = (
+                    new_df["cost_center"].fillna("").astype(str).str.strip()
+                )
                 merged = new_df.merge(
                     rep_map_df,
                     on=["account_number", "cost_center"],
                     how="left",
                 )
-                # Where BILLSLMN has a current owner, use that; otherwise keep
-                # the original SALESPERSON_DESC from the order line.
-                orig = new_df["salesperson_desc"].fillna("").astype(str).str.strip()
+                # `merged` has RangeIndex 0..N-1 and same row order as new_df.
+                # Use merged["salesperson_desc"] as fallback so index is aligned.
+                orig = merged["salesperson_desc"].fillna("").astype(str).str.strip()
                 override = merged["salesman_name"].fillna("").astype(str).str.strip()
                 new_df["salesperson_desc"] = override.where(override != "", orig)
             new_df["data_source"] = "new"
