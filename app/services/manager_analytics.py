@@ -73,6 +73,7 @@ class RepScorecard:
     peer_count: int = 0
     is_yoy_outlier: bool = False            # True when YoY is so extreme it
                                             # would skew peer comparisons
+    price_class_top: list[dict] = field(default_factory=list)  # top price classes
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -176,6 +177,7 @@ def compute_rep_scorecards(
     samples_df: pd.DataFrame | None = None,
     core_displays_by_cc: dict[str, list[str]] | None = None,
     sample_to_product_cc: dict[str, str] | None = None,
+    price_class_lookup: dict[str, str] | None = None,
     today: date | None = None,
 ) -> dict[str, RepScorecard]:
     """Compute one :class:`RepScorecard` per rep from already-loaded
@@ -449,6 +451,36 @@ def compute_rep_scorecards(
                 "coverage shown is *any* display on file."
             )
 
+        # Top price classes (by revenue) for this rep — used to surface
+        # product-type patterns in the coaching email and AI prompt.
+        pc_top: list[dict] = []
+        if "price_class" in sales.columns:
+            rep_pc = sales[
+                (sales["rep_key"] == rep_key)
+                & sales["price_class"].notna()
+                & (sales["price_class"].astype(str).str.strip() != "")
+            ]
+            if not rep_pc.empty:
+                pc_grp = rep_pc.groupby("price_class", as_index=False).agg(
+                    revenue=("revenue", "sum"),
+                    gross_profit=("gross_profit", "sum"),
+                    lines=("revenue", "size"),
+                )
+                pc_grp = pc_grp.sort_values("revenue", ascending=False).head(8)
+                for r in pc_grp.to_dict("records"):
+                    pc = str(r.get("price_class") or "").strip()
+                    desc = (price_class_lookup or {}).get(pc, pc)
+                    rev_pc = float(r.get("revenue") or 0.0)
+                    gp_pc = float(r.get("gross_profit") or 0.0)
+                    gp_pct_pc = (gp_pc / rev_pc * 100.0) if rev_pc else 0.0
+                    pc_top.append({
+                        "price_class": pc,
+                        "desc": desc,
+                        "revenue": rev_pc,
+                        "gp_pct": round(gp_pct_pc, 1),
+                        "lines": int(r.get("lines") or 0),
+                    })
+
         out[rep_key] = RepScorecard(
             rep_key=rep_key,
             rep_name=rep_key,  # rep_key is the human-readable salesperson_desc
@@ -486,6 +518,7 @@ def compute_rep_scorecards(
             rank_yoy=rank_yoy.get(rep_key),
             peer_count=len(peer_yoys),
             is_yoy_outlier=(rep_key in rep_outliers),
+            price_class_top=pc_top,
             notes=notes,
         )
     return out

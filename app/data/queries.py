@@ -93,6 +93,7 @@ INVOICED_SALES_LINES = """
 SELECT  TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD])         AS invoice_yyyymmdd,
         LTRIM(RTRIM(o.[ACCOUNT#I]))                          AS account_number,
         LTRIM(RTRIM(i.[ICCTR]))                              AS cost_center,
+        LTRIM(RTRIM(i.[IPRCCD]))                             AS price_class,
         LTRIM(RTRIM(o.[SALESPERSON_DESC]))                   AS salesperson_desc,
         TRY_CONVERT(int, o.[INVOICE#])                       AS invoice_number,
         TRY_CONVERT(int, o.[ORDER#])                         AS order_number,
@@ -188,4 +189,16 @@ LEFT JOIN dbo.CLASSES AS c
    AND  LTRIM(RTRIM(c.[CLCAT]))  = 'DT'
 WHERE   LTRIM(RTRIM(b.[BCCAT])) = 'DT'
   AND   ISNULL(LTRIM(RTRIM(b.[BCACCT])), '') <> ''
+"""
+
+# Price class reference — unique (code → description) lookup from dbo.PRICE.
+# Used to enrich rep scorecards and weekly-email AI prompts with product-type
+# context (e.g. "WIN WIN", "ALLURE", "TOP GUN").
+PRICE_CLASS_LOOKUP = """
+SELECT  LTRIM(RTRIM(p.[$PRCCD])) AS price_class,
+        MAX(LTRIM(RTRIM(p.[$DESC]))) AS price_class_desc
+FROM    dbo.PRICE AS p
+WHERE   ISNULL(LTRIM(RTRIM(p.[$PRCCD])), '') <> ''
+GROUP BY LTRIM(RTRIM(p.[$PRCCD]))
+ORDER BY p.[$PRCCD]
 """

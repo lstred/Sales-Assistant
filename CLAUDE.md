@@ -287,7 +287,47 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
-- **2026-05-14 (latest)** — CC zero-padding fix for rep-level upload + weekly email high-impact drops:
+- **2026-05-14 (latest)** — BILLSLMN attribution fix + price class insights + weekly email tier differentiation:
+  - **BILLSLMN is now the source of truth for ALL sales attribution** (new and
+    legacy). Previously, new-system sales used `SALESPERSON_DESC` from
+    `_ORDERS`, so departed reps (e.g. Steve Olink, rep 205, who has 1 account
+    in BILLSLMN) were credited with $1.9M in sales that belong to their
+    successors. Fixed in `load_blended_sales`: `rep_map` is now always built
+    from `load_rep_assignments()` (regardless of whether the date range
+    includes pre-cutoff legacy data), and applied to new-system rows via
+    `apply()` — any `(account_number, cost_center)` in BILLSLMN has its
+    `salesperson_desc` overridden with the current owner's name. Rows for
+    accounts with no BILLSLMN entry keep their original `salesperson_desc`.
+  - **Price class added to sales data and rep scorecards.**
+    - `INVOICED_SALES_LINES` query now returns `price_class` (`ITEM.[IPRCCD]`);
+      ITEM was already joined so no extra join needed.
+    - New query `PRICE_CLASS_LOOKUP` returns `{price_class: description}` from
+      `dbo.PRICE` (`[$PRCCD]` / `[$DESC]`).
+    - Invoice cache bumped from `v2` → `v3` so old pickled DataFrames (without
+      `price_class`) are not served.
+    - `load_price_class_lookup(db) → dict[str, str]` added to `app/data/loaders.py`.
+    - `RepScorecard.price_class_top: list[dict]` field added (top 8 price
+      classes by revenue, with GP%). Computed in `compute_rep_scorecards` when
+      `price_class_lookup` is passed.
+    - `compute_rep_scorecards` accepts `price_class_lookup: dict[str, str] | None`.
+    - `WeeklyEmailView._ensure_scorecards` lazily loads price class lookup and
+      passes it through.
+    - `_build_rep_prompt` includes a `TOP PRICE CLASSES` block in the user
+      message so the AI knows what product types each rep is actually selling.
+  - **Weekly email: tier-differentiated closing section.**
+    - `_build_rep_prompt` now classifies each rep as STRUGGLING (bottom 40%
+      by revenue rank AND declining YoY >5% or active-account rate <50%) or
+      PERFORMING.
+    - Struggling reps: closing section is "SPECIFIC ASSIGNED ACTION ITEMS" —
+      concrete tasks with account labels and dollar context, framed as
+      expectations.
+    - Performing reps: closing section is "OPPORTUNITIES" — insight-framed
+      patterns from the data (product line momentum, display correlation,
+      territory upside), not directives.
+    - Rep TIER label included in the AI user message for transparency.
+    - The system prompt hard-rule added: "Do NOT give everyone things to do."
+  - **22/22 tests pass.** All existing tests continue to pass; no new tests
+    needed (functional changes verified via live DB + import check).
   - **Root cause of upload not applying**: CC codes in the CSV used no leading
     zeros (`10`, `27`, `40` etc.) while the DB stores 3-char zero-padded codes
     (`010`, `027`, `040`). Dict key `("212","10")` never matched `("212","010")`.

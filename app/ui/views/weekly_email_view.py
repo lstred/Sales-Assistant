@@ -52,6 +52,7 @@ from app.config.models import AppConfig, DatabaseConfig
 from app.data.loaders import (
     load_blended_sales,
     load_display_placements,
+    load_price_class_lookup,
     load_rep_assignments,
 )
 from app.services.fiscal_calendar import find_period
@@ -178,6 +179,7 @@ class WeeklyEmailView(QWidget):
         self._assignments_df: pd.DataFrame | None = None
         self._displays_df: pd.DataFrame | None = None
         self._samples_df: pd.DataFrame | None = None
+        self._price_class_lookup: dict[str, str] = {}
         self._scorecards: dict[str, RepScorecard] = {}
         self._period_overview: PeriodOverview | None = None
         self._drafts: dict[str, dict] = {}
@@ -302,6 +304,12 @@ class WeeklyEmailView(QWidget):
     def _ensure_scorecards(self) -> None:
         if self._scorecards or self._df is None:
             return
+        # Lazily load the price class lookup (small, static reference table).
+        if not self._price_class_lookup:
+            try:
+                self._price_class_lookup = load_price_class_lookup(self._get_db())
+            except Exception as exc:  # noqa: BLE001
+                log.warning("price class lookup failed: %s", exc)
         self._scorecards = compute_rep_scorecards(
             self._df,
             prior_df=self._prior_df,
@@ -310,6 +318,7 @@ class WeeklyEmailView(QWidget):
             samples_df=self._samples_df,
             core_displays_by_cc=self._cfg.core_displays_by_cc,
             sample_to_product_cc=self._cfg.sample_to_product_cc,
+            price_class_lookup=self._price_class_lookup or None,
         )
         s, e = self.filter_bar.date_range()
         try:
@@ -831,6 +840,37 @@ def _build_rep_prompt(
         else "direct, results-focused, no fluff" if tone >= -1
         else "firm and clear about underperformance"
     )
+
+    # Classify rep tier from scorecard signals.
+    # "Struggling" = bottom 40% by revenue rank AND meaningful decline
+    # or poor account activation. These reps get assigned action items;
+    # higher-performing reps get insight-framed opportunities instead.
+    sc = scorecard
+    _peer_count = sc.peer_count or 1
+    _bottom_40 = (
+        sc.rank_revenue is not None and sc.rank_revenue > _peer_count * 0.60
+    )
+    _declining = sc.yoy_pct is not None and sc.yoy_pct < -5.0
+    _low_activation = sc.active_account_pct < 50.0
+    is_struggling = _bottom_40 and (_declining or _low_activation)
+
+    if is_struggling:
+        closing_instruction = (
+            "3. Close with 1–2 SPECIFIC ASSIGNED ACTION ITEMS for next week. "
+            "Format each as: 'Action: [exact task] — [account label and dollar "
+            "context]'. These are not suggestions — they are expectations. Keep "
+            "the tone consistent with the overall tone setting.\n"
+        )
+    else:
+        closing_instruction = (
+            "3. Close with 1–2 insight-framed OPPORTUNITIES — not prescriptions. "
+            "Point to data patterns the rep can act on: e.g. which product lines "
+            "have the strongest momentum, whether accounts with displays are "
+            "outperforming those without, or where there is untapped growth "
+            "potential in their territory. Frame it as 'the data suggests…' or "
+            "'worth exploring…' — not a directive.\n"
+        )
+
     sys_msg = (
         "You are a senior sales manager at a flooring distributor writing a "
         "weekly coaching email to ONE sales rep. The reader is a busy "
@@ -838,17 +878,17 @@ def _build_rep_prompt(
         f"actionable. Tone: {tone_word}. Always:\n"
         "1. Open with one specific positive (a real number or account they "
         "can be proud of). Never generic praise.\n"
-        "2. Then 2–3 areas to focus on, ranked by impact. Each must cite a "
+        "2. Identify 2–3 focus areas ranked by impact. Each must cite a "
         "concrete number from the scorecard or account list — no vague "
-        "platitudes.\n"
+        "platitudes. Where the data shows a correlation (e.g. accounts with "
+        "core displays outperform accounts without, or a specific product "
+        "line is the rep's strongest / weakest), call it out specifically.\n"
         "   HIGH-IMPACT FLAG: if any account in 'TOP DECLINING ACCOUNTS' or "
-        "'STALE ACCOUNTS' shows a large revenue drop (e.g. >$5 000 decline, "
-        "or was a consistent buyer and is now $0), flag it prominently as a "
-        "top-priority action item — even if it was mentioned in a prior "
-        "email. Consistent significant declines deserve persistent follow-up "
-        "until resolved.\n"
-        "3. End with 1–2 specific action items for next week (e.g. 'visit "
-        "account 12345 — they bought $X last year and zero this year').\n"
+        "'STALE ACCOUNTS' shows a large revenue drop (>$5 000 decline, or "
+        "was a consistent buyer and is now $0), flag it prominently as a "
+        "top-priority item — even if mentioned in a prior email. Persistent "
+        "significant declines warrant persistent follow-up until resolved.\n"
+        f"{closing_instruction}"
         "Hard rules:\n"
         "- Only reference numbers in the data block. Do not invent figures.\n"
         "- When you mention an account, ALWAYS use the rep-friendly label "
@@ -859,7 +899,10 @@ def _build_rep_prompt(
         "challenge with peer context.\n"
         "- Skip the scorecard table at the bottom — the system appends it.\n"
         "- No subject line, no greeting like 'Hi REP'. Start with the body.\n"
-        "- If a metric is unavailable (None / n/a), do not mention it."
+        "- If a metric is unavailable (None / n/a), do not mention it.\n"
+        "- Do NOT give everyone things to do. The closing section is "
+        "tier-dependent: struggling reps get assigned tasks; performing reps "
+        "get insights and opportunities."
     )
     if scorecard.is_yoy_outlier:
         sys_msg += (
@@ -881,7 +924,6 @@ def _build_rep_prompt(
             f"yoy={yoy}, gp%={po.gpp_pct:.1f}, active_reps={po.active_reps}\n\n"
         )
 
-    sc = scorecard
     yoy = "n/a" if sc.yoy_pct is None else f"{sc.yoy_pct:+.1f}%"
     peers = "n/a" if sc.peer_avg_yoy_pct is None else f"{sc.peer_avg_yoy_pct:+.1f}%"
     vs_peer = "n/a" if sc.vs_peers_pct is None else f"{sc.vs_peers_pct:+.1f} pts"
@@ -907,6 +949,11 @@ def _build_rep_prompt(
         for a in sc.new_accounts
     ) or "  (none)"
 
+    pc_lines = "\n".join(
+        f"  - {p['price_class']} ({p['desc']}): ${p['revenue']:,.0f}, GP%={p['gp_pct']:.1f}%"
+        for p in sc.price_class_top
+    ) or "  (none)"
+
     week_block = ""
     if week_lines:
         week_block = (
@@ -921,8 +968,11 @@ def _build_rep_prompt(
             f"{week_lines['current_week_lines']:,} lines\n"
         )
 
+    # Include rep tier in the data so the AI understands the context.
+    tier_label = "STRUGGLING (bottom 40% + declining/low activation)" if is_struggling else "PERFORMING"
+
     user_msg = (
-        f"REP: {rep_key}\n"
+        f"REP: {rep_key}  [TIER: {tier_label}]\n"
         f"WINDOW: {start} -> {end} (cost centers: {cc_label})\n\n"
         f"{overview_block}"
         f"REP SCORECARD:\n"
@@ -937,6 +987,7 @@ def _build_rep_prompt(
         f"  sample_lines={sc.sample_lines}, samples_per_account={sc.samples_per_account:.2f}\n"
         f"  last_3mo=${sc.last_3mo_revenue:,.0f}, prior_3mo=${sc.prior_3mo_revenue:,.0f}, "
         f"vs_prior_3mo={l3}, yoy_3mo={l3y}\n\n"
+        f"TOP PRICE CLASSES (by revenue — what this rep is actually selling):\n{pc_lines}\n\n"
         f"TOP GROWING ACCOUNTS (current vs prior):\n{growing_lines}\n\n"
         f"TOP DECLINING ACCOUNTS:\n{declining_lines}\n\n"
         f"STALE ACCOUNTS (had revenue last period, zero this period):\n{stale_lines}\n\n"

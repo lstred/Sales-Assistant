@@ -139,11 +139,34 @@ def load_blended_sales(
     Returns a DataFrame with these columns (always present):
     ``invoice_date``, ``fiscal_year``, ``fiscal_period``,
     ``fiscal_period_name``, ``account_number``, ``cost_center``,
-    ``salesperson_desc``, ``revenue``, ``gross_profit``,
+    ``price_class``, ``salesperson_desc``, ``revenue``, ``gross_profit``,
     ``invoice_number``, ``data_source``.
+
+    Sales attribution is always driven by the **current** rep-account
+    assignment in ``dbo.BILLSLMN`` (source of truth). If an order line's
+    ``SALESPERSON_DESC`` belongs to a rep who has since left and their
+    accounts have been reassigned, the sales are credited to the current
+    owner. Lines for accounts with no current BILLSLMN entry keep their
+    original ``SALESPERSON_DESC``.
     """
     parts: list[pd.DataFrame] = []
     prefix = (code_prefix or "").strip()
+
+    # Always build the rep attribution map from the current BILLSLMN
+    # assignments so BOTH new-system and legacy rows are attributed to
+    # whoever owns the account TODAY — not to whoever placed the order.
+    rep_map: dict[tuple[str, str], str] = {}
+    try:
+        assignments = load_rep_assignments(db)
+        if assignments is not None and not assignments.empty:
+            for rec in assignments.to_dict("records"):
+                acct = str(rec.get("account_number") or "").strip()
+                cc = str(rec.get("cost_center") or "").strip()
+                name = str(rec.get("salesman_name") or "").strip()
+                if acct and cc and name:
+                    rep_map[(acct, cc)] = name
+    except Exception:  # noqa: BLE001
+        rep_map = {}
 
     # New-system portion
     new_start = max(start, NEW_SYSTEM_CUTOFF)
@@ -151,14 +174,24 @@ def load_blended_sales(
         new_df = load_invoiced_sales(db, new_start, end, cost_centers, prefix)
         if new_df is not None and not new_df.empty:
             new_df = new_df.copy()
+            # Re-attribute each line to the CURRENT account owner per BILLSLMN.
+            # Departed reps (e.g. an ex-employee whose accounts were reassigned)
+            # no longer appear in the metrics — their former accounts' sales flow
+            # to whoever owns those accounts now.
+            if rep_map:
+                def _remap(r: pd.Series) -> str:
+                    key = (
+                        str(r.get("account_number") or "").strip(),
+                        str(r.get("cost_center") or "").strip(),
+                    )
+                    return rep_map.get(key, str(r.get("salesperson_desc") or "").strip())
+                new_df["salesperson_desc"] = new_df.apply(_remap, axis=1)
             new_df["data_source"] = "new"
             parts.append(new_df)
 
     # Legacy portion (everything before the cutoff in the requested range).
-    # We attribute legacy rows to the *current* rep that owns each
-    # (account × cost-center) pair via dbo.BILLSLMN, so YoY rep totals
-    # stay consistent across the cutoff. Accounts with no current
-    # assignment fall back to ``LEGACY_REP_LABEL``.
+    # The rep_map built above is reused so legacy rows get the same
+    # BILLSLMN-driven attribution as new-system rows.
     if start < NEW_SYSTEM_CUTOFF:
         legacy_end = min(end, NEW_SYSTEM_CUTOFF - timedelta(days=1))
         fy_start = _fy_for(start)
@@ -167,18 +200,6 @@ def load_blended_sales(
             old_raw = load_old_sales(db, fy_start, fy_end)
         except Exception:  # noqa: BLE001
             old_raw = pd.DataFrame()
-        rep_map: dict[tuple[str, str], str] = {}
-        try:
-            assignments = load_rep_assignments(db)
-            if assignments is not None and not assignments.empty:
-                for rec in assignments.to_dict("records"):
-                    acct = str(rec.get("account_number") or "").strip()
-                    cc = str(rec.get("cost_center") or "").strip()
-                    name = str(rec.get("salesman_name") or "").strip()
-                    if acct and cc and name:
-                        rep_map[(acct, cc)] = name
-        except Exception:  # noqa: BLE001
-            rep_map = {}
         if old_raw is not None and not old_raw.empty:
             legacy = _unpivot_old_sales(
                 old_raw, start, legacy_end, cost_centers,
@@ -190,7 +211,7 @@ def load_blended_sales(
 
     cols = [
         "invoice_date", "fiscal_year", "fiscal_period", "fiscal_period_name",
-        "account_number", "cost_center", "salesperson_desc",
+        "account_number", "cost_center", "price_class", "salesperson_desc",
         "revenue", "gross_profit", "invoice_number", "data_source",
     ]
     if not parts:
@@ -302,6 +323,21 @@ def load_display_placements(db: DatabaseConfig) -> pd.DataFrame:
     if "placed_on" in df.columns:
         df["placed_on"] = pd.to_datetime(df["placed_on"], errors="coerce")
     return df
+
+
+def load_price_class_lookup(db: DatabaseConfig) -> dict[str, str]:
+    """Return a ``{price_class_code: description}`` mapping from ``dbo.PRICE``.
+
+    Used to enrich rep scorecards and AI prompts with product-type context.
+    Falls back to an empty dict on any error so callers never crash.
+    """
+    try:
+        df = read_dataframe(db, queries.PRICE_CLASS_LOOKUP)
+        if df is None or df.empty:
+            return {}
+        return dict(zip(df["price_class"].astype(str), df["price_class_desc"].astype(str)))
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 # ----------------------------------------------------------------- helpers
