@@ -286,6 +286,46 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 Newest first.
 
+- **2026-05-14** — Faster refresh + global default filters:
+  - **Singleflight loader dedup** (`app/services/singleflight.py`). All
+    `SalesFilterBar` instances funnel `load_blended_sales` calls through
+    a process-wide `SingleFlight` keyed by
+    `(start, end, cost_centers, code_prefix)`. When the global Refresh
+    fans out to all four sales-driven views simultaneously, only **one**
+    SQL query actually runs — the other three threads wait on the same
+    `threading.Event` and receive the same DataFrame. Refresh time
+    drops by ~3-4x in practice. Added a smoke test
+    (`test_singleflight_collapses_concurrent_calls`) that fires 8
+    concurrent threads and asserts the work fn ran exactly once.
+  - **Global default filters** (`AppConfig.defaults: GlobalFiltersConfig`).
+    Persisted: `start_iso`, `end_iso`, `cost_centers: list[str]`,
+    `vs_prior_year: bool`. Empty start/end means "auto = last 12
+    fiscal periods". Empty CC list means "all CCs".
+  - **"Default filters" card on the Dashboard**
+    (`app/ui/widgets/global_filters_card.py`). Date pickers, vs-prior
+    toggle, embedded `CostCenterSelector` (product CCs only). Two
+    actions:
+      - **Apply to all pages** — emits
+        `DashboardView.apply_global_filters_requested(start, end, ccs)`,
+        which `MainWindow._apply_global_filters` fans out to every
+        view's `filter_bar.apply_filters(start, end, ccs)`. Each filter
+        bar updates its own date pickers + CC checklist and re-runs.
+        Combined with singleflight + cache, all four pages reload in
+        a single SQL hit.
+      - **Save as default** — emits
+        `save_global_filters_requested(...)`, which `MainWindow`
+        persists to `AppConfig.defaults` via `save_config`. Next
+        launch every `SalesFilterBar` opens already pre-filtered.
+  - **`SalesFilterBar.apply_filters(start, end, ccs)`** — public API for
+    programmatic filter changes; pairs with `refresh_data()` for
+    cache-bypass refresh. Filter bar constructor now reads
+    `cfg.defaults.{start_iso, end_iso, cost_centers, vs_prior_year}`
+    on construction so every page opens consistent.
+  - **`CostCenterSelector.set_selected_codes(codes)`** + new
+    `default_selected=` constructor arg. `None`/empty list means
+    "select all" (matches loader semantics).
+  - 14/14 tests pass.
+
 - **2026-05-14** — Missing-revenue fix + single global Refresh:
   - **Removed `N_NOT_INVENTORY='Y'` and `i.[IINVEN]='Y'` filters** from
     `INVOICED_SALES_LINES` and `OPEN_ORDERS_LINES`. Together they were

@@ -59,6 +59,7 @@ class CostCenterSelector(QWidget):
         autoload: bool = True,
         select_all_after_load: bool = True,
         code_prefix_filter: str | None = None,
+        default_selected: list[str] | None = None,
     ) -> None:
         super().__init__(parent)
         self._get_db = get_db
@@ -66,6 +67,11 @@ class CostCenterSelector(QWidget):
         self._df: pd.DataFrame | None = None
         self._select_all_after_load = select_all_after_load
         self._prefix_filter = (code_prefix_filter or "").strip()
+        self._default_selected: set[str] | None = (
+            {str(c).strip() for c in default_selected if str(c).strip()}
+            if default_selected is not None
+            else None
+        )
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -127,6 +133,25 @@ class CostCenterSelector(QWidget):
         self._loader.failed.connect(self._on_failed)
         self._loader.start()
 
+    def set_selected_codes(self, codes: list[str] | None) -> None:
+        """Programmatically set the checked rows. ``None`` or empty list
+        selects everything (matching the "all CCs" semantics used by the
+        loaders)."""
+        wanted: set[str] | None = (
+            {str(c).strip() for c in codes if str(c).strip()} if codes else None
+        )
+        self.model.blockSignals(True)
+        for r in range(self.model.rowCount()):
+            it = self.model.item(r)
+            code = it.data(Qt.ItemDataRole.UserRole)
+            checked = True if wanted is None else code in wanted
+            it.setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+        self.model.blockSignals(False)
+        self._refresh_count()
+        self.selection_changed.emit(self.selected_codes())
+
     # --------------------------------------------------------------- internal
     def _on_loaded(self, df: pd.DataFrame) -> None:
         if self._prefix_filter and df is not None and not df.empty:
@@ -141,7 +166,10 @@ class CostCenterSelector(QWidget):
             it = QStandardItem(label)
             it.setData(code, Qt.ItemDataRole.UserRole)
             it.setCheckable(True)
-            initially_checked = self._select_all_after_load
+            if self._default_selected is not None:
+                initially_checked = code in self._default_selected
+            else:
+                initially_checked = self._select_all_after_load
             it.setCheckState(
                 Qt.CheckState.Checked if initially_checked else Qt.CheckState.Unchecked
             )

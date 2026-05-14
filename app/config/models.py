@@ -93,6 +93,21 @@ class FiscalCalendarConfig(BaseModel):
     """Fiscal years (e.g. 2027) where January is 6 weeks instead of 5."""
 
 
+class GlobalFiltersConfig(BaseModel):
+    """App-wide default filters applied to every sales-driven view.
+
+    Stored as ISO date strings (or empty for "auto = last 12 fiscal periods")
+    so JSON round-trips cleanly. Cost centers is a list of CC code strings;
+    empty list means "all CCs". ``vs_prior_year`` toggles the comparison
+    parallel-load.
+    """
+
+    start_iso: str = ""           # "" => last 12 fiscal periods (auto)
+    end_iso: str = ""             # "" => auto (paired with start)
+    cost_centers: list[str] = Field(default_factory=list)
+    vs_prior_year: bool = True
+
+
 class AppConfig(BaseModel):
     schema_version: int = 1
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
@@ -100,6 +115,7 @@ class AppConfig(BaseModel):
     ai: AIConfig = Field(default_factory=AIConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     fiscal: FiscalCalendarConfig = Field(default_factory=FiscalCalendarConfig)
+    defaults: GlobalFiltersConfig = Field(default_factory=GlobalFiltersConfig)
 
     # User-maintained mappings (free-form, edited in UI later):
     sample_to_product_cc: dict[str, str] = Field(default_factory=dict)

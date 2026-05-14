@@ -38,6 +38,7 @@ from app.services.fiscal_calendar import (
     last_full_period,
     last_n_full_periods_range,
 )
+from app.services.singleflight import sales_singleflight
 from app.storage import sales_cache
 from app.ui.theme import TEXT_MUTED
 from app.ui.widgets.cc_selector import CostCenterSelector
@@ -67,15 +68,34 @@ class _SalesLoader(QThread):
 
     def run(self) -> None:  # noqa: D401
         try:
-            cur = load_blended_sales(
-                self._db, self._start, self._end, self._ccs or None, self._sw,
-                self._code_prefix,
+            # Singleflight key — identical concurrent requests across views
+            # collapse into one warehouse call. After the first call returns,
+            # the others get the same DataFrame and the per-month cache is
+            # already populated, so subsequent reads are instant.
+            ccs_key = ",".join(sorted({str(c).strip() for c in (self._ccs or ()) if c}))
+            cur_key = (
+                "blended", self._start.isoformat(), self._end.isoformat(),
+                ccs_key, self._code_prefix,
+            )
+            cur = sales_singleflight.do(
+                cur_key,
+                lambda: load_blended_sales(
+                    self._db, self._start, self._end, self._ccs or None,
+                    self._sw, self._code_prefix,
+                ),
             )
             prior = None
             if self._prior_start is not None and self._prior_end is not None:
-                prior = load_blended_sales(
-                    self._db, self._prior_start, self._prior_end,
-                    self._ccs or None, self._sw, self._code_prefix,
+                prior_key = (
+                    "blended", self._prior_start.isoformat(),
+                    self._prior_end.isoformat(), ccs_key, self._code_prefix,
+                )
+                prior = sales_singleflight.do(
+                    prior_key,
+                    lambda: load_blended_sales(
+                        self._db, self._prior_start, self._prior_end,
+                        self._ccs or None, self._sw, self._code_prefix,
+                    ),
                 )
             self.loaded.emit(cur, prior)
         except Exception as exc:  # noqa: BLE001
@@ -120,6 +140,11 @@ class SalesFilterBar(QFrame):
             autoload=autoload,
             select_all_after_load=True,
             code_prefix_filter=code_prefix_filter,
+            default_selected=(
+                list(self._cfg.defaults.cost_centers)
+                if self._cfg is not None and self._cfg.defaults.cost_centers
+                else None
+            ),
         )
         self.cc.loaded.connect(self._on_cc_loaded)
         root.addWidget(self.cc, 1)
@@ -129,14 +154,25 @@ class SalesFilterBar(QFrame):
         date_label.setStyleSheet("font-weight: 600;")
         root.addWidget(date_label)
 
-        # Smart defaults: last full year of completed fiscal months
+        # Smart defaults: start from app-wide defaults if set, otherwise the
+        # last full year of completed fiscal periods.
         sw = self._cfg.fiscal.six_week_january_years if self._cfg else []
-        try:
-            default_start, default_end = last_n_full_periods_range(date.today(), 12, sw)
-        except Exception:  # noqa: BLE001
-            today = QDate.currentDate()
-            default_start = (today.addDays(-365)).toPython()
-            default_end = today.toPython()
+        default_start = default_end = None
+        if self._cfg is not None:
+            d = self._cfg.defaults
+            if d.start_iso and d.end_iso:
+                try:
+                    default_start = date.fromisoformat(d.start_iso)
+                    default_end = date.fromisoformat(d.end_iso)
+                except ValueError:
+                    default_start = default_end = None
+        if default_start is None or default_end is None:
+            try:
+                default_start, default_end = last_n_full_periods_range(date.today(), 12, sw)
+            except Exception:  # noqa: BLE001
+                today = QDate.currentDate()
+                default_start = (today.addDays(-365)).toPython()
+                default_end = today.toPython()
 
         self.start_edit = QDateEdit()
         self.start_edit.setCalendarPopup(True)
@@ -168,7 +204,9 @@ class SalesFilterBar(QFrame):
             root.addLayout(row)
 
         self.compare_prior = QCheckBox("Also load prior year (for comparison)")
-        self.compare_prior.setChecked(True)
+        self.compare_prior.setChecked(
+            self._cfg.defaults.vs_prior_year if self._cfg is not None else True
+        )
         root.addWidget(self.compare_prior)
 
         self.status = QLabel("Loading…")
@@ -328,3 +366,23 @@ class SalesFilterBar(QFrame):
         self._last_cache_ts = None
         self._refresh_cache_label()
         self._run(force_refresh=True)
+
+    def apply_filters(
+        self,
+        start: date | None,
+        end: date | None,
+        cost_centers: list[str] | None,
+        *,
+        run: bool = True,
+    ) -> None:
+        """Programmatically set this bar's filters and (by default) re-run.
+
+        Used by the Dashboard's "Apply to all pages" action so a single
+        global filter change updates every screen at once.
+        """
+        if start is not None and end is not None and end >= start:
+            self._set_dates(start, end)
+        if cost_centers is not None:
+            self.cc.set_selected_codes(cost_centers)
+        if run:
+            self._run(force_refresh=False)

@@ -20,6 +20,7 @@ from app.services.fiscal_calendar import last_full_period
 from app.storage import invoice_cache, sales_cache
 from app.ui.views._header import ViewHeader
 from app.ui.widgets.cards import KpiCard
+from app.ui.widgets.global_filters_card import GlobalFiltersCard
 
 
 class _DashboardLoader(QThread):
@@ -76,6 +77,8 @@ class _DashboardLoader(QThread):
 
 class DashboardView(QWidget):
     refresh_all_requested = Signal()
+    apply_global_filters_requested = Signal(object, object, list)  # start, end, ccs
+    save_global_filters_requested = Signal(object, object, list, bool)  # +vs_prior
 
     def __init__(
         self,
@@ -138,6 +141,19 @@ class DashboardView(QWidget):
         sub_grid.addWidget(self.cards["open_actions"], 0, 1)
         sub_grid.addWidget(self.cards["needs_review"], 0, 2)
         root.addLayout(sub_grid)
+
+        # Global filter card — only when wired to config + DB.
+        if cfg is not None and get_db is not None:
+            self.global_filters = GlobalFiltersCard(cfg, get_db)
+            self.global_filters.apply_requested.connect(
+                self.apply_global_filters_requested.emit
+            )
+            self.global_filters.save_requested.connect(
+                self.save_global_filters_requested.emit
+            )
+            root.addWidget(self.global_filters)
+        else:
+            self.global_filters = None  # type: ignore[assignment]
 
         root.addStretch(1)
 

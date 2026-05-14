@@ -142,6 +142,12 @@ class MainWindow(QMainWindow):
         # Dashboard's "Refresh all data" button fans out to every other
         # view that knows how to reload itself.
         self.dashboard_view.refresh_all_requested.connect(self._refresh_all_views)
+        self.dashboard_view.apply_global_filters_requested.connect(
+            self._apply_global_filters
+        )
+        self.dashboard_view.save_global_filters_requested.connect(
+            self._save_global_filters
+        )
 
         h.addWidget(self.sidebar)
         h.addWidget(self.stack, 1)
@@ -197,6 +203,34 @@ class MainWindow(QMainWindow):
                     bar.refresh_data()
             except Exception:  # noqa: BLE001
                 log.exception("refresh_data failed for %s", type(view).__name__)
+
+    def _apply_global_filters(self, start, end, ccs) -> None:
+        """Push a new global filter to every page's filter bar so the
+        whole app reloads in sync."""
+        for view in self._views.values():
+            bar = getattr(view, "filter_bar", None)
+            if bar is None or not hasattr(bar, "apply_filters"):
+                continue
+            try:
+                bar.apply_filters(start, end, list(ccs))
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "apply_filters failed for %s", type(view).__name__
+                )
+
+    def _save_global_filters(self, start, end, ccs, vs_prior) -> None:
+        from datetime import date as _date  # local — avoid top-level coupling
+        if isinstance(start, _date) and isinstance(end, _date):
+            self._cfg.defaults.start_iso = start.isoformat()
+            self._cfg.defaults.end_iso = end.isoformat()
+        self._cfg.defaults.cost_centers = list(ccs)
+        self._cfg.defaults.vs_prior_year = bool(vs_prior)
+        try:
+            save_config(self._cfg)
+            self.status.showMessage("Default filters saved.", 3000)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("save_config failed")
+            self.status.showMessage(f"Save failed: {exc}", 5000)
 
     # ------------------------------------------------------------ navigation
     def _navigate(self, key: str) -> None:

@@ -143,6 +143,44 @@ def test_make_key_includes_prefix() -> None:
     assert a != b
 
 
+def test_singleflight_collapses_concurrent_calls() -> None:
+    """Many threads asking for the same key trigger the work fn exactly
+    once and all callers receive the same result."""
+    import threading
+    from app.services.singleflight import SingleFlight
+
+    sf = SingleFlight()
+    call_count = {"n": 0}
+    gate = threading.Event()
+    started = threading.Barrier(8)
+
+    def slow_work():
+        call_count["n"] += 1
+        gate.wait(timeout=2.0)
+        return 42
+
+    results: list[int] = []
+    rlock = threading.Lock()
+
+    def worker():
+        started.wait()
+        v = sf.do("k", slow_work)
+        with rlock:
+            results.append(v)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    # Let all 8 reach `do` and join the in-flight slot before unblocking.
+    threading.Event().wait(0.1)
+    gate.set()
+    for t in threads:
+        t.join()
+
+    assert call_count["n"] == 1
+    assert results == [42] * 8
+
+
 def test_invoice_cache_serves_immutable_months_from_disk(tmp_path, monkeypatch) -> None:
     """Past months must be fetched from the warehouse exactly once,
     then served from local SQLite forever."""
