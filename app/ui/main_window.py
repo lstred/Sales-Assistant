@@ -35,6 +35,7 @@ from app.ui.views.sales_by_rep_view import SalesByRepView
 from app.ui.views.settings_view import SettingsView
 from app.ui.views.budget_view import BudgetView
 from app.ui.views.weekly_email_view import WeeklyEmailView
+from app.ui.views.help_view import HelpView
 from app.ui.widgets.sidebar import Sidebar
 
 
@@ -55,6 +56,7 @@ NAV_ITEMS = [
     ("core_displays", "Core Displays"),
     ("fiscal",        "Fiscal Calendar"),
     ("settings",      "Settings"),
+    ("help",          "Help"),
 ]
 
 
@@ -121,6 +123,7 @@ class MainWindow(QMainWindow):
         self.cc_mapping_view = CCMappingView(self._cfg, get_db=lambda: self._cfg.database)
         self.core_displays_view = CoreDisplaysView(self._cfg, get_db=lambda: self._cfg.database)
         self.fiscal_view = FiscalCalendarView(self._cfg)
+        self.help_view = HelpView()
         self.settings_view = SettingsView()
         self.settings_view.open_db.connect(self._open_db_dialog)
         self.settings_view.open_email.connect(self._open_email_dialog)
@@ -139,9 +142,15 @@ class MainWindow(QMainWindow):
             "core_displays": self.core_displays_view,
             "fiscal":        self.fiscal_view,
             "settings":      self.settings_view,
+            "help":          self.help_view,
         }
         for w in self._views.values():
             self.stack.addWidget(w)
+
+        # Surface Needs Review count in sidebar and dashboard.
+        self.conversations_view.needs_review_changed.connect(
+            self._on_needs_review_changed
+        )
 
         # Dashboard's "Refresh all data" button fans out to every other
         # view that knows how to reload itself.
@@ -247,6 +256,20 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             log.exception("save_config failed")
             self.status.showMessage(f"Save failed: {exc}", 5000)
+
+    # ------------------------------------------------------------ needs review
+    def _on_needs_review_changed(self, count: int) -> None:
+        """Update the sidebar Conversations button when rep replies are pending."""
+        if count > 0:
+            self._buttons_needing_review_label = f"Conversations ({count})"
+            # Use the failed glyph (⚠) to draw attention
+            btn = self.sidebar._buttons.get("conversations")
+            if btn:
+                btn.setText(f"Conversations ({count}) ⚠")
+        else:
+            btn = self.sidebar._buttons.get("conversations")
+            if btn:
+                btn.setText("Conversations")
 
     # ------------------------------------------------------------ navigation
     def _navigate(self, key: str) -> None:

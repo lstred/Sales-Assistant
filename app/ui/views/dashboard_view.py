@@ -22,6 +22,7 @@ from app.services.fiscal_calendar import (
     last_full_period,
 )
 from app.storage import invoice_cache, sales_cache
+from app.storage.repos import dashboard_counts
 from app.ui.views._header import ViewHeader
 from app.ui.widgets.cards import KpiCard
 from app.ui.widgets.global_filters_card import GlobalFiltersCard
@@ -104,6 +105,7 @@ class _DashboardLoader(QThread):
                 "active_reps": int(recent_reps),
                 "sel_revenue": sel_revenue,
                 "sel_label": sel_label,
+                **dashboard_counts(),
             })
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"{type(exc).__name__}: {exc}")
@@ -230,6 +232,21 @@ class DashboardView(QWidget):
             f"{data.get('open_lines', 0):,} un-invoiced lines"
         )
         self.cards["active_reps"].set_value(f"{data['active_reps']:,}")
+        # Wire conversation/action/review counts from local SQLite.
+        self.cards["active_convos"].set_value(
+            str(data.get("active_conversations", 0))
+        )
+        self.cards["open_actions"].set_value(
+            str(data.get("open_action_items", 0))
+        )
+        nr = data.get("needs_review", 0)
+        self.cards["needs_review"].set_value(str(nr))
+        if nr > 0:
+            self.cards["needs_review"].set_caption(
+                f"{nr} rep repl{'y' if nr == 1 else 'ies'} awaiting response"
+            )
+        else:
+            self.cards["needs_review"].set_caption("All caught up")
         self.busy_state_changed.emit("done")
 
     def _on_failed(self, msg: str) -> None:

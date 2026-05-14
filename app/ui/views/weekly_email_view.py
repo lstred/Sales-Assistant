@@ -842,9 +842,6 @@ def _build_rep_prompt(
     )
 
     # Classify rep tier from scorecard signals.
-    # "Struggling" = bottom 40% by revenue rank AND meaningful decline
-    # or poor account activation. These reps get assigned action items;
-    # higher-performing reps get insight-framed opportunities instead.
     sc = scorecard
     _peer_count = sc.peer_count or 1
     _bottom_40 = (
@@ -856,62 +853,58 @@ def _build_rep_prompt(
 
     if is_struggling:
         closing_instruction = (
-            "3. Close with 1–2 SPECIFIC ASSIGNED ACTION ITEMS for next week. "
+            "4. Close with 1–2 SPECIFIC ASSIGNED ACTION ITEMS for next week. "
             "Format each as: 'Action: [exact task] — [account label and dollar "
-            "context]'. These are not suggestions — they are expectations. Keep "
-            "the tone consistent with the overall tone setting.\n"
+            "context]'. These are not suggestions — they are expectations.\n"
         )
     else:
         closing_instruction = (
-            "3. Close with 1–2 insight-framed OPPORTUNITIES — not prescriptions. "
-            "Point to data patterns the rep can act on: e.g. which product lines "
-            "have the strongest momentum, whether accounts with displays are "
-            "outperforming those without, or where there is untapped growth "
-            "potential in their territory. Frame it as 'the data suggests…' or "
-            "'worth exploring…' — not a directive.\n"
+            "4. Close with 1–2 insight-framed OPPORTUNITIES — not prescriptions. "
+            "Point to a data pattern they can act on: product line momentum, "
+            "display correlation, territory upside. Frame as 'worth exploring...' "
+            "not a directive.\n"
         )
 
     sys_msg = (
         "You are a senior sales manager at a flooring distributor writing a "
-        "weekly coaching email to ONE sales rep. The reader is a busy "
-        "salesperson — keep it tight (200–350 words), human, specific, and "
-        f"actionable. Tone: {tone_word}. Always:\n"
-        "1. Open with one specific positive (a real number or account they "
-        "can be proud of). Never generic praise.\n"
-        "2. Identify 2–3 focus areas ranked by impact. Each must cite a "
-        "concrete number from the scorecard or account list — no vague "
-        "platitudes. Where the data shows a correlation (e.g. accounts with "
-        "core displays outperform accounts without, or a specific product "
-        "line is the rep's strongest / weakest), call it out specifically.\n"
-        "   HIGH-IMPACT FLAG: if any account in 'TOP DECLINING ACCOUNTS' or "
-        "'STALE ACCOUNTS' shows a large revenue drop (>$5 000 decline, or "
-        "was a consistent buyer and is now $0), flag it prominently as a "
-        "top-priority item — even if mentioned in a prior email. Persistent "
-        "significant declines warrant persistent follow-up until resolved.\n"
+        "weekly coaching email to ONE sales rep. Keep it TIGHT (150-250 words "
+        "total). Reps don't read long emails. Be human, specific, direct. "
+        f"Tone: {tone_word}.\n\n"
+        "STRUCTURE — write exactly in this order:\n"
+        "1. HIGHLIGHT (1 sentence): Best thing from their data this week. "
+        "Must cite a real number or account. Never generic praise.\n"
+        "2. LOWLIGHT (1 sentence): Biggest concern. Name it plainly. "
+        "HIGH-IMPACT FLAG: any account with >$5,000 decline or a consistent "
+        "buyer now at $0 must be called out here — every week until resolved.\n"
+        "3. FOCUS AREAS (2-3 bullet points): Concrete, numbered-backed items "
+        "ranked by impact. Always use EXACT dates (e.g. 'February–April 2026') "
+        "— never say 'previous period' or 'last period' without specifying the "
+        "months. Use rep-friendly account labels from the data (e.g. '#1234 · "
+        "ABC FLOORING').\n"
         f"{closing_instruction}"
+        "5. SERVICE OFFER (1 line, optional): If you see a specific data pattern "
+        "that warrants a deeper dive (e.g. month-by-month breakdown of a "
+        "declining price class, account-level detail on stale accounts, or "
+        "display ROI analysis), offer it with a clear yes/no ask. Example: "
+        "'Want a month-by-month breakdown of your carpet sales at #1234 since "
+        "January 2026? Reply YES and I'll pull it.' Only offer if there is a "
+        "genuinely useful data question to answer — do not offer something "
+        "vague.\n\n"
         "Hard rules:\n"
         "- Only reference numbers in the data block. Do not invent figures.\n"
-        "- When you mention an account, ALWAYS use the rep-friendly label "
-        "shown in the data (e.g. '50285 (#1234)' or '50285 (#1234 · ABC "
-        "FLOORING)') because reps recognise their accounts by the legacy "
-        "#-number, not the new account number.\n"
-        "- If the rep is up vs peers, celebrate it; if down, frame it as a "
-        "challenge with peer context.\n"
+        "- Always write full date ranges, never 'previous period'.\n"
         "- Skip the scorecard table at the bottom — the system appends it.\n"
-        "- No subject line, no greeting like 'Hi REP'. Start with the body.\n"
-        "- If a metric is unavailable (None / n/a), do not mention it.\n"
-        "- Do NOT give everyone things to do. The closing section is "
-        "tier-dependent: struggling reps get assigned tasks; performing reps "
-        "get insights and opportunities."
+        "- No subject line, no greeting like 'Hi REP'. Start with HIGHLIGHT:.\n"
+        "- If a metric is unavailable (None / n/a), skip it.\n"
+        "- Do NOT give everyone things to do. Struggling reps get assigned "
+        "tasks; performing reps get insights and opportunities."
     )
     if scorecard.is_yoy_outlier:
         sys_msg += (
-            "\n\nIMPORTANT: This rep's YoY % is an outlier (likely caused by "
-            "an account-territory transfer, not real performance). DO NOT "
-            "frame the email around YoY %. Instead lead with absolute "
-            "revenue, GP%, last-3-months momentum, top growing/declining "
-            "accounts, and active-account ratio. Mention YoY only as a "
-            "factual aside, not as praise or criticism."
+            "\n\nIMPORTANT: This rep's YoY % is an outlier (likely a territory "
+            "transfer, not real performance). DO NOT frame the email around YoY. "
+            "Lead with absolute revenue, GP%, 3-month momentum, top "
+            "growing/declining accounts. Mention YoY only as a factual aside."
         )
 
     overview_block = ""
@@ -919,10 +912,19 @@ def _build_rep_prompt(
         po = period_overview
         yoy = "n/a" if po.yoy_pct is None else f"{po.yoy_pct:+.1f}%"
         overview_block = (
-            f"COMPANY PERIOD OVERVIEW ({po.label}, {po.start} -> {po.end}):\n"
+            f"COMPANY PERIOD OVERVIEW ({po.label}, {po.start.strftime('%B %Y')} -> {po.end.strftime('%B %Y')}):\n"
             f"  total_revenue=${po.revenue:,.0f}, prior=${po.prior_revenue:,.0f}, "
             f"yoy={yoy}, gp%={po.gpp_pct:.1f}, active_reps={po.active_reps}\n\n"
         )
+
+    # Build explicit human-readable date range labels so the AI can write
+    # them out in full (e.g. "February–April 2026") — never "previous period".
+    start_label = start.strftime("%B %Y")
+    end_label = end.strftime("%B %Y")
+    prior_start = start.replace(year=start.year - 1)
+    prior_end = end.replace(year=end.year - 1)
+    prior_start_label = prior_start.strftime("%B %Y")
+    prior_end_label = prior_end.strftime("%B %Y")
 
     yoy = "n/a" if sc.yoy_pct is None else f"{sc.yoy_pct:+.1f}%"
     peers = "n/a" if sc.peer_avg_yoy_pct is None else f"{sc.peer_avg_yoy_pct:+.1f}%"
@@ -973,10 +975,13 @@ def _build_rep_prompt(
 
     user_msg = (
         f"REP: {rep_key}  [TIER: {tier_label}]\n"
-        f"WINDOW: {start} -> {end} (cost centers: {cc_label})\n\n"
+        f"WINDOW: {start_label} to {end_label} ({start} -> {end}) | "
+        f"Prior year same window: {prior_start_label} to {prior_end_label}\n"
+        f"Cost centers: {cc_label}\n\n"
         f"{overview_block}"
         f"REP SCORECARD:\n"
-        f"  revenue=${sc.revenue:,.0f}, prior=${sc.prior_revenue:,.0f}, yoy={yoy}\n"
+        f"  revenue=${sc.revenue:,.0f} ({start_label}–{end_label}), "
+        f"prior=${sc.prior_revenue:,.0f} ({prior_start_label}–{prior_end_label}), yoy={yoy}\n"
         f"  peer_avg_yoy={peers}, vs_peers={vs_peer} (peer set: {sc.peer_count} reps)\n"
         f"  rank_revenue={sc.rank_revenue}, rank_yoy={sc.rank_yoy}\n"
         f"  gp%={sc.gpp_pct:.1f}, lines={sc.invoice_lines}\n"
@@ -988,10 +993,10 @@ def _build_rep_prompt(
         f"  last_3mo=${sc.last_3mo_revenue:,.0f}, prior_3mo=${sc.prior_3mo_revenue:,.0f}, "
         f"vs_prior_3mo={l3}, yoy_3mo={l3y}\n\n"
         f"TOP PRICE CLASSES (by revenue — what this rep is actually selling):\n{pc_lines}\n\n"
-        f"TOP GROWING ACCOUNTS (current vs prior):\n{growing_lines}\n\n"
-        f"TOP DECLINING ACCOUNTS:\n{declining_lines}\n\n"
-        f"STALE ACCOUNTS (had revenue last period, zero this period):\n{stale_lines}\n\n"
-        f"NEW ACCOUNTS (zero last period, revenue this period):\n{new_lines}\n"
+        f"TOP GROWING ACCOUNTS ({start_label}–{end_label} vs {prior_start_label}–{prior_end_label}):\n{growing_lines}\n\n"
+        f"TOP DECLINING ACCOUNTS ({start_label}–{end_label} vs {prior_start_label}–{prior_end_label}):\n{declining_lines}\n\n"
+        f"STALE ACCOUNTS (had revenue {prior_start_label}–{prior_end_label}, zero {start_label}–{end_label}):\n{stale_lines}\n\n"
+        f"NEW ACCOUNTS (zero {prior_start_label}–{prior_end_label}, revenue {start_label}–{end_label}):\n{new_lines}\n"
         f"{week_block}\n"
         f"NOTES:\n  " + ("\n  ".join(sc.notes) if sc.notes else "(none)")
     )

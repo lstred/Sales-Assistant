@@ -57,20 +57,21 @@ from app.ui.widgets.sales_filter_bar import SalesFilterBar
 
 SYSTEM_PROMPT = (
     "You are an analytical assistant for a sales manager at a flooring "
-    "distributor. The user message contains: (1) PRE-AGGREGATED TABLES "
-    "computed from the FULL filtered dataset (totals, by-rep, by-cost-center, "
-    "by-account, by-fiscal-period) \u2014 these are the ground truth for any "
-    "'top N', 'totals', 'who is biggest', 'who grew the most' style question. "
-    "(2) A CSV SAMPLE of up to a few thousand individual invoiced lines for "
-    "row-level detail. ALWAYS prefer the aggregate tables for ranking and "
-    "summing; only use the CSV sample when you need a specific line-level "
-    "fact. Answer concisely, citing exact numbers. If the data does not "
-    "support the answer, say so explicitly. Format dollar amounts with $ and "
-    "thousands separators. When listing reps, use the salesperson_desc field."
+    "distributor. Be BLUNT and DIRECT. The manager wants to know what's "
+    "working and what isn't, who is performing well and who isn't, what's "
+    "good and what's bad — don't soften the truth or hedge unnecessarily. "
+    "Call out underperformers by name. Highlight winners by name. Say clearly "
+    "when a trend is bad, not just 'there is room for improvement'.\n\n"
+    "The user message contains: (1) PRE-AGGREGATED TABLES computed from the "
+    "FULL filtered dataset (totals, by-rep, by-cost-center, by-account, "
+    "by-fiscal-period) — use these as ground truth for any ranking, totals, "
+    "or comparison questions. (2) A FULL CSV of all individual invoiced lines "
+    "for row-level detail queries. ALWAYS prefer the aggregate tables for "
+    "ranking/totals; use the CSV for line-level specifics. Answer concisely, "
+    "citing exact numbers. If the data does not support the answer, say so "
+    "explicitly. Format dollar amounts with $ and thousands separators. When "
+    "listing reps, use the salesperson_desc field."
 )
-
-# Soft caps to avoid blowing token budgets on huge result sets.
-MAX_ROWS_FOR_AI = 1500
 
 
 class _AskWorker(QThread):
@@ -119,10 +120,11 @@ class AIChatView(QWidget):
         # KPI estimates
         kpi_row = QHBoxLayout()
         self.kpi_rows = KpiCard("Rows in scope", "—")
-        self.kpi_data_tokens = KpiCard("Est. data tokens", "—")
-        self.kpi_total_tokens = KpiCard("Est. prompt tokens", "—",
-                                        "system + question + data")
-        for k in (self.kpi_rows, self.kpi_data_tokens, self.kpi_total_tokens):
+        self.kpi_data_tokens = KpiCard("Est. data tokens", "\u2014", "full dataset sent to AI")
+        self.kpi_total_tokens = KpiCard("Est. prompt tokens", "\u2014",
+                                        "system + question + full data")
+        self.kpi_cost_est = KpiCard("Est. input cost", "\u2014", "gpt-4.1 @ $2/1M tokens")
+        for k in (self.kpi_rows, self.kpi_data_tokens, self.kpi_total_tokens, self.kpi_cost_est):
             kpi_row.addWidget(k, 1)
         root.addLayout(kpi_row)
 
@@ -242,15 +244,18 @@ class AIChatView(QWidget):
     def _refresh_token_estimate(self) -> None:
         rows = 0 if self._df is None else len(self._df)
         self.kpi_rows.set_value(f"{rows:,}")
-        data_tok = estimate_df_tokens(self._df, max_rows=MAX_ROWS_FOR_AI) if self._df is not None else 0
+        # Full dataset — no cap — is sent to AI.
+        data_tok = estimate_df_tokens(self._df) if self._df is not None else 0
         sys_tok = estimate_text_tokens(SYSTEM_PROMPT)
         q_tok = estimate_text_tokens(self.input.toPlainText())
         total = sys_tok + q_tok + data_tok
-        self.kpi_data_tokens.set_value(
-            f"{data_tok:,}",
-            "" if rows <= MAX_ROWS_FOR_AI else f"top {MAX_ROWS_FOR_AI:,} of {rows:,} rows",
-        )
+        self.kpi_data_tokens.set_value(f"{data_tok:,}")
         self.kpi_total_tokens.set_value(f"{total:,}")
+        # Rough cost at gpt-4.1 input pricing ($2 per 1M tokens)
+        cost_usd = total / 1_000_000 * 2.0
+        self.kpi_cost_est.set_value(
+            f"~${cost_usd:.3f}" if cost_usd < 0.10 else f"~${cost_usd:.2f}"
+        )
 
     # --------------------------------------------------------------- ask
     def _ask(self) -> None:
@@ -261,13 +266,14 @@ class AIChatView(QWidget):
             self.status.setText("Type a question first.")
             return
 
-        sample = self._df.head(MAX_ROWS_FOR_AI)
+        # Full dataset — no row cap. The aggregate tables handle large datasets
+        # efficiently; the raw CSV is also sent in full so the AI can answer
+        # line-level questions without losing data.
         buf = io.StringIO()
-        sample.to_csv(buf, index=False)
+        self._df.to_csv(buf, index=False)
         csv_text = buf.getvalue()
 
-        # Pre-aggregate the FULL filtered dataset so the AI sees the truth
-        # for ranking / totals questions even when the CSV sample is capped.
+        # Pre-aggregate the FULL filtered dataset (ground truth for rankings).
         agg = aggregate_for_ai(self._df)
         agg_text = _format_aggregates(agg)
 
@@ -317,13 +323,11 @@ class AIChatView(QWidget):
             f"Date range (invoice date): {s.isoformat()} to {e.isoformat()}\n"
             f"Cost centers in scope: {', '.join(ccs)}\n"
             f"{scope_extra}"
-            f"Total rows in full dataset: {len(self._df):,} "
-            f"(showing {len(sample):,} in CSV sample below).\n\n"
+            f"Total rows: {len(self._df):,} (full dataset — no truncation).\n\n"
             f"PRE-AGGREGATED TABLES (full dataset \u2014 use these for ranking "
             f"and totals):\n{agg_text}\n"
             f"Question: {question}\n\n"
-            f"DATA SAMPLE (CSV, up to {MAX_ROWS_FOR_AI:,} rows for line-level "
-            f"detail only):\n{csv_text}"
+            f"FULL INVOICED LINES (CSV \u2014 all {len(self._df):,} rows):\n{csv_text}"
         )
 
         self.transcript.append(

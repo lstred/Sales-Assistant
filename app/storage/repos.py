@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Iterable, Optional
 
@@ -129,3 +129,321 @@ def _row_to_analysis(row) -> AIAnalysis:
         pinned=bool(row["pinned"]),
         created_at=row["created_at"],
     )
+
+
+# ============================================================ conversations
+@dataclass
+class Conversation:
+    id: int
+    rep_id: str
+    cost_center: Optional[str]
+    subject: str
+    topic: Optional[str]
+    status: str          # active | closed | escalated
+    tone: int
+    thread_key: str
+    created_at: str
+    last_activity_at: str
+    # Populated by join queries:
+    rep_name: str = ""
+    last_inbound_at: Optional[str] = None
+    needs_reply: bool = False
+
+
+@dataclass
+class Message:
+    id: int
+    conversation_id: int
+    direction: str       # inbound | outbound
+    message_id: Optional[str]
+    in_reply_to: Optional[str]
+    from_address: str
+    to_address: str
+    cc_address: Optional[str]
+    subject: str
+    body_text: str
+    body_html: str
+    ai_reasoning: str
+    imap_uid: Optional[str]
+    sent_at: str
+
+
+@dataclass
+class ActionItem:
+    id: int
+    conversation_id: int
+    rep_id: str
+    description: str
+    due_at: Optional[str]
+    status: str          # open | done | skipped
+    created_at: str
+    resolved_at: Optional[str]
+
+
+def list_conversations(status: str | None = None) -> list[Conversation]:
+    """Return conversations, newest-last-activity first.
+
+    If ``needs_reply`` joins are done here so callers don't have to query again.
+    """
+    with get_conn() as conn:
+        params: list = []
+        where = "WHERE 1=1"
+        if status:
+            where += " AND c.status = ?"
+            params.append(status)
+        rows = conn.execute(
+            f"""
+            SELECT c.*,
+                   r.name AS rep_name,
+                   MAX(CASE WHEN m.direction='inbound' THEN m.sent_at END) AS last_inbound_at,
+                   -- needs_reply: has inbound with no later outbound
+                   CASE WHEN EXISTS (
+                       SELECT 1 FROM messages mi
+                       WHERE mi.conversation_id = c.id
+                         AND mi.direction = 'inbound'
+                         AND NOT EXISTS (
+                             SELECT 1 FROM messages mo
+                             WHERE mo.conversation_id = c.id
+                               AND mo.direction = 'outbound'
+                               AND mo.sent_at > mi.sent_at
+                         )
+                   ) THEN 1 ELSE 0 END AS needs_reply
+            FROM conversations c
+            LEFT JOIN reps r ON r.salesman_number = c.rep_id
+            LEFT JOIN messages m ON m.conversation_id = c.id
+            {where}
+            GROUP BY c.id
+            ORDER BY c.last_activity_at DESC
+            """,
+            params,
+        ).fetchall()
+    return [_row_to_conversation(r) for r in rows]
+
+
+def get_conversation(conv_id: int) -> Conversation | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT c.*,
+                   r.name AS rep_name,
+                   MAX(CASE WHEN m.direction='inbound' THEN m.sent_at END) AS last_inbound_at,
+                   0 AS needs_reply
+            FROM conversations c
+            LEFT JOIN reps r ON r.salesman_number = c.rep_id
+            LEFT JOIN messages m ON m.conversation_id = c.id
+            WHERE c.id = ?
+            GROUP BY c.id
+            """,
+            (conv_id,),
+        ).fetchone()
+    return _row_to_conversation(row) if row else None
+
+
+def list_messages(conv_id: int) -> list[Message]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY sent_at ASC",
+            (conv_id,),
+        ).fetchall()
+    return [_row_to_message(r) for r in rows]
+
+
+def list_action_items(conv_id: int | None = None, status: str | None = None) -> list[ActionItem]:
+    with get_conn() as conn:
+        params: list = []
+        where = "WHERE 1=1"
+        if conv_id is not None:
+            where += " AND conversation_id = ?"
+            params.append(conv_id)
+        if status:
+            where += " AND status = ?"
+            params.append(status)
+        rows = conn.execute(
+            f"SELECT * FROM action_items {where} ORDER BY created_at DESC",
+            params,
+        ).fetchall()
+    return [_row_to_action(r) for r in rows]
+
+
+def resolve_action_item(item_id: int, new_status: str = "done") -> None:
+    from datetime import datetime
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE action_items SET status=?, resolved_at=? WHERE id=?",
+            (new_status, datetime.utcnow().isoformat(), item_id),
+        )
+
+
+def save_conversation(
+    *,
+    rep_id: str,
+    subject: str,
+    thread_key: str,
+    cost_center: str = "",
+    topic: str = "",
+    status: str = "active",
+    tone: int = 0,
+) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO conversations
+              (rep_id, cost_center, subject, topic, status, tone, thread_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (rep_id, cost_center, subject, topic, status, tone, thread_key),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def save_message(
+    *,
+    conversation_id: int,
+    direction: str,
+    from_address: str,
+    to_address: str,
+    subject: str,
+    body_text: str = "",
+    body_html: str = "",
+    message_id: str = "",
+    in_reply_to: str = "",
+    cc_address: str = "",
+    ai_reasoning: str = "",
+    imap_uid: str = "",
+) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO messages
+              (conversation_id, direction, message_id, in_reply_to,
+               from_address, to_address, cc_address, subject,
+               body_text, body_html, ai_reasoning, imap_uid)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id, direction, message_id, in_reply_to,
+                from_address, to_address, cc_address, subject,
+                body_text, body_html, ai_reasoning, imap_uid,
+            ),
+        )
+        conv_id = conversation_id
+        conn.execute(
+            "UPDATE conversations SET last_activity_at=datetime('now') WHERE id=?",
+            (conv_id,),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def save_action_item(
+    *,
+    conversation_id: int,
+    rep_id: str,
+    description: str,
+    due_at: str = "",
+) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO action_items (conversation_id, rep_id, description, due_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (conversation_id, rep_id, description, due_at or None),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def _row_to_conversation(row) -> Conversation:
+    return Conversation(
+        id=row["id"],
+        rep_id=row["rep_id"],
+        cost_center=row["cost_center"],
+        subject=row["subject"],
+        topic=row["topic"],
+        status=row["status"],
+        tone=row["tone"],
+        thread_key=row["thread_key"],
+        created_at=row["created_at"],
+        last_activity_at=row["last_activity_at"],
+        rep_name=row["rep_name"] or "",
+        last_inbound_at=row["last_inbound_at"],
+        needs_reply=bool(row["needs_reply"]),
+    )
+
+
+def _row_to_message(row) -> Message:
+    return Message(
+        id=row["id"],
+        conversation_id=row["conversation_id"],
+        direction=row["direction"],
+        message_id=row["message_id"],
+        in_reply_to=row["in_reply_to"],
+        from_address=row["from_address"],
+        to_address=row["to_address"],
+        cc_address=row["cc_address"],
+        subject=row["subject"],
+        body_text=row["body_text"],
+        body_html=row["body_html"],
+        ai_reasoning=row["ai_reasoning"],
+        imap_uid=row["imap_uid"],
+        sent_at=row["sent_at"],
+    )
+
+
+def _row_to_action(row) -> ActionItem:
+    return ActionItem(
+        id=row["id"],
+        conversation_id=row["conversation_id"],
+        rep_id=row["rep_id"],
+        description=row["description"],
+        due_at=row["due_at"],
+        status=row["status"],
+        created_at=row["created_at"],
+        resolved_at=row["resolved_at"],
+    )
+
+
+# ============================================================ dashboard counts
+def dashboard_counts() -> dict:
+    """Return live counts for the three dashboard KPI cards.
+
+    Returns:
+        dict with keys:
+        - active_conversations: int  — conversations with status='active'
+        - open_action_items: int     — action_items with status='open'
+        - needs_review: int          — inbound messages not yet replied to
+                                       (conversation has an inbound message
+                                       with no subsequent outbound message)
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM conversations WHERE status = 'active'"
+        ).fetchone()
+        active_convos = int(row[0]) if row else 0
+
+        row = conn.execute(
+            "SELECT COUNT(*) FROM action_items WHERE status = 'open'"
+        ).fetchone()
+        open_actions = int(row[0]) if row else 0
+
+        # "Needs review": conversations that have at least one inbound message
+        # that is more recent than the last outbound message (or have no
+        # outbound message at all). These are rep replies we haven't answered.
+        row = conn.execute(
+            """
+            SELECT COUNT(DISTINCT c.id)
+            FROM conversations c
+            JOIN messages m ON m.conversation_id = c.id
+                AND m.direction = 'inbound'
+            LEFT JOIN messages m2 ON m2.conversation_id = c.id
+                AND m2.direction = 'outbound'
+                AND m2.sent_at > m.sent_at
+            WHERE m2.id IS NULL
+            """
+        ).fetchone()
+        needs_review = int(row[0]) if row else 0
+
+    return {
+        "active_conversations": active_convos,
+        "open_action_items": open_actions,
+        "needs_review": needs_review,
+    }

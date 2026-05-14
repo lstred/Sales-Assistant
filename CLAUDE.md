@@ -287,6 +287,15 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
+- **2026-05-15 (latest)** — Ask AI full-dataset + blunt tone; weekly email HIGHLIGHT/LOWLIGHT structure; dashboard KPIs wired; conversations view with reply queue; help section:
+  - **Ask the AI**: Removed 1500-row cap — full DataFrame CSV is now sent to the AI. `estimate_df_tokens` updated accordingly. New KPI card shows estimated token cost at gpt-4.1 pricing ($2/1M input tokens). System prompt rewritten to be blunt and direct: "Call out underperformers by name. Say clearly when a trend is bad, not just 'there is room for improvement'."
+  - **Weekly email new structure**: Every email now starts with `HIGHLIGHT:` (best result, real numbers) then `LOWLIGHT:` (biggest concern), followed by FOCUS AREAS (2-3 bullets), closing action items or opportunities, and a `SERVICE OFFER` section where the AI offers a deeper data pull (e.g. "Want a month-by-month breakdown of carpet sales at #1234 since Jan 2026? Reply YES"). Target length 150-250 words (was 200-350). All date references are explicit (e.g. "February 2026–April 2026") — "previous period" is forbidden.
+  - **Dashboard KPIs wired**: `_DashboardLoader` now calls `dashboard_counts()` from `app.storage.repos` and wires the result to the Active Conversations, Open Action Items, and Needs Review KPI cards. All three show real data from SQLite on every refresh.
+  - **`app/storage/repos.py` expanded**: `Conversation`, `Message`, `ActionItem` dataclasses added. Full CRUD: `list_conversations` (with `needs_reply` computed via SQL subquery), `get_conversation`, `list_messages`, `list_action_items`, `resolve_action_item`, `save_conversation`, `save_message`, `save_action_item`. `dashboard_counts()` returns `{active_conversations, open_action_items, needs_review}`.
+  - **ConversationsView fully implemented** (was a placeholder): 3-tab QTabWidget — (0) All Conversations with filter buttons (All/Active/Needs reply) + message thread pane; (1) Needs Review — unanswered rep replies with "Mark as replied (manual)" button that logs an outbound message to clear the queue; (2) Action Items with mark-done/skip buttons. `needs_review_changed` signal updates sidebar badge and dashboard. Auto-loads via `QTimer.singleShot` on init.
+  - **Help view** (`app/ui/views/help_view.py`) added: searchable, full-content help documentation covering all 14 topics (Getting Started, Dashboard, Sales by Rep, Budget, Weekly Email, Ask the AI, Conversations, CC Mapping, Core Displays, Fiscal Calendar, Settings, Reps, Troubleshooting, Data & Privacy). Added as "Help" to sidebar.
+  - **22/22 tests pass.**
+
 - **2026-05-14 (latest)** — BILLSLMN attribution fix + price class insights + weekly email tier differentiation:
   - **BILLSLMN is now the source of truth for ALL sales attribution** (new and
     legacy). Previously, new-system sales used `SALESPERSON_DESC` from
