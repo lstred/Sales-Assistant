@@ -286,6 +286,74 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 Newest first.
 
+- **2026-05-14 (PM)** — Bug-fix + polish round (master leaderboard,
+  outliers, samples/displays, account labels):
+  - **Master leaderboard "No invoiced sales last week" fix**. The
+    button anchored the previous-week window to `date.today()`, but
+    when the manager's filter range ended *before* today (e.g. data
+    loaded through May 2 and "last week" was May 3-9), every per-rep
+    weekly query returned $0 and the email rendered empty. New
+    `_anchor_date()` returns `min(today, max(invoice_date in scope))`,
+    which `_generate_master` and `_weekly_lines_for` both use for the
+    weekly windows. The rendered HTML adds a yellow "Anchored to last
+    invoice date in scope (YYYY-MM-DD) — widen the date range to
+    include this calendar week." banner whenever the anchor < today,
+    so the user knows why and can fix it in one click.
+  - **Outlier YoY exclusion** (`OUTLIER_YOY_PCT_THRESHOLD = 500.0`).
+    A rep whose `|yoy_pct|` exceeds the threshold (e.g. Matthew Keenan
+    at +6410% after a territory transfer) is now flagged
+    `RepScorecard.is_yoy_outlier = True`, **excluded** from the
+    `peer_avg_yoy_pct` rollup so it can't skew everyone else's
+    comparative numbers, but the rep still gets a scorecard. The
+    AI weekly-email prompt receives an extra system instruction telling
+    it not to frame the email around YoY for outliers and to lean on
+    absolute revenue, GP%, last-3-months momentum, top movers, and
+    active-account ratio instead. The shoutout AI prompt converts the
+    YoY field to "YoY=outlier (territory transfer; ignore)" for those
+    reps and adds a `3mo=±X%` field so the model has a stable
+    alternative metric. The scorecard footer appends "(outlier — likely
+    territory transfer)" next to the YoY line.
+  - **Samples + core-display "all zeros" fix**. Two bugs stacked:
+    (a) `_ContextLoader` was loading sample sales via
+    `load_blended_sales(..., cost_centers=self._ccs, code_prefix="1")`
+    — but `self._ccs` contained the user's *product* CC selection,
+    which is mutually exclusive with `code_prefix='1'` in the SQL
+    filter, so the loader returned 0 rows every time. Fixed by passing
+    `cost_centers=None` (and `ccs_key=""` for the singleflight key) on
+    the samples loader call. (b) Core-display coverage was 0 for every
+    rep because `AppConfig.core_displays_by_cc` is empty by default
+    (the manager hadn't tagged any displays as "core" yet), so
+    `flat_core` was empty and no placement could match. New fallback:
+    when `core_displays_by_cc` is empty/None, **any** display
+    placement on a rep's account counts toward coverage, and a
+    `notes` line ("Core-display coverage uses ANY display because no
+    core displays are configured…") is added to the scorecard so the
+    manager knows to configure them in the Core Displays view for a
+    stricter measure.
+  - **Account labels everywhere use legacy BBANK2 + name**. Plumbed
+    `account_info` (`{new_acct: {old: BBANK2, name: BNAME stripped}}`)
+    from `load_rep_assignments` through `compute_rep_scorecards` so
+    every account dict in `top_growing_accounts` /
+    `top_declining_accounts` / `stale_accounts` / `new_accounts` now
+    carries `old_account` + `account_name` (closed-account leading
+    `*` stripped). New `format_account_label(rec, style='short'|'long')`
+    helper renders `"50285 (#1234 · ABC FLOORING)"` (short) or
+    `"50285 · ABC FLOORING (#1234)"` (long). The weekly email AI
+    prompt, fallback body, fallback shoutout, AI shoutout bullets,
+    and the scorecard footer growing/declining lists all use the
+    short form — reps now see the legacy `#-number` they recognise
+    next to the new account number.
+  - **Polish**. Master leaderboard HTML upgraded: dark navy header
+    (`#0F172A`/`#F8FAFC`), zebra-striped rows, `font-variant-numeric:
+    tabular-nums` on currency cells, rounded `1px solid #E2E8F0`
+    border, "Week to date covers …" caption, and the new anchor
+    warning banner. Scorecard footer typography tightened
+    (`font-weight:600`, `line-height:1.55`, `color:#0F172A`).
+  - **Tests**. New `tests/test_manager_analytics.py` covers (a) outlier
+    YoY excluded from `peer_avg_yoy_pct` while still flagged on the
+    scorecard, and (b) `format_account_label` short and long styles
+    plus the no-old-account fallback. **16/16 tests pass.**
+
 - **2026-05-14** — Sales-manager analytics + AI-coached weekly emails +
   rep directory + master leaderboard:
   - **New service `app/services/manager_analytics.py`**. Two dataclasses

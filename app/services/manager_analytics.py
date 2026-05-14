@@ -27,6 +27,12 @@ import pandas as pd
 MIN_ACCOUNTS_FOR_PEER_COMPARE = 5
 # A rep needs at least this much revenue in the period before YoY % is shown.
 MIN_REVENUE_FOR_YOY = 1_000.0
+# A rep whose YoY swings beyond this threshold (in either direction) is
+# almost always the result of an account-territory transfer, not real
+# performance — we exclude them from the peer-average calculation and the
+# email is steered toward more stable metrics (absolute revenue, GP%,
+# 3-month momentum, account mix).
+OUTLIER_YOY_PCT_THRESHOLD = 500.0
 # An account counts as "active" if it had any invoiced revenue in the window.
 # An account counts as "stale" if it had revenue in the prior window but
 # zero in the current window — these are the highest-priority talking points.
@@ -65,6 +71,8 @@ class RepScorecard:
     rank_revenue: int | None = None         # 1-based rank within peer set
     rank_yoy: int | None = None
     peer_count: int = 0
+    is_yoy_outlier: bool = False            # True when YoY is so extreme it
+                                            # would skew peer comparisons
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -220,10 +228,26 @@ def compute_rep_scorecards(
     # accounts are surfaced as context elsewhere).
     total_accts: dict[str, int] = {}
     open_accts_by_rep: dict[str, set[str]] = {}
+    account_info: dict[str, dict] = {}  # account_number -> {old, name}
     if assignments_df is not None and not assignments_df.empty:
         a = assignments_df.copy()
         a["salesman_name"] = a["salesman_name"].fillna("").astype(str).str.strip()
         a["account_number"] = a["account_number"].fillna("").astype(str).str.strip()
+        if "old_account_number" in a.columns:
+            a["old_account_number"] = a["old_account_number"].fillna("").astype(str).str.strip()
+        if "account_name" in a.columns:
+            a["account_name"] = (
+                a["account_name"].fillna("").astype(str).str.lstrip("*").str.strip()
+            )
+        # Account info map (one row per account — first non-empty wins).
+        for r in a.drop_duplicates(subset="account_number").itertuples(index=False):
+            acct = getattr(r, "account_number", "") or ""
+            if not acct:
+                continue
+            account_info[acct] = {
+                "old": getattr(r, "old_account_number", "") or "",
+                "name": getattr(r, "account_name", "") or "",
+            }
         a = a[a["salesman_name"] != ""]
         if "is_closed" in a.columns:
             a = a[~a["is_closed"].astype(bool)]
@@ -232,19 +256,26 @@ def compute_rep_scorecards(
             open_accts_by_rep[rep] = accts
             total_accts[rep] = len(accts)
 
-    # Core-display coverage per rep
-    core_set: set[tuple[str, str]] = set()  # (account, display_code) considered "core"
-    if displays_df is not None and not displays_df.empty and core_displays_by_cc:
-        # Flatten the configured "core" display codes into a single set
-        # (across all CCs the manager flagged).
-        flat_core = {c for codes in core_displays_by_cc.values() for c in codes}
+    # Core-display coverage per rep. If the manager has not configured any
+    # "core" displays for the cost centers in scope, we fall back to
+    # "any display placement counts as coverage" so the metric reflects
+    # reality instead of always reading 0.
+    core_set: set[tuple[str, str]] = set()
+    used_any_display_fallback = False
+    if displays_df is not None and not displays_df.empty:
+        d = displays_df.copy()
+        d["account_number"] = d.get("account_number", "").astype(str).str.strip()
+        d["display_code"] = d.get("display_code", "").astype(str).str.strip()
+        flat_core = (
+            {c for codes in (core_displays_by_cc or {}).values() for c in codes}
+            if core_displays_by_cc else set()
+        )
         if flat_core:
-            d = displays_df.copy()
-            d["account_number"] = d.get("account_number", "").astype(str).str.strip()
-            d["display_code"] = d.get("display_code", "").astype(str).str.strip()
             d = d[d["display_code"].isin(flat_core)]
-            for r in d.itertuples(index=False):
-                core_set.add((r.account_number, r.display_code))
+        else:
+            used_any_display_fallback = True
+        for r in d.itertuples(index=False):
+            core_set.add((r.account_number, r.display_code))
     accounts_with_core: dict[str, set[str]] = {}
     for acct, _code in core_set:
         for rep, accts in open_accts_by_rep.items():
@@ -277,14 +308,22 @@ def compute_rep_scorecards(
     ).fillna(0.0)
 
     # Peer-set YoY average — reps with enough revenue & accounts to count.
+    # Outliers (|YoY| > OUTLIER_YOY_PCT_THRESHOLD) are excluded so a single
+    # rep with a huge transferred-account swing can't drag the peer average
+    # away from reality.
     peer_yoys: list[float] = []
     rep_yoys: dict[str, float] = {}
+    rep_outliers: set[str] = set()
     for rep_key, totals in rep_totals.items():
         rev = float(totals["revenue"])
         prior_rev = float(prior_totals.get(rep_key, 0.0))
         accts = int(acct_per_rep.get(rep_key, 0))
         y = _yoy_pct(rev, prior_rev)
         if y is None or rev < MIN_REVENUE_FOR_YOY or accts < MIN_ACCOUNTS_FOR_PEER_COMPARE:
+            continue
+        if abs(y) > OUTLIER_YOY_PCT_THRESHOLD:
+            rep_outliers.add(rep_key)
+            rep_yoys[rep_key] = y  # still recorded for the rep, just not in peer avg
             continue
         peer_yoys.append(y)
         rep_yoys[rep_key] = y
@@ -342,6 +381,18 @@ def compute_rep_scorecards(
             )
         if rev < MIN_REVENUE_FOR_YOY:
             notes.append("Revenue below YoY-comparison threshold; YoY hidden.")
+        if rep_key in rep_outliers:
+            notes.append(
+                "YoY swing is outside the normal range (likely an "
+                "account-territory transfer) — excluded from peer average. "
+                "Coaching email will focus on absolute revenue, GP%, "
+                "3-month momentum, and account mix."
+            )
+        if used_any_display_fallback:
+            notes.append(
+                "No core displays configured for these cost centers — "
+                "coverage shown is *any* display on file."
+            )
 
         out[rep_key] = RepScorecard(
             rep_key=rep_key,
@@ -372,23 +423,34 @@ def compute_rep_scorecards(
             prior_3mo_revenue=p3,
             last_3mo_vs_prior_3mo_pct=_yoy_pct(l3, p3),
             last_3mo_yoy_pct=_yoy_pct(l3, y3),
-            top_growing_accounts=_records_for_email(growing),
-            top_declining_accounts=_records_for_email(declining),
-            stale_accounts=_records_for_email(stale, prior_only=True),
-            new_accounts=_records_for_email(new_a),
+            top_growing_accounts=_records_for_email(growing, account_info=account_info),
+            top_declining_accounts=_records_for_email(declining, account_info=account_info),
+            stale_accounts=_records_for_email(stale, prior_only=True, account_info=account_info),
+            new_accounts=_records_for_email(new_a, account_info=account_info),
             rank_revenue=rank_rev.get(rep_key),
             rank_yoy=rank_yoy.get(rep_key),
             peer_count=len(peer_yoys),
+            is_yoy_outlier=(rep_key in rep_outliers),
             notes=notes,
         )
     return out
 
 
-def _records_for_email(df: pd.DataFrame, *, prior_only: bool = False) -> list[dict]:
+def _records_for_email(
+    df: pd.DataFrame,
+    *,
+    prior_only: bool = False,
+    account_info: dict[str, dict] | None = None,
+) -> list[dict]:
     out = []
+    info = account_info or {}
     for r in df.to_dict("records"):
+        acct = r.get("account_number", "") or ""
+        meta = info.get(acct, {})
         row = {
-            "account": r.get("account_number", ""),
+            "account": acct,
+            "old_account": meta.get("old", ""),
+            "account_name": meta.get("name", ""),
             "current": float(r.get("revenue_curr", 0.0)),
             "prior": float(r.get("revenue_prior", 0.0)),
             "delta": float(r.get("delta", 0.0)),
@@ -400,6 +462,35 @@ def _records_for_email(df: pd.DataFrame, *, prior_only: bool = False) -> list[di
             row.pop("current", None)
         out.append(row)
     return out
+
+
+def format_account_label(rec: dict, *, style: str = "short") -> str:
+    """Render a top-mover account record for emails / UI.
+
+    ``style='short'``  -> ``"50285 (#1234)"`` or ``"50285 (ABC FLOORING)"``
+    ``style='long'``   -> ``"50285 · ABC FLOORING (#1234)"``
+    Old-system account number (BBANK2) is shown in parentheses with a ``#``
+    prefix because reps know their accounts by the legacy number.
+    """
+    acct = str(rec.get("account", "") or "").strip()
+    old = str(rec.get("old_account", "") or "").strip()
+    name = str(rec.get("account_name", "") or "").strip()
+    if style == "long":
+        bits = [acct]
+        if name:
+            bits.append("· " + name)
+        if old and old != acct:
+            bits.append(f"(#{old})")
+        return " ".join(bits).strip()
+    # short
+    paren_bits: list[str] = []
+    if old and old != acct:
+        paren_bits.append(f"#{old}")
+    if name:
+        paren_bits.append(name)
+    if paren_bits:
+        return f"{acct} ({' · '.join(paren_bits)})"
+    return acct
 
 
 def _slice_revenue_by_rep(
