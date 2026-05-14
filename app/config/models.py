@@ -93,6 +93,31 @@ class FiscalCalendarConfig(BaseModel):
     """Fiscal years (e.g. 2027) where January is 6 weeks instead of 5."""
 
 
+class BudgetConfig(BaseModel):
+    """Budget / forecast settings.
+
+    ``budget_fiscal_year`` is the FY label (e.g. 2027) the budget is being
+    built for.  0 means auto-detect (current fiscal year).
+
+    ``cc_growth_pct`` maps product cost-center code → percentage growth or
+    contraction vs the prior fiscal year (e.g. 10.0 for +10 %, -5.0 for −5 %).
+    CCs not in this map default to 0 % growth.
+
+    ``monthly_seasonality_pct`` has 12 values for P1 (February) through
+    P12 (January).  Values should sum to 100.0.  The default is a flat
+    distribution (8.34 / 8.33 alternating, sums to 100.0).
+    """
+
+    budget_fiscal_year: int = 0
+    cc_growth_pct: dict[str, float] = Field(default_factory=dict)
+    monthly_seasonality_pct: list[float] = Field(
+        default_factory=lambda: [
+            8.34, 8.33, 8.33, 8.34, 8.33, 8.33,
+            8.34, 8.33, 8.33, 8.34, 8.33, 8.33,
+        ]
+    )
+
+
 class GlobalFiltersConfig(BaseModel):
     """App-wide default filters applied to every sales-driven view.
 
@@ -116,6 +141,7 @@ class AppConfig(BaseModel):
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     fiscal: FiscalCalendarConfig = Field(default_factory=FiscalCalendarConfig)
     defaults: GlobalFiltersConfig = Field(default_factory=GlobalFiltersConfig)
+    budget: BudgetConfig = Field(default_factory=BudgetConfig)
 
     # User-maintained mappings (free-form, edited in UI later):
     sample_to_product_cc: dict[str, str] = Field(default_factory=dict)

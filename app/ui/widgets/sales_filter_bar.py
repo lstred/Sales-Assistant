@@ -172,12 +172,12 @@ class SalesFilterBar(QFrame):
                 except ValueError:
                     default_start = default_end = None
         if default_start is None or default_end is None:
+            yesterday = date.today() - timedelta(days=1)
             try:
-                default_start, default_end = last_n_full_periods_range(date.today(), 12, sw)
-            except Exception:  # noqa: BLE001
-                today = QDate.currentDate()
-                default_start = (today.addDays(-365)).toPython()
-                default_end = today.toPython()
+                default_start = yesterday.replace(year=yesterday.year - 1)
+            except ValueError:
+                default_start = yesterday - timedelta(days=365)
+            default_end = yesterday
 
         self.start_edit = QDateEdit()
         self.start_edit.setCalendarPopup(True)

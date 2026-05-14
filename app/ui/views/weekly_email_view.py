@@ -475,17 +475,11 @@ class WeeklyEmailView(QWidget):
         per_rep_curr = revenue_in_window(self._df, cur_start, cur_end, by="rep")
         leaderboard = sorted(per_rep_last.items(), key=lambda kv: -kv[1])
 
-        if self._has_ai() and leaderboard:
-            shoutouts = self._ai_shoutouts(leaderboard)
-        else:
-            shoutouts = {rep: _fallback_shoutout(rep, self._scorecards.get(rep))
-                         for rep, _ in leaderboard}
-
         body_html = _render_master_html(
             week_start=wk_start, week_end=wk_end,
             cur_start=cur_start, cur_end=cur_end,
             per_rep_last=per_rep_last, per_rep_curr=per_rep_curr,
-            shoutouts=shoutouts, period_overview=self._period_overview,
+            period_overview=self._period_overview,
             anchor=anchor,
         )
         subject = f"Team scoreboard \u2014 week of {wk_start.isoformat()}"
@@ -755,7 +749,6 @@ def _render_master_html(
     cur_end: date,
     per_rep_last: dict[str, float],
     per_rep_curr: dict[str, float],
-    shoutouts: dict[str, str],
     period_overview: PeriodOverview | None,
     anchor: date | None = None,
 ) -> str:
@@ -763,7 +756,6 @@ def _render_master_html(
     rows = []
     for i, (rep, rev) in enumerate(sorted_last, 1):
         cur = per_rep_curr.get(rep, 0.0)
-        msg = shoutouts.get(rep, "")
         zebra = "#FFFFFF" if i % 2 else "#F8FAFC"
         rows.append(
             f"<tr style='background:{zebra};'>"
@@ -771,11 +763,10 @@ def _render_master_html(
             f"<td style='padding:6px 10px;font-weight:600;color:#0F172A;'>{rep}</td>"
             f"<td style='padding:6px 10px;text-align:right;font-variant-numeric:tabular-nums;'>${rev:,.0f}</td>"
             f"<td style='padding:6px 10px;text-align:right;color:#475569;font-variant-numeric:tabular-nums;'>${cur:,.0f}</td>"
-            f"<td style='padding:6px 10px;color:#334155;'>{msg}</td>"
             f"</tr>"
         )
     table_rows = "".join(rows) or (
-        "<tr><td colspan='5' style='padding:12px;color:#888;'>No invoiced sales last week.</td></tr>"
+        "<tr><td colspan='4' style='padding:12px;color:#888;'>No invoiced sales last week.</td></tr>"
     )
     overview = ""
     if period_overview is not None and period_overview.revenue:
@@ -812,7 +803,6 @@ def _render_master_html(
           "<th style='padding:8px 10px;text-align:left;'>Rep</th>"
           "<th style='padding:8px 10px;text-align:right;'>Last week</th>"
           "<th style='padding:8px 10px;text-align:right;'>Week to date</th>"
-          "<th style='padding:8px 10px;text-align:left;'>Shout-out</th>"
           "</tr></thead>"
         + "<tbody>" + table_rows + "</tbody></table>"
         + f"<p style='color:#475569;font-size:12px;margin-top:14px;'>"
