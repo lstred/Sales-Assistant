@@ -341,7 +341,19 @@ class WeeklyEmailView(QWidget):
 
         s, e = self.filter_bar.date_range()
         ccs = self.filter_bar.selected_codes()
-        cc_label = ", ".join(ccs) if ccs else "all cost centers"
+        # Build a human-readable CC label including product-line names so
+        # reps see e.g. "CARPET RESIDENTIAL · CARPET COMMERCIAL" not just codes.
+        cc_df = getattr(self.filter_bar.cc, "_df", None)
+        if cc_df is not None and not cc_df.empty and ccs:
+            name_map: dict[str, str] = dict(
+                zip(cc_df["cost_center"].astype(str),
+                    cc_df["cost_center_name"].fillna(""))
+            )
+            cc_label = "  ·  ".join(
+                name_map.get(c, c) or c for c in ccs
+            )
+        else:
+            cc_label = ", ".join(ccs) if ccs else "all product lines"
 
         rep_to_number = self._build_rep_number_map()
 
@@ -369,6 +381,7 @@ class WeeklyEmailView(QWidget):
                 "body_html": _render_loading_html(rep_key),
                 "scorecard": sc.as_dict(),
                 "week_lines": week_lines,
+                "cc_label": cc_label,
             }
             label = self._list_label(rep_key, sc, email)
             item = QListWidgetItem(label)
@@ -459,6 +472,7 @@ class WeeklyEmailView(QWidget):
             scorecard=sc,
             period_overview=self._period_overview,
             week_lines=d.get("week_lines"),
+            cc_label=d.get("cc_label", ""),
         )
         for i in range(self.list.count()):
             it = self.list.item(i)
@@ -683,6 +697,7 @@ def _wrap_ai_body(
     scorecard: RepScorecard | None,
     period_overview: PeriodOverview | None,
     week_lines: dict | None,
+    cc_label: str = "",
 ) -> str:
     body_html = "".join(
         f"<p>{line.replace('<', '&lt;').replace('>', '&gt;')}</p>"
@@ -703,6 +718,16 @@ def _wrap_ai_body(
             f"{week_lines['current_week_lines']:,} lines"
             f"</div>"
         )
+    # Product-line coverage note — tells the rep which product categories
+    # this email covers so there's no ambiguity.
+    cc_html = ""
+    if cc_label:
+        cc_html = (
+            f"<p style='color:#475569;font-size:11px;background:#F8FAFC;"
+            f"border:1px solid #E2E8F0;border-radius:6px;padding:5px 10px;"
+            f"display:inline-block;margin:0 0 10px 0;'>"
+            f"\U0001f4ca <b>Product lines:</b> {cc_label}</p>"
+        )
     overview_html = ""
     if period_overview is not None:
         overview_html = (
@@ -716,7 +741,7 @@ def _wrap_ai_body(
     footer = ""
     if scorecard is not None:
         footer = _scorecard_footer_html(scorecard)
-    return overview_html + week_html + body_html + footer
+    return cc_html + overview_html + week_html + body_html + footer
 
 
 def _scorecard_footer_html(sc: RepScorecard) -> str:
@@ -884,7 +909,7 @@ def _build_rep_prompt(
         f"{closing_instruction}"
         "5. SERVICE OFFER (1 line, optional): If you see a specific data pattern "
         "that warrants a deeper dive (e.g. month-by-month breakdown of a "
-        "declining price class, account-level detail on stale accounts, or "
+        "declining product line, account-level detail on stale accounts, or "
         "display ROI analysis), offer it with a clear yes/no ask. Example: "
         "'Want a month-by-month breakdown of your carpet sales at #1234 since "
         "January 2026? Reply YES and I'll pull it.' Only offer if there is a "
@@ -952,7 +977,7 @@ def _build_rep_prompt(
     ) or "  (none)"
 
     pc_lines = "\n".join(
-        f"  - {p['price_class']} ({p['desc']}): ${p['revenue']:,.0f}, GP%={p['gp_pct']:.1f}%"
+        f"  - {p['desc'] or p['price_class']}: ${p['revenue']:,.0f}, GP%={p['gp_pct']:.1f}%"
         for p in sc.price_class_top
     ) or "  (none)"
 
@@ -977,7 +1002,7 @@ def _build_rep_prompt(
         f"REP: {rep_key}  [TIER: {tier_label}]\n"
         f"WINDOW: {start_label} to {end_label} ({start} -> {end}) | "
         f"Prior year same window: {prior_start_label} to {prior_end_label}\n"
-        f"Cost centers: {cc_label}\n\n"
+        f"Product lines covered: {cc_label}\n\n"
         f"{overview_block}"
         f"REP SCORECARD:\n"
         f"  revenue=${sc.revenue:,.0f} ({start_label}–{end_label}), "
@@ -992,7 +1017,7 @@ def _build_rep_prompt(
         f"  sample_lines={sc.sample_lines}, samples_per_account={sc.samples_per_account:.2f}\n"
         f"  last_3mo=${sc.last_3mo_revenue:,.0f}, prior_3mo=${sc.prior_3mo_revenue:,.0f}, "
         f"vs_prior_3mo={l3}, yoy_3mo={l3y}\n\n"
-        f"TOP PRICE CLASSES (by revenue — what this rep is actually selling):\n{pc_lines}\n\n"
+        f"TOP PRODUCTS BY REVENUE (what this rep is actually selling):\n{pc_lines}\n\n"
         f"TOP GROWING ACCOUNTS ({start_label}–{end_label} vs {prior_start_label}–{prior_end_label}):\n{growing_lines}\n\n"
         f"TOP DECLINING ACCOUNTS ({start_label}–{end_label} vs {prior_start_label}–{prior_end_label}):\n{declining_lines}\n\n"
         f"STALE ACCOUNTS (had revenue {prior_start_label}–{prior_end_label}, zero {start_label}–{end_label}):\n{stale_lines}\n\n"
