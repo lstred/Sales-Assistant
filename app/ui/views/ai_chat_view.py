@@ -39,6 +39,7 @@ from app.ai.base import ChatMessage
 from app.ai.factory import build_provider
 from app.ai.token_estimator import estimate_df_tokens, estimate_text_tokens
 from app.config.models import AppConfig, DatabaseConfig
+from app.services.manager_analytics import aggregate_for_ai
 from app.storage.repos import (
     AIAnalysis,
     delete_ai_analysis,
@@ -56,9 +57,14 @@ from app.ui.widgets.sales_filter_bar import SalesFilterBar
 
 SYSTEM_PROMPT = (
     "You are an analytical assistant for a sales manager at a flooring "
-    "distributor. You will be given a CSV of invoiced sales lines (filtered "
-    "to one or more cost centers and a date range). Answer the user's question "
-    "concisely, citing exact numbers from the data. If the data does not "
+    "distributor. The user message contains: (1) PRE-AGGREGATED TABLES "
+    "computed from the FULL filtered dataset (totals, by-rep, by-cost-center, "
+    "by-account, by-fiscal-period) \u2014 these are the ground truth for any "
+    "'top N', 'totals', 'who is biggest', 'who grew the most' style question. "
+    "(2) A CSV SAMPLE of up to a few thousand individual invoiced lines for "
+    "row-level detail. ALWAYS prefer the aggregate tables for ranking and "
+    "summing; only use the CSV sample when you need a specific line-level "
+    "fact. Answer concisely, citing exact numbers. If the data does not "
     "support the answer, say so explicitly. Format dollar amounts with $ and "
     "thousands separators. When listing reps, use the salesperson_desc field."
 )
@@ -260,6 +266,11 @@ class AIChatView(QWidget):
         sample.to_csv(buf, index=False)
         csv_text = buf.getvalue()
 
+        # Pre-aggregate the FULL filtered dataset so the AI sees the truth
+        # for ranking / totals questions even when the CSV sample is capped.
+        agg = aggregate_for_ai(self._df)
+        agg_text = _format_aggregates(agg)
+
         s, e = self.filter_bar.date_range()
         ccs = self.filter_bar.selected_codes() or ["ALL"]
 
@@ -303,9 +314,12 @@ class AIChatView(QWidget):
             f"Cost centers in scope: {', '.join(ccs)}\n"
             f"{scope_extra}"
             f"Total rows in full dataset: {len(self._df):,} "
-            f"(showing {len(sample):,} in CSV below).\n\n"
+            f"(showing {len(sample):,} in CSV sample below).\n\n"
+            f"PRE-AGGREGATED TABLES (full dataset \u2014 use these for ranking "
+            f"and totals):\n{agg_text}\n"
             f"Question: {question}\n\n"
-            f"DATA (CSV):\n{csv_text}"
+            f"DATA SAMPLE (CSV, up to {MAX_ROWS_FOR_AI:,} rows for line-level "
+            f"detail only):\n{csv_text}"
         )
 
         self.transcript.append(
@@ -464,3 +478,66 @@ class AIChatView(QWidget):
         self.input.clear()
         self.similar_banner.setVisible(False)
         self.status.setText("")
+
+
+# --------------------------------------------------------------- helpers
+def _format_aggregates(agg: dict) -> str:
+    """Render the aggregate_for_ai() output as compact text tables."""
+    lines: list[str] = []
+    by_rep = agg.get("by_rep") or []
+    by_cc = agg.get("by_cc") or []
+    by_account = agg.get("by_account") or []
+    by_period = agg.get("by_period") or []
+
+    # Synthesize a totals header from by_rep (every line is in some rep bucket).
+    if by_rep:
+        tot_rev = sum(float(r.get("revenue", 0) or 0) for r in by_rep)
+        tot_gp = sum(float(r.get("gross_profit", 0) or 0) for r in by_rep)
+        tot_lines = sum(int(r.get("lines", 0) or 0) for r in by_rep)
+        gpp = (tot_gp / tot_rev * 100.0) if tot_rev else 0.0
+        n_accounts = len({str(r.get("account_number", "")) for r in by_account})
+        lines.append(
+            f"TOTALS: revenue=${tot_rev:,.0f} | gp=${tot_gp:,.0f} | "
+            f"gp%={gpp:.1f} | lines={tot_lines:,} | reps={len(by_rep):,} | "
+            f"accounts_in_top200={n_accounts:,}"
+        )
+
+    if by_rep:
+        lines.append("\nBY REP (descending revenue, top 100):")
+        for r in by_rep[:100]:
+            lines.append(
+                f"  {str(r.get('rep_key','')):<32}  "
+                f"${float(r.get('revenue',0)):>14,.0f}  "
+                f"gp ${float(r.get('gross_profit',0)):>12,.0f}  "
+                f"lines {int(r.get('lines',0)):>5}  "
+                f"accts {int(r.get('accounts',0)):>4}"
+            )
+    if by_cc:
+        lines.append("\nBY COST CENTER (descending revenue):")
+        for r in by_cc[:50]:
+            lines.append(
+                f"  {str(r.get('cost_center','')):<6}  "
+                f"${float(r.get('revenue',0)):>14,.0f}  "
+                f"gp ${float(r.get('gross_profit',0)):>12,.0f}  "
+                f"lines {int(r.get('lines',0)):>5}  "
+                f"accts {int(r.get('accounts',0)):>4}"
+            )
+    if by_account:
+        lines.append("\nTOP ACCOUNTS (by revenue, up to 100):")
+        for r in by_account[:100]:
+            lines.append(
+                f"  {str(r.get('account_number','')):<14}  "
+                f"${float(r.get('revenue',0)):>14,.0f}  "
+                f"gp ${float(r.get('gross_profit',0)):>12,.0f}  "
+                f"lines {int(r.get('lines',0)):>5}"
+            )
+    if by_period:
+        lines.append("\nBY FISCAL PERIOD:")
+        for r in by_period:
+            lines.append(
+                f"  FY{r.get('fiscal_year','')} P{r.get('fiscal_period','')} "
+                f"({r.get('fiscal_period_name','')})  "
+                f"${float(r.get('revenue',0)):>14,.0f}  "
+                f"lines {int(r.get('lines',0)):>5}"
+            )
+    return "\n".join(lines) if lines else "(no aggregate data)"

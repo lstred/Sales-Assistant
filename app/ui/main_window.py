@@ -109,7 +109,7 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.dashboard_view = DashboardView(self._cfg, get_db=lambda: self._cfg.database)
-        self.reps_view = RepsView(get_db=lambda: self._cfg.database)
+        self.reps_view = RepsView(self._cfg, get_db=lambda: self._cfg.database)
         self.sales_by_rep_view = SalesByRepView(self._cfg, get_db=lambda: self._cfg.database)
         self.sales_by_cc_view = SalesByCostCenterView(self._cfg, get_db=lambda: self._cfg.database)
         self.conversations_view = ConversationsView()

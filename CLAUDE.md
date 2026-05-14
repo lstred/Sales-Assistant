@@ -286,6 +286,102 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 Newest first.
 
+- **2026-05-14** — Sales-manager analytics + AI-coached weekly emails +
+  rep directory + master leaderboard:
+  - **New service `app/services/manager_analytics.py`**. Two dataclasses
+    (`RepScorecard`, `PeriodOverview`) and pure functions that turn the
+    blended-sales DataFrame + rep assignments + display placements +
+    sample sales into deterministic, manager-grade analytics:
+    - Per-rep YoY revenue, **peer-average YoY** (peers defined by the
+      currently selected scope; min 5 active accounts and $1k revenue
+      to be peer-eligible), **vs-peers delta**, GP / GP%, line count.
+    - **Active-account ratio** (% of a rep's assigned accounts that
+      had any invoiced revenue in the window).
+    - **Core-display coverage** (% of the rep's accounts that have at
+      least one of the cost-center's "core" displays installed, per
+      `AppConfig.core_displays_by_cc`).
+    - **Samples-per-account** (sample-CC lines normalised to account
+      count) — a leading indicator of pipeline activity.
+    - **Last 3 months vs prior 3 months** and **last 3 months YoY** so
+      the email always has a current-trend talking point regardless of
+      the filter window.
+    - Top growing / top declining / **stale** (had revenue last yr,
+      zero now) / **new** (zero last yr, revenue now) accounts — each
+      with current, prior, delta, and pct.
+    - Within the loaded scope: `rank_revenue` and `rank_yoy`.
+    - `compute_period_overview(label, start, end, df, prior)` returns
+      total revenue / GP / YoY / active reps / active accounts /
+      top-rep & top-CC contributors for the period — used as the
+      preamble in monthly / quarterly / yearly emails.
+    - `current_week_range` / `previous_week_range` (Sun→Sat).
+    - `revenue_in_window(df, start, end, by='rep'|'account')` — used
+      to compute "last week" and "week-to-date" rep totals from the
+      already-loaded DataFrame without going back to SQL.
+    - `aggregate_for_ai(df)` returns `{by_rep, by_cc, by_account[top
+      200], by_period}` — the full-dataset truth tables fed to the AI.
+  - **`Sales Reps & Directory` view (`reps_view.py`) is now editable.**
+    Three new in-grid columns: **email**, **boss email** (Cc on
+    escalations), and **tone** (-3 firm … +3 extra-encouraging). Edits
+    persist to `AppConfig.rep_emails / rep_boss_emails / rep_tone`
+    keyed by `salesman_number` and write through `save_config(cfg)`.
+    Empty values clear the entry. Status bar reports how many reps
+    have an email on file. Answers the user's "is there a section to
+    add emails" question — yes, this view.
+  - **Weekly Email view rewritten end-to-end (`weekly_email_view.py`)**
+    to behave like a real sales manager:
+    1. Filter bar loads blended sales (current + prior year).
+    2. `_ContextLoader` background-loads rep assignments, display
+       placements, and sample-CC sales (sample sales reuse the
+       `sales_singleflight` cache with `code_prefix='1'`).
+    3. `compute_rep_scorecards(...)` + `compute_period_overview(...)`
+       are auto-run; the period preamble is detected from the
+       window's end date via `find_period(...)`.
+    4. **`_AIDraftWorker` (QThread)** sequentially asks the configured
+       AI provider to draft one email per rep using a tone-aware
+       system prompt (200–350 words, opens with a real positive,
+       2–3 focus areas with concrete numbers, 1–2 specific action
+       items, never invents figures). Tone ladder reads `rep_tone`:
+       ≥+2 warm; ≥0 supportive-candid; ≥-1 direct; else firm.
+    5. Each draft body is wrapped with a **company period overview
+       banner** ("FY27 P3 (April): $X · YoY +Y%"), a **"Last week /
+       This week to date" box** (per-rep weekly cadence), the AI
+       body, and a **scorecard footer** (revenue, YoY, peer delta,
+       L3M vs prior, active-account %, core-display coverage,
+       samples/account, top growing/declining accounts).
+    6. **Fallback path** when AI is not configured: a deterministic
+       5-paragraph human draft is rendered synchronously so the
+       workflow never blocks.
+  - **Master leaderboard email**. New "Generate master leaderboard"
+    button produces a single email recapping **last full week** for
+    every rep, sorted descending. Each row includes "Last week" and
+    "Week to date" totals + a one-line **AI-generated positive
+    shout-out** (separate AI call with a strict "always find
+    something honest and positive — never insult" system prompt).
+    Falls back to a hand-written shout-out template per rep
+    (top growing account / new account / YoY) when AI is off.
+  - **Per-rep recipient resolution**. The view builds a
+    `salesman_name → salesman_number` map from the assignments
+    DataFrame and looks each rep's `email` / `boss_email` /
+    `tone` up in `AppConfig`. The list label clearly flags
+    "no email on file (set in Sales Reps)" so the manager can fix
+    it in one click.
+  - **AI Chat view (`ai_chat_view.py`) now sends the full filtered
+    dataset truth.** Every question now includes a
+    `PRE-AGGREGATED TABLES` block built by `aggregate_for_ai(self._df)`
+    with TOTALS + by-rep (top 100) + by-cost-center (top 50) + top
+    accounts (100) + by-fiscal-period, *before* the existing capped
+    CSV sample. The system prompt explicitly tells the model to use
+    the aggregates for ranking/totals questions and the CSV only for
+    line-level detail — so "top 5 reps" answers are now correct even
+    when there are 200k underlying rows. The CSV cap stays at 1500
+    for token sanity.
+  - **Crash-safety pattern preserved**: `_ContextLoader` and
+    `_AIDraftWorker` use the `self._context_loaders: list[...]` /
+    `self._ai_workers: list[...]` pattern with
+    `finished.connect(...remove)` so concurrent generations never GC
+    a running QThread.
+  - 14/14 tests still pass.
+
 - **2026-05-14** — Crash fix + per-view feedback + fiscal-aware KPIs:
   - **Native crash on Refresh fixed**: every QThread-owning view (and the
     `CostCenterSelector`/`SalesFilterBar` widgets) used the
