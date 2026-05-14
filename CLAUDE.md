@@ -286,6 +286,46 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 
 Newest first.
 
+- **2026-05-14** — Crash fix + per-view feedback + fiscal-aware KPIs:
+  - **Native crash on Refresh fixed**: every QThread-owning view (and the
+    `CostCenterSelector`/`SalesFilterBar` widgets) used the
+    `self._loader = QThread(...)` pattern. When a refresh fired while a
+    previous loader was still running, the old reference was overwritten,
+    Python GC'd the still-running QThread, and PySide6 took the whole
+    process down. All sites now hold a `self._loaders: list[...]` and
+    each thread connects its `finished` signal to remove itself, so
+    multiple in-flight loaders coexist safely. Affected files:
+    `dashboard_view`, `reps_view`, `cc_mapping_view`,
+    `core_displays_view`, `ai_chat_view`, `cc_selector`,
+    `sales_filter_bar`.
+  - **Per-screen loading feedback in the sidebar.** Each nav button now
+    appends a status glyph: `⟳` (loading), `✓` (loaded), `!` (failed).
+    `Sidebar.set_status(key, state)` is the public API.
+    `SalesFilterBar` and `DashboardView` emit `busy_state_changed(str)`,
+    which `MainWindow` wires to the matching sidebar key. The startup
+    "Apply to all pages" / "Refresh" flow now visibly reports progress
+    for every screen as it loads.
+  - **Fiscal YTD KPI** — replaced the calendar `date(today.year,1,1)`
+    YTD card on the Dashboard with a true fiscal YTD using
+    `fy_start_date(fiscal_year_for(today))`. Caption now reads
+    `FY27 YTD · since 2026-02-01`.
+  - **Dashboard KPIs respect global default filters.** `_DashboardLoader`
+    now honors `cfg.defaults.cost_centers` for every blended-sales call
+    (LFM, fiscal YTD, open orders, active reps) and adds a new
+    **Selected range** KPI that computes total revenue across
+    `cfg.defaults.start_iso → end_iso` (or shows "—" if no default range
+    is set). All KPIs reflect the manager's chosen scope, not the entire
+    warehouse.
+  - **AI scope expanded** to include indirectly relevant context. When
+    the manager has selected product CC(s) in *Ask the AI*, the user
+    message now also lists (a) the **sample CCs that map to those
+    products** via `AppConfig.sample_to_product_cc`, and (b) the
+    **core display codes** registered for those CCs via
+    `AppConfig.core_displays_by_cc`. The AI can reason about
+    sample-pull and display correlations without the manager having to
+    surface them manually.
+  - 14/14 tests pass.
+
 - **2026-05-14** — Faster refresh + global default filters:
   - **Singleflight loader dedup** (`app/services/singleflight.py`). All
     `SalesFilterBar` instances funnel `load_blended_sales` calls through

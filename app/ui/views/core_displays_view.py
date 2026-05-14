@@ -59,7 +59,7 @@ class CoreDisplaysView(QWidget):
         super().__init__(parent)
         self._cfg = cfg
         self._get_db = get_db
-        self._loader: _Loader | None = None
+        self._loaders: list[_Loader] = []
         self._displays: pd.DataFrame | None = None
         self._ccs: pd.DataFrame | None = None
         self._cc_codes: list[str] = []
@@ -167,10 +167,14 @@ class CoreDisplaysView(QWidget):
     def _reload(self) -> None:
         self.refresh_btn.setEnabled(False)
         self.status.setText("Loading displays + cost centers…")
-        self._loader = _Loader(self._get_db())
-        self._loader.loaded.connect(self._on_loaded)
-        self._loader.failed.connect(self._on_failed)
-        self._loader.start()
+        loader = _Loader(self._get_db())
+        loader.loaded.connect(self._on_loaded)
+        loader.failed.connect(self._on_failed)
+        self._loaders.append(loader)
+        loader.finished.connect(
+            lambda L=loader: self._loaders.remove(L) if L in self._loaders else None
+        )
+        loader.start()
 
     def _on_loaded(self, displays: pd.DataFrame, ccs: pd.DataFrame) -> None:
         self.refresh_btn.setEnabled(True)

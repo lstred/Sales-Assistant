@@ -14,6 +14,16 @@ from PySide6.QtWidgets import (
 )
 
 
+# Status glyphs shown next to nav labels. Plain Unicode → renders cleanly in
+# Segoe UI Variable on Windows without needing icon assets.
+_STATUS_GLYPH = {
+    "idle":    "",
+    "loading": "  ⟳",
+    "done":    "  ✓",
+    "failed":  "  !",
+}
+
+
 class Sidebar(QFrame):
     navigated = Signal(str)  # emits the destination view key
 
@@ -38,6 +48,8 @@ class Sidebar(QFrame):
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
         self._buttons: dict[str, QPushButton] = {}
+        self._labels: dict[str, str] = {}
+        self._status: dict[str, str] = {}
 
         for key, label in items:
             btn = QPushButton(label)
@@ -48,6 +60,8 @@ class Sidebar(QFrame):
             self._group.addButton(btn)
             layout.addWidget(btn)
             self._buttons[key] = btn
+            self._labels[key] = label
+            self._status[key] = "idle"
 
         layout.addItem(QSpacerItem(0, 0, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
 
@@ -59,3 +73,16 @@ class Sidebar(QFrame):
     def select(self, key: str) -> None:
         if key in self._buttons:
             self._buttons[key].setChecked(True)
+
+    def set_status(self, key: str, status: str) -> None:
+        """Annotate a nav item with a status glyph (idle/loading/done/failed)."""
+        if key not in self._buttons:
+            return
+        if status not in _STATUS_GLYPH:
+            status = "idle"
+        self._status[key] = status
+        self._buttons[key].setText(self._labels[key] + _STATUS_GLYPH[status])
+
+    def reset_all_statuses(self) -> None:
+        for k in self._buttons:
+            self.set_status(k, "idle")

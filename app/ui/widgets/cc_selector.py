@@ -63,7 +63,7 @@ class CostCenterSelector(QWidget):
     ) -> None:
         super().__init__(parent)
         self._get_db = get_db
-        self._loader: _CCLoader | None = None
+        self._loaders: list[_CCLoader] = []
         self._df: pd.DataFrame | None = None
         self._select_all_after_load = select_all_after_load
         self._prefix_filter = (code_prefix_filter or "").strip()
@@ -128,10 +128,14 @@ class CostCenterSelector(QWidget):
 
     def reload(self) -> None:
         self.count_label.setText("loading…")
-        self._loader = _CCLoader(self._get_db())
-        self._loader.loaded.connect(self._on_loaded)
-        self._loader.failed.connect(self._on_failed)
-        self._loader.start()
+        loader = _CCLoader(self._get_db())
+        loader.loaded.connect(self._on_loaded)
+        loader.failed.connect(self._on_failed)
+        self._loaders.append(loader)
+        loader.finished.connect(
+            lambda L=loader: self._loaders.remove(L) if L in self._loaders else None
+        )
+        loader.start()
 
     def set_selected_codes(self, codes: list[str] | None) -> None:
         """Programmatically set the checked rows. ``None`` or empty list

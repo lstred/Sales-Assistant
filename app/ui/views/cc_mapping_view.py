@@ -60,7 +60,7 @@ class CCMappingView(QWidget):
         super().__init__(parent)
         self._cfg = cfg
         self._get_db = get_db
-        self._loader: _CCLoader | None = None
+        self._loaders: list[_CCLoader] = []
         self._df: pd.DataFrame | None = None
 
         root = QVBoxLayout(self)
@@ -144,10 +144,14 @@ class CCMappingView(QWidget):
     def _reload(self) -> None:
         self.refresh_btn.setEnabled(False)
         self.status.setText("Loading cost centers…")
-        self._loader = _CCLoader(self._get_db())
-        self._loader.loaded.connect(self._on_loaded)
-        self._loader.failed.connect(self._on_failed)
-        self._loader.start()
+        loader = _CCLoader(self._get_db())
+        loader.loaded.connect(self._on_loaded)
+        loader.failed.connect(self._on_failed)
+        self._loaders.append(loader)
+        loader.finished.connect(
+            lambda L=loader: self._loaders.remove(L) if L in self._loaders else None
+        )
+        loader.start()
 
     def _on_loaded(self, df: pd.DataFrame) -> None:
         df = (

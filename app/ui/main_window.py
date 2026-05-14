@@ -149,6 +149,18 @@ class MainWindow(QMainWindow):
             self._save_global_filters
         )
 
+        # Per-view busy indicators in the sidebar.
+        for key, view in self._views.items():
+            bar = getattr(view, "filter_bar", None)
+            if bar is not None and hasattr(bar, "busy_state_changed"):
+                bar.busy_state_changed.connect(
+                    lambda state, k=key: self.sidebar.set_status(k, state)
+                )
+            elif hasattr(view, "busy_state_changed"):
+                view.busy_state_changed.connect(
+                    lambda state, k=key: self.sidebar.set_status(k, state)
+                )
+
         h.addWidget(self.sidebar)
         h.addWidget(self.stack, 1)
 

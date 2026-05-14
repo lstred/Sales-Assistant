@@ -107,6 +107,7 @@ class SalesFilterBar(QFrame):
     sales_loaded = Signal(object)               # current df (back-compat)
     sales_loaded_with_prior = Signal(object, object)  # current, prior (or None)
     failed = Signal(str)
+    busy_state_changed = Signal(str)  # "loading" | "done" | "failed"
 
     def __init__(
         self,
@@ -125,7 +126,11 @@ class SalesFilterBar(QFrame):
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self._get_db = get_db
         self._cfg = cfg
-        self._loader: _SalesLoader | None = None
+        # Hold strong refs to *every* in-flight loader so PySide6 can't GC
+        # the QThread mid-run (which is the classic native-crash trigger).
+        # Threads are removed from the list when their ``finished`` signal
+        # fires.
+        self._loaders: list[_SalesLoader] = []
         self._autorun = autorun
         self._has_autorun = False
         self._last_cache_ts = None  # type: datetime | None
@@ -299,6 +304,7 @@ class SalesFilterBar(QFrame):
                     + (f" · prior {len(prior_df):,}" if prior_df is not None else "")
                 )
                 self._refresh_cache_label()
+                self.busy_state_changed.emit("done")
                 self.sales_loaded.emit(cur_df)
                 self.sales_loaded_with_prior.emit(cur_df, prior_df)
                 return
@@ -306,16 +312,21 @@ class SalesFilterBar(QFrame):
         scope = ", ".join(ccs) if ccs else "all CCs"
         self.status.setText(f"Loading {s} → {e} for {scope}…")
         self.run_btn.setEnabled(False)
+        self.busy_state_changed.emit("loading")
         self.run_requested.emit(s, e, ccs)
 
         sw = list(self._cfg.fiscal.six_week_january_years) if self._cfg else []
-        self._loader = _SalesLoader(
+        loader = _SalesLoader(
             self._get_db(), s, e, ccs, prior_start, prior_end, sw,
             self._code_prefix_filter,
         )
-        self._loader.loaded.connect(self._on_loaded)
-        self._loader.failed.connect(self._on_failed)
-        self._loader.start()
+        loader.loaded.connect(self._on_loaded)
+        loader.failed.connect(self._on_failed)
+        # Hold a strong ref until ``finished`` (PySide6 will native-crash
+        # if a running QThread is garbage-collected).
+        self._loaders.append(loader)
+        loader.finished.connect(lambda L=loader: self._loaders.remove(L) if L in self._loaders else None)
+        loader.start()
 
     def _on_loaded(self, df: pd.DataFrame, prior: pd.DataFrame | None) -> None:
         self.run_btn.setEnabled(True)
@@ -344,12 +355,14 @@ class SalesFilterBar(QFrame):
             suffix = f" · prior {len(prior):,} lines"
         self.status.setText(f"{len(df):,} invoiced lines{suffix}.")
         self._refresh_cache_label()
+        self.busy_state_changed.emit("done")
         self.sales_loaded.emit(df)
         self.sales_loaded_with_prior.emit(df, prior)
 
     def _on_failed(self, msg: str) -> None:
         self.run_btn.setEnabled(True)
         self.status.setText(f"Failed — {msg}")
+        self.busy_state_changed.emit("failed")
         self.failed.emit(msg)
 
     def _refresh_cache_label(self) -> None:

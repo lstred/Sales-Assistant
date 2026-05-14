@@ -74,7 +74,7 @@ class RepsView(QWidget):
     def __init__(self, get_db: callable, parent=None) -> None:
         super().__init__(parent)
         self._get_db = get_db
-        self._loader: _RepsLoader | None = None
+        self._loaders: list[_RepsLoader] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -121,10 +121,14 @@ class RepsView(QWidget):
     def reload(self) -> None:
         self.refresh_btn.setEnabled(False)
         self.status.setText("Loading reps from database…")
-        self._loader = _RepsLoader(self._get_db())
-        self._loader.loaded.connect(self._on_loaded)
-        self._loader.failed.connect(self._on_failed)
-        self._loader.start()
+        loader = _RepsLoader(self._get_db())
+        loader.loaded.connect(self._on_loaded)
+        loader.failed.connect(self._on_failed)
+        self._loaders.append(loader)
+        loader.finished.connect(
+            lambda L=loader: self._loaders.remove(L) if L in self._loaders else None
+        )
+        loader.start()
 
     def _on_loaded(self, df: pd.DataFrame) -> None:
         self._all_df = df

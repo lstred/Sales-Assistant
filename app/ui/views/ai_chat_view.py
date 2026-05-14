@@ -96,7 +96,7 @@ class AIChatView(QWidget):
         super().__init__(parent)
         self._cfg = cfg
         self._df: pd.DataFrame | None = None
-        self._worker: _AskWorker | None = None
+        self._workers: list[_AskWorker] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -262,9 +262,46 @@ class AIChatView(QWidget):
 
         s, e = self.filter_bar.date_range()
         ccs = self.filter_bar.selected_codes() or ["ALL"]
+
+        # Pull in the manager's app-side context so the AI can reason about
+        # related sample CCs and core displays even though those rows aren't
+        # in the loaded sales DataFrame.
+        related_samples: list[str] = []
+        related_displays: list[str] = []
+        try:
+            sel = set(self.filter_bar.selected_codes())
+            if sel and self._cfg is not None:
+                # Sample → product map; reverse it for "samples that feed
+                # the selected product CC(s)".
+                related_samples = sorted({
+                    s_cc for s_cc, p_cc in self._cfg.sample_to_product_cc.items()
+                    if p_cc in sel
+                })
+                related_displays = sorted({
+                    code
+                    for cc, codes in self._cfg.core_displays_by_cc.items()
+                    if cc in sel
+                    for code in codes
+                })
+        except Exception:  # noqa: BLE001
+            pass
+
+        scope_extra = ""
+        if related_samples:
+            scope_extra += (
+                f"Related sample cost centers (samples that feed these "
+                f"products): {', '.join(related_samples)}\n"
+            )
+        if related_displays:
+            scope_extra += (
+                f"Core display codes for these CCs: "
+                f"{', '.join(related_displays)}\n"
+            )
+
         user_msg = (
             f"Date range (invoice date): {s.isoformat()} to {e.isoformat()}\n"
             f"Cost centers in scope: {', '.join(ccs)}\n"
+            f"{scope_extra}"
             f"Total rows in full dataset: {len(self._df):,} "
             f"(showing {len(sample):,} in CSV below).\n\n"
             f"Question: {question}\n\n"
@@ -280,10 +317,14 @@ class AIChatView(QWidget):
         self.status.setText("Asking the model…")
         self.ask_btn.setEnabled(False)
 
-        self._worker = _AskWorker(self._cfg, SYSTEM_PROMPT, user_msg)
-        self._worker.answered.connect(self._on_answer)
-        self._worker.failed.connect(self._on_failed)
-        self._worker.start()
+        worker = _AskWorker(self._cfg, SYSTEM_PROMPT, user_msg)
+        worker.answered.connect(self._on_answer)
+        worker.failed.connect(self._on_failed)
+        self._workers.append(worker)
+        worker.finished.connect(
+            lambda W=worker: self._workers.remove(W) if W in self._workers else None
+        )
+        worker.start()
 
     def _on_answer(self, text: str, usage: dict) -> None:
         self.ask_btn.setEnabled(True)
