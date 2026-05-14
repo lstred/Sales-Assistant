@@ -155,18 +155,30 @@ def load_blended_sales(
     # Always build the rep attribution map from the current BILLSLMN
     # assignments so BOTH new-system and legacy rows are attributed to
     # whoever owns the account TODAY — not to whoever placed the order.
-    rep_map: dict[tuple[str, str], str] = {}
+    assignments_df_: pd.DataFrame | None = None
     try:
-        assignments = load_rep_assignments(db)
-        if assignments is not None and not assignments.empty:
-            for rec in assignments.to_dict("records"):
-                acct = str(rec.get("account_number") or "").strip()
-                cc = str(rec.get("cost_center") or "").strip()
-                name = str(rec.get("salesman_name") or "").strip()
-                if acct and cc and name:
-                    rep_map[(acct, cc)] = name
+        assignments_df_ = load_rep_assignments(db)
     except Exception:  # noqa: BLE001
-        rep_map = {}
+        pass
+
+    # Build two structures from the assignments:
+    # 1. A DataFrame keyed by (account_number, cost_center) -> salesman_name
+    #    for a fast vectorized merge onto the sales data.
+    # 2. The same map as a dict for use in the legacy unpivot loop.
+    rep_map: dict[tuple[str, str], str] = {}
+    rep_map_df: pd.DataFrame | None = None
+    if assignments_df_ is not None and not assignments_df_.empty:
+        ax = assignments_df_.copy()
+        ax["account_number"] = ax["account_number"].fillna("").astype(str).str.strip()
+        ax["cost_center"] = ax["cost_center"].fillna("").astype(str).str.strip()
+        ax["salesman_name"] = ax["salesman_name"].fillna("").astype(str).str.strip()
+        ax = ax[ax["salesman_name"] != ""][["account_number", "cost_center", "salesman_name"]]
+        ax = ax.drop_duplicates(subset=["account_number", "cost_center"])
+        rep_map_df = ax.reset_index(drop=True)
+        rep_map = {
+            (r["account_number"], r["cost_center"]): r["salesman_name"]
+            for r in ax.to_dict("records")
+        }
 
     # New-system portion
     new_start = max(start, NEW_SYSTEM_CUTOFF)
@@ -174,18 +186,22 @@ def load_blended_sales(
         new_df = load_invoiced_sales(db, new_start, end, cost_centers, prefix)
         if new_df is not None and not new_df.empty:
             new_df = new_df.copy()
-            # Re-attribute each line to the CURRENT account owner per BILLSLMN.
-            # Departed reps (e.g. an ex-employee whose accounts were reassigned)
-            # no longer appear in the metrics — their former accounts' sales flow
-            # to whoever owns those accounts now.
-            if rep_map:
-                def _remap(r: pd.Series) -> str:
-                    key = (
-                        str(r.get("account_number") or "").strip(),
-                        str(r.get("cost_center") or "").strip(),
-                    )
-                    return rep_map.get(key, str(r.get("salesperson_desc") or "").strip())
-                new_df["salesperson_desc"] = new_df.apply(_remap, axis=1)
+            # Re-attribute each line to the CURRENT account owner per BILLSLMN
+            # using a vectorized merge (not per-row apply — that would be O(n)
+            # Python-level iteration over 270k+ rows and take many minutes).
+            if rep_map_df is not None and not rep_map_df.empty:
+                new_df["account_number"] = new_df["account_number"].fillna("").astype(str).str.strip()
+                new_df["cost_center"] = new_df["cost_center"].fillna("").astype(str).str.strip()
+                merged = new_df.merge(
+                    rep_map_df,
+                    on=["account_number", "cost_center"],
+                    how="left",
+                )
+                # Where BILLSLMN has a current owner, use that; otherwise keep
+                # the original SALESPERSON_DESC from the order line.
+                orig = new_df["salesperson_desc"].fillna("").astype(str).str.strip()
+                override = merged["salesman_name"].fillna("").astype(str).str.strip()
+                new_df["salesperson_desc"] = override.where(override != "", orig)
             new_df["data_source"] = "new"
             parts.append(new_df)
 
