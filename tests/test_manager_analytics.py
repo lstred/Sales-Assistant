@@ -99,33 +99,36 @@ def test_samples_attributed_via_account_ownership() -> None:
 # ─────────────────────── Budget service tests ────────────────────────────────
 
 def test_parse_rep_cc_upload_from_csv(tmp_path) -> None:
-    """parse_rep_cc_upload reads a CSV correctly and parses growth_pct."""
+    """parse_rep_cc_upload reads a CSV correctly and zero-pads CC codes."""
     from app.services.budget_service import parse_rep_cc_upload
 
     csv_path = tmp_path / "overrides.csv"
     csv_path.write_text(
         "rep_number,cost_center,growth_pct\n"
-        "42,010,10.0\n"
-        "17,010,-5.5\n"
-        "42,020,0.0\n"
+        "42,10,10.0\n"    # CC "10" should be normalised to "010"
+        "17,10,-5.5\n"    # same
+        "42,20,0.0\n"     # "20" → "020"
+        "5,010,3.0\n"     # already 3-char, kept; rep "5" stripped of leading zeros
     )
     overrides, errors = parse_rep_cc_upload(str(csv_path))
     assert errors == []
+    # CC codes are zero-padded to 3 digits
     assert overrides[("42", "010")] == 10.0
     assert overrides[("17", "010")] == -5.5
     assert overrides[("42", "020")] == 0.0
+    assert overrides[("5", "010")] == 3.0
 
 
 def test_parse_rep_cc_upload_skips_bad_rows(tmp_path) -> None:
-    """Bad rows emit errors but valid rows are still returned."""
+    """Bad rows emit errors but valid rows are still returned. CC zero-padded."""
     from app.services.budget_service import parse_rep_cc_upload
 
     csv_path = tmp_path / "bad.csv"
     csv_path.write_text(
         "rep_number,cost_center,growth_pct\n"
-        "42,010,10.0\n"
-        ",,\n"
-        "17,020,notanumber\n"
+        "42,10,10.0\n"       # valid — CC "10" → "010"
+        ",,\n"               # blank rep + cc → error
+        "17,20,notanumber\n" # bad growth_pct → error
     )
     overrides, errors = parse_rep_cc_upload(str(csv_path))
     assert ("42", "010") in overrides

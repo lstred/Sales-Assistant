@@ -346,8 +346,9 @@ class _SettingsPanel(QWidget):
         # Format spec box
         spec = QLabel(
             "<b>Required columns (exact names, case-insensitive):</b><br>"
-            "&nbsp;&nbsp;<b>rep_number</b> — salesman number (e.g. <tt>42</tt>)<br>"
-            "&nbsp;&nbsp;<b>cost_center</b> — CC code (e.g. <tt>010</tt>)<br>"
+            "&nbsp;&nbsp;<b>rep_number</b> — salesman number (e.g. <tt>212</tt>)<br>"
+            "&nbsp;&nbsp;<b>cost_center</b> — CC code, leading zeros optional "
+            "(<tt>10</tt> and <tt>010</tt> both work)<br>"
             "&nbsp;&nbsp;<b>growth_pct</b> — growth or decline % (<tt>10</tt> = +10 %, <tt>-5</tt> = −5 %)<br>"
             "One row per rep × CC pair. Extra columns are ignored."
         )
@@ -504,13 +505,15 @@ class _SettingsPanel(QWidget):
         template = (
             "rep_number,cost_center,growth_pct\n"
             "# Instructions:\n"
-            "#   rep_number  — salesman number exactly as it appears in Sales Reps (e.g. 42)\n"
-            "#   cost_center — product CC code (e.g. 010)\n"
+            "#   rep_number  — salesman number as shown in Sales Reps (e.g. 42 or 212)\n"
+            "#   cost_center — product CC code with OR without leading zeros\n"
+            "#                 (e.g. 10 and 010 both work for CC 010)\n"
             "#   growth_pct  — numeric % (e.g. 10 for +10%, -5 for -5%)\n"
-            "#   Remove these comment lines before uploading.\n"
-            "42,010,10.0\n"
-            "42,020,-5.0\n"
-            "17,010,12.5\n"
+            "#   One row per rep × CC pair. Remove these comment lines before uploading.\n"
+            "212,10,2.0\n"
+            "212,11,3.0\n"
+            "206,10,2.0\n"
+            "206,30,-2.5\n"
         )
         try:
             Path(path).write_text(template)

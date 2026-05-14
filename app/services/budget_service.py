@@ -111,6 +111,17 @@ def parse_rep_cc_upload(path: str) -> tuple[dict[tuple[str, str], float], list[s
         if not rep or not cc:
             errors.append(f"Row {i + 2}: rep_number or cost_center is blank — skipped.")
             continue
+
+        # Normalize CC code to 3-char zero-padded format so it matches the DB
+        # (e.g. "10" → "010", "27" → "027"; 4-char codes like "0122" are left alone).
+        if cc.isdigit() and len(cc) < 3:
+            cc = cc.zfill(3)
+
+        # Normalize rep number: strip leading zeros so "004" matches the DB's "4"
+        # but leave non-numeric rep IDs untouched.
+        if rep.isdigit():
+            rep = str(int(rep))
+
         try:
             pct = float(pct_str)
         except ValueError:
@@ -129,8 +140,25 @@ def _effective_growth(
     rep_cc_growth_pct: dict[tuple[str, str], float],
     cc_growth_pct: dict[str, float],
 ) -> float:
-    """Return the growth % to apply: rep-CC override if present, else CC default."""
-    return rep_cc_growth_pct.get((rep_num, cc), cc_growth_pct.get(cc, 0.0))
+    """Return the growth % to apply: rep-CC override if present, else CC default.
+
+    Normalizes keys the same way parse_rep_cc_upload does so lookup is always
+    consistent regardless of leading-zero formatting in source data.
+    """
+    if not rep_cc_growth_pct:
+        return cc_growth_pct.get(cc, 0.0)
+
+    # Normalize to the same format used in parse_rep_cc_upload
+    norm_rep = str(int(rep_num)) if rep_num.isdigit() else rep_num
+    norm_cc = cc.zfill(3) if cc.isdigit() and len(cc) < 3 else cc
+
+    # Try normalized form first, then exact match as fallback
+    v = rep_cc_growth_pct.get((norm_rep, norm_cc))
+    if v is None:
+        v = rep_cc_growth_pct.get((rep_num, cc))
+    if v is None:
+        return cc_growth_pct.get(cc, 0.0)
+    return v
 
 
 def _cc_aggregates(

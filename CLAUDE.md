@@ -287,7 +287,24 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
-- **2026-05-14 (latest)** — Rep-level budget upload + fiscal YTD default filter:
+- **2026-05-14 (latest)** — CC zero-padding fix for rep-level upload + weekly email high-impact drops:
+  - **Root cause of upload not applying**: CC codes in the CSV used no leading
+    zeros (`10`, `27`, `40` etc.) while the DB stores 3-char zero-padded codes
+    (`010`, `027`, `040`). Dict key `("212","10")` never matched `("212","010")`.
+    Fixed in `parse_rep_cc_upload`: numeric CC codes shorter than 3 chars are
+    now zero-padded with `cc.zfill(3)` before building the key. Rep numbers are
+    normalized by stripping leading zeros via `str(int(rep))` so both `"4"` and
+    `"004"` map to the same key. `_effective_growth` applies the same
+    normalization when looking up, so matching is always consistent.
+    Template download updated with realistic examples (two-digit CCs, note
+    that leading zeros are optional). Format-spec label in UI updated likewise.
+  - **Weekly email — high-impact account drops now flagged persistently**:
+    AI system prompt updated to instruct the model to flag top-declining and
+    stale accounts with large drops (>$5k decline, or regular buyer now at $0)
+    as the top-priority action item in every email until resolved — not just
+    the first week. These high-impact signals warrant persistent follow-up.
+  - **22/22 tests pass.** Test updated to use 2-digit CC codes to reflect
+    real upload format and verify zero-padding is applied correctly.
   - **Default filter date range** changed to **fiscal YTD**: from the start
     of the current fiscal year through the end of the last fully-completed
     fiscal period.  Prior-year comparison covers the same fiscal YTD range
