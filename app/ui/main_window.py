@@ -116,7 +116,7 @@ class MainWindow(QMainWindow):
         self.reps_view = RepsView(self._cfg, get_db=lambda: self._cfg.database)
         self.sales_by_rep_view = SalesByRepView(self._cfg, get_db=lambda: self._cfg.database)
         self.sales_by_cc_view = SalesByCostCenterView(self._cfg, get_db=lambda: self._cfg.database)
-        self.conversations_view = ConversationsView(self._cfg)
+        self.conversations_view = ConversationsView(self._cfg, get_db=lambda: self._cfg.database)
         self.ai_chat_view = AIChatView(self._cfg, get_db=lambda: self._cfg.database)
         self.weekly_email_view = WeeklyEmailView(self._cfg, get_db=lambda: self._cfg.database)
         self.budget_view = BudgetView(self._cfg, get_db=lambda: self._cfg.database)

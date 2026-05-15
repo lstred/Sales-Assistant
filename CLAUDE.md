@@ -308,6 +308,47 @@ read those plus this file's earlier sections for full context.
     - **Tab badge colour** uses `QColor("#DC2626")` (red) / `QColor()` (theme default) instead of the hardcoded `Qt.GlobalColor.black` which rendered incorrectly on dark backgrounds.
   - **26/26 tests pass.**
 
+- **2026-05-18 (latest)** — AI Reply in Conversations view; Needs Review tab redesign:
+  - **`_AiReplyWorker(QThread)`** new class in `conversations_view.py`:
+    Signals `draft_ready(str)` / `error(str)` / `done()`. Pulls the full
+    conversation history, extracts account numbers via regex from all messages,
+    fetches fresh month-by-month warehouse data (Jan prior yr → today) from
+    `load_invoiced_sales` + `load_rep_assignments` for those accounts, then
+    calls the configured AI provider to draft a 100–220 word data-rich reply
+    fulfilling the rep's specific request. Temperature 0.35 for factual
+    consistency. `get_db` is passed in from `main_window.py` (same pattern
+    as all other views).
+  - **`_ReplyComposeDialog(QDialog)`** new class: polished compose window
+    with readonly To/Subject header, collapsible thread history (`QTextBrowser`
+    170 px, toggleable via ▼/▶ button), editable draft body (`QTextEdit`),
+    status label, Cancel + "✉ Send Reply" buttons. `Send Reply` dispatches
+    via `EmailClient.send()` with proper `In-Reply-To` header (last inbound
+    message-id) for email-client threading, then calls `record_send()` to
+    log the outbound message. Emits `sent` signal → triggers `refresh()`.
+    Send button disabled with tooltip when SMTP not configured.
+  - **`_render_thread_html(messages)`** module-level shared helper (replaces
+    inline duplicated HTML building in both tabs and the old `_load_thread`
+    method). Inbound messages: blue (`#EFF6FF` bg / `#BFDBFE` border); outbound:
+    green (`#F0FDF4` bg / `#BBF7D0` border). Prefers `body_html`, falls back
+    to escaped `body_text`.
+  - **Needs Review tab completely redesigned** — old layout (list + small
+    detail panel below + single "Mark as replied" button) replaced with a
+    `QSplitter` (list left, full thread right) mirroring the All Conversations
+    tab. Two action buttons: primary blue **"✨ Draft AI Reply"** (launches
+    worker + compose dialog) and secondary **"Mark as replied (manual)"**.
+    Thread auto-scrolls to bottom so the most recent reply is immediately
+    visible. Both buttons are disabled until a conversation is selected; AI
+    button further disabled if AI provider not configured.
+  - **Old orphaned ConversationsView body removed** — previous session left
+    ~480 lines of dead old `__init__` code and all old methods trailing after
+    the new class. Cleaned up.
+  - **`main_window.py`** updated: `ConversationsView(self._cfg)` →
+    `ConversationsView(self._cfg, get_db=lambda: self._cfg.database)`.
+  - **Help view updated**: Conversations section rewritten to document AI
+    Reply workflow (4-step numbered list), compose dialog, manual fallback,
+    and IMAP poll button.
+  - **26/26 tests pass.**
+
 - **2026-05-17 (latest)** — Leaderboard exclusions, HTML clipboard, email send, shoutout polish:
   - **`_EXCLUDED_REPS` constant**: `frozenset({"", "house account", "(legacy / pre-aug 2025)"})` — blank rep names, HOUSE ACCOUNT, and the legacy pre-Aug-2025 synthetic rep are excluded from `active_reps` before the leaderboard is built, so they never appear in the standings table, shoutout sections, or improvement calculations.
   - **"Copy leaderboard" now copies rich HTML** via `QMimeData.setHtml()`. Outlook and Gmail accept `text/html` clipboard data and render the table with proper proportional-font alignment — no more misaligned columns. Plain text is still set as a fallback via `QMimeData.setText()`.

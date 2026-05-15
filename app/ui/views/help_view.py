@@ -293,28 +293,31 @@ alert you so you don't waste an API call.</p>
         "Conversations & Reply Queue",
         """
 <h2>Conversations &amp; Reply Queue</h2>
-<p>Tracks every email thread the app has started with a rep, plus their replies.</p>
+<p>Tracks every email thread the app has started with a rep, plus their replies and extracted commitments.</p>
 
 <h3>All Conversations tab</h3>
-<p>Shows all threads sorted by most recent activity. Filter by All / Active /
-Needs reply using the buttons at the top. Click a conversation to see the
-full message thread on the right.</p>
+<p>Shows all threads sorted by most recent activity. Filter by All / Active / Needs reply using the buttons at the top. Click a conversation to see the full message thread rendered on the right — inbound (rep) messages appear with a blue border, outbound (sent) messages with a green border.</p>
 
 <h3>Needs Review tab</h3>
-<p><b>This is your most important queue.</b> Any time a rep replies to an
-email and you haven't responded, it appears here — whether the app was open
-or not. Check this tab every time you open the app.</p>
-<p>When the count is &gt; 0, the Dashboard "Needs review" KPI card turns red.
-The sidebar badge also updates.</p>
-<p>To clear an item: select it, review the rep's reply in the bottom panel,
-then click <b>Mark as replied (manual)</b> after you've sent your response.
-This logs the reply so the thread no longer shows as needing attention.</p>
+<p><b>Your most important queue.</b> Any time a rep replies to an AI-generated email, it appears here automatically. The Dashboard "Needs review" KPI card turns red and the sidebar badge updates when count &gt; 0.</p>
+
+<h4>AI Reply (recommended)</h4>
+<ol>
+  <li>Click a thread in the list on the left — the full conversation renders on the right so you can read what the rep actually said.</li>
+  <li>Click <b>✨ Draft AI Reply</b>. The AI reads the full conversation history, extracts any account numbers, pulls fresh month-by-month warehouse data for those accounts, and drafts a data-rich response (100–220 words) fulfilling the rep's specific request.</li>
+  <li>The <b>Reply Compose</b> window opens with the draft pre-loaded. You can read the collapsible thread history at the top, then edit the body freely.</li>
+  <li>Click <b>✉ Send Reply</b> to dispatch via SMTP and clear the thread from the queue.</li>
+</ol>
+<p><i>Requires AI and outbound SMTP to be configured in Settings.</i></p>
+
+<h4>Manual Mark as Replied</h4>
+<p>If you replied directly from your email client, click <b>Mark as replied (manual)</b> to log the action and remove the thread from the queue. No email is sent by the app.</p>
 
 <h3>Action Items tab</h3>
-<p>Rep commitments extracted from their replies (e.g. "I'll call them Friday",
-"will do a PK session next week"). These are created automatically when the AI
-parses inbound messages. You can mark them as <b>Done</b> or <b>Skip</b>.
-Active action items are counted on the Dashboard.</p>
+<p>Rep commitments extracted from their replies (e.g. "I'll call them Friday"). Mark as <b>Done</b> or <b>Skip</b>. Active items are counted on the Dashboard.</p>
+
+<h3>Check for new replies button</h3>
+<p>Polls your IMAP inbox for unread messages and matches them to existing conversation threads. Requires IMAP configuration in Settings → Email. Run this whenever you want to sync without restarting the app.</p>
 """,
     ),
     (
