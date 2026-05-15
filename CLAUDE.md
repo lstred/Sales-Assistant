@@ -287,6 +287,27 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
+- **2026-05-15 (latest)** — Conversations view fully wired; IMAP reply detection:
+  - **Root cause fixed**: Emails sent via `_SendWorker` / `_SendReviewDialog` were never written to SQLite — the Conversations view showed "No conversations yet" even after real emails had been sent. Fix: `_SendWorker.run()` now calls `record_send()` after every successful SMTP send, creating the conversation row (idempotent via `INSERT OR IGNORE`) and recording the outbound message.
+  - **`app/storage/repos.py`** — four new helper functions:
+    - `upsert_rep(salesman_number, name, tone)` — idempotent rep upsert that does NOT overwrite user-configured email/boss_email/tone.
+    - `record_send(...)` — combines `upsert_rep` + `INSERT OR IGNORE` conversation + `save_message(outbound)` in one call. Returns the conversation id.
+    - `find_conversation_for_reply(in_reply_to, references)` — matches an inbound email to an existing conversation by checking `messages.message_id` and `conversations.thread_key` against each Message-ID in the headers.
+    - `record_inbound(...)` — deduplication-safe inbound message save (checks `message_id` and `imap_uid` before inserting).
+  - **`app/notifications/email_client.py`** — `fetch_new_replies()` method: connects to IMAP via UID SEARCH UNSEEN, fetches messages with `BODY.PEEK[]` (preserves unread status), decodes RFC 2047 subjects, extracts text + HTML bodies, returns list of dicts. `_extract_body()` static helper handles multipart and single-part messages.
+  - **`app/ui/views/weekly_email_view.py`** — `_SendWorker` updated:
+    - Constructor gains `from_address: str = ""` parameter.
+    - `run()` calls `record_send()` for each successfully sent per-rep email (skips the master leaderboard which has no `salesman_number`).
+    - `_SendReviewDialog._send()` passes `from_address=cfg.email.smtp_from_address`.
+  - **`app/ui/views/conversations_view.py`** — complete overhaul:
+    - `ConversationsView.__init__` now accepts `cfg: AppConfig`; `main_window.py` updated accordingly.
+    - `_ImapPollWorker(QThread)` class: background IMAP poll → `find_conversation_for_reply` → `record_inbound` per matched message; emits `found(count)` / `error(str)` / `done`.
+    - **"🔄 Check for new replies" button** added above the tab widget. Disabled with tooltip when IMAP is not configured; shows "Checking inbox…" while running; updates to "✓ N new replies saved." on completion and auto-refreshes the list.
+    - **Thread view** now prefers `body_html` over `body_text` so emails render richly; falls back to escaped plain text. Added subtle colour-coded border per message direction.
+    - **`_mark_replied`** now uses `cfg.rep_emails.get(conv.rep_id)` for `to_address` instead of the salesman number; uses `smtp_from_address` for `from_address`.
+    - **Tab badge colour** uses `QColor("#DC2626")` (red) / `QColor()` (theme default) instead of the hardcoded `Qt.GlobalColor.black` which rendered incorrectly on dark backgrounds.
+  - **26/26 tests pass.**
+
 - **2026-05-17 (latest)** — Leaderboard exclusions, HTML clipboard, email send, shoutout polish:
   - **`_EXCLUDED_REPS` constant**: `frozenset({"", "house account", "(legacy / pre-aug 2025)"})` — blank rep names, HOUSE ACCOUNT, and the legacy pre-Aug-2025 synthetic rep are excluded from `active_reps` before the leaderboard is built, so they never appear in the standings table, shoutout sections, or improvement calculations.
   - **"Copy leaderboard" now copies rich HTML** via `QMimeData.setHtml()`. Outlook and Gmail accept `text/html` clipboard data and render the table with proper proportional-font alignment — no more misaligned columns. Plain text is still set as a fallback via `QMimeData.setText()`.

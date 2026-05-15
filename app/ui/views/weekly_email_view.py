@@ -66,6 +66,7 @@ from app.data.loaders import (
     load_rep_assignments,
 )
 from app.notifications.email_client import EmailClient
+from app.storage.repos import record_send
 from app.services.fiscal_calendar import build_fiscal_year, find_period
 from app.services.manager_analytics import (
     PeriodOverview,
@@ -187,10 +188,11 @@ class _SendWorker(QThread):
     result = Signal(str, bool, str)   # key, ok, message
     finished_all = Signal()
 
-    def __init__(self, jobs: list[tuple[str, dict]], client: EmailClient) -> None:
+    def __init__(self, jobs: list[tuple[str, dict]], client: EmailClient, from_address: str = "") -> None:
         super().__init__()
         self._jobs = jobs
         self._client = client
+        self._from_address = from_address
 
     def run(self) -> None:
         for key, draft in self._jobs:
@@ -202,6 +204,21 @@ class _SendWorker(QThread):
                     body_html=draft.get("body_html", ""),
                     cc_address=draft.get("cc", ""),
                 )
+                if res.ok and draft.get("salesman_number"):
+                    try:
+                        record_send(
+                            salesman_number=draft["salesman_number"],
+                            rep_name=draft.get("rep_name", draft["salesman_number"]),
+                            subject=draft["subject"],
+                            thread_key=res.message_id,
+                            from_address=self._from_address,
+                            to_address=draft["to"],
+                            cc_address=draft.get("cc", ""),
+                            body_html=draft.get("body_html", ""),
+                            cost_center=draft.get("cc_label", ""),
+                        )
+                    except Exception as db_exc:  # noqa: BLE001
+                        log.warning("record_send DB error for %s: %s", key, db_exc)
                 self.result.emit(key, res.ok, res.error)
             except Exception as exc:  # noqa: BLE001
                 self.result.emit(key, False, str(exc))
@@ -399,7 +416,7 @@ class _SendReviewDialog(QDialog):
             self._status_labels[k].setText("")
 
         client = EmailClient(self._cfg.email)
-        self._worker = _SendWorker(jobs, client)
+        self._worker = _SendWorker(jobs, client, from_address=self._cfg.email.smtp_from_address)
         self._worker.result.connect(self._on_result)
         self._worker.finished_all.connect(self._on_finished)
         self._worker.start()

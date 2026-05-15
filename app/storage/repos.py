@@ -447,3 +447,168 @@ def dashboard_counts() -> dict:
         "open_action_items": open_actions,
         "needs_review": needs_review,
     }
+
+
+# ============================================================ conversation tracking helpers
+
+def upsert_rep(*, salesman_number: str, name: str, tone: int = 0) -> None:
+    """Insert a rep if new; update name/active if already exists.
+
+    Does NOT overwrite user-configured email, boss_email, or tone — those are
+    managed in the Reps view.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO reps (salesman_number, name, tone, active, updated_at)
+            VALUES (?, ?, ?, 1, datetime('now'))
+            ON CONFLICT(salesman_number) DO UPDATE SET
+                name       = excluded.name,
+                active     = 1,
+                updated_at = datetime('now')
+            """,
+            (salesman_number, name, tone),
+        )
+
+
+def record_send(
+    *,
+    salesman_number: str,
+    rep_name: str,
+    subject: str,
+    thread_key: str,
+    from_address: str,
+    to_address: str,
+    cc_address: str = "",
+    body_html: str = "",
+    cost_center: str = "",
+    tone: int = 0,
+) -> int:
+    """Ensure the rep and conversation exist, then record the outbound message.
+
+    Uses INSERT OR IGNORE on both reps and conversations so re-sends (same
+    thread_key) only create one conversation row.  Returns the conversation id.
+    """
+    upsert_rep(salesman_number=salesman_number, name=rep_name, tone=tone)
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO conversations
+              (rep_id, cost_center, subject, topic, status, tone, thread_key)
+            VALUES (?, ?, ?, 'weekly_email', 'active', ?, ?)
+            """,
+            (salesman_number, cost_center, subject, tone, thread_key),
+        )
+        row = conn.execute(
+            "SELECT id FROM conversations WHERE thread_key = ?",
+            (thread_key,),
+        ).fetchone()
+        conv_id = int(row["id"])
+
+    save_message(
+        conversation_id=conv_id,
+        direction="outbound",
+        message_id=thread_key,
+        from_address=from_address,
+        to_address=to_address,
+        cc_address=cc_address,
+        subject=subject,
+        body_html=body_html,
+        ai_reasoning="Weekly email sent via Sales Assistant.",
+    )
+    return conv_id
+
+
+def find_conversation_for_reply(
+    in_reply_to: str,
+    references: str = "",
+) -> Optional["Conversation"]:
+    """Return the conversation a reply belongs to, or None if unrecognised.
+
+    Checks each Message-ID in *in_reply_to* and *references* against:
+    1. ``messages.message_id``  — catches mid-thread replies.
+    2. ``conversations.thread_key`` — catches direct replies to the seed.
+    """
+    candidates = [
+        mid.strip()
+        for mid in (in_reply_to + " " + references).split()
+        if mid.strip()
+    ]
+    if not candidates:
+        return None
+    with get_conn() as conn:
+        for mid in candidates:
+            row = conn.execute(
+                """
+                SELECT c.*, r.name AS rep_name,
+                       NULL AS last_inbound_at, 0 AS needs_reply
+                FROM conversations c
+                JOIN messages m ON m.conversation_id = c.id
+                LEFT JOIN reps r ON r.salesman_number = c.rep_id
+                WHERE m.message_id = ?
+                LIMIT 1
+                """,
+                (mid,),
+            ).fetchone()
+            if row:
+                return _row_to_conversation(row)
+            row = conn.execute(
+                """
+                SELECT c.*, r.name AS rep_name,
+                       NULL AS last_inbound_at, 0 AS needs_reply
+                FROM conversations c
+                LEFT JOIN reps r ON r.salesman_number = c.rep_id
+                WHERE c.thread_key = ?
+                LIMIT 1
+                """,
+                (mid,),
+            ).fetchone()
+            if row:
+                return _row_to_conversation(row)
+    return None
+
+
+def record_inbound(
+    *,
+    conversation_id: int,
+    message_id: str,
+    in_reply_to: str = "",
+    from_address: str,
+    subject: str,
+    body_text: str = "",
+    body_html: str = "",
+    imap_uid: str = "",
+) -> Optional[int]:
+    """Save an inbound message, skipping duplicates.
+
+    Deduplication is performed by *message_id* (if non-empty) and by
+    *imap_uid* + *conversation_id*.  Returns the new message id, or None if
+    the message was already present.
+    """
+    with get_conn() as conn:
+        if message_id:
+            existing = conn.execute(
+                "SELECT id FROM messages WHERE message_id = ?", (message_id,)
+            ).fetchone()
+            if existing:
+                return None
+        if imap_uid:
+            existing = conn.execute(
+                "SELECT id FROM messages WHERE imap_uid = ? AND conversation_id = ?",
+                (imap_uid, conversation_id),
+            ).fetchone()
+            if existing:
+                return None
+
+    return save_message(
+        conversation_id=conversation_id,
+        direction="inbound",
+        message_id=message_id,
+        in_reply_to=in_reply_to,
+        from_address=from_address,
+        to_address="",
+        subject=subject,
+        body_text=body_text,
+        body_html=body_html,
+        imap_uid=imap_uid,
+    )

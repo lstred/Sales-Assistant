@@ -5,19 +5,18 @@ Shows:
 - Needs Review tab: inbound rep replies that haven't been responded to yet
 - Action Items tab: extracted commitments from rep replies
 
-On launch, the main window calls ``refresh()`` so any new inbound messages
-that arrived while the app was closed surface immediately in the
-"Needs Review" badge on the sidebar.
+On launch the view auto-loads from SQLite and optionally polls IMAP for new
+rep replies. The sidebar badge is updated whenever the needs-review count
+changes.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Callable
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -30,13 +29,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.config.models import AppConfig
+from app.notifications.email_client import EmailClient
 from app.storage.repos import (
     ActionItem,
     Conversation,
     Message,
+    find_conversation_for_reply,
     list_action_items,
     list_conversations,
     list_messages,
+    record_inbound,
     resolve_action_item,
     save_message,
 )
@@ -52,16 +55,65 @@ _STATUS_COLORS = {
 }
 
 
+# ======================================================== background IMAP worker
+
+class _ImapPollWorker(QThread):
+    """Fetch unseen IMAP messages and save any recognised rep replies to SQLite."""
+
+    found = Signal(int)   # number of new inbound messages saved
+    error = Signal(str)
+    done = Signal()
+
+    def __init__(self, cfg: AppConfig, parent=None) -> None:
+        super().__init__(parent)
+        self._cfg = cfg
+
+    def run(self) -> None:
+        try:
+            client = EmailClient(self._cfg.email)
+            replies = client.fetch_new_replies()
+            saved = 0
+            for reply in replies:
+                conv = find_conversation_for_reply(
+                    reply["in_reply_to"],
+                    reply["references"],
+                )
+                if conv is None:
+                    continue  # Message not part of any known thread — ignore
+                result = record_inbound(
+                    conversation_id=conv.id,
+                    message_id=reply["message_id"],
+                    in_reply_to=reply["in_reply_to"],
+                    from_address=reply["from_address"],
+                    subject=reply["subject"],
+                    body_text=reply["body_text"],
+                    body_html=reply["body_html"],
+                    imap_uid=reply["imap_uid"],
+                )
+                if result is not None:
+                    saved += 1
+            self.found.emit(saved)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("IMAP poll failed")
+            self.error.emit(str(exc))
+        finally:
+            self.done.emit()
+
+
+# ============================================================ conversations view
+
 class ConversationsView(QWidget):
     """Full conversation management view with reply queue and action items."""
 
     needs_review_changed = Signal(int)  # emits count when it changes
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, cfg: AppConfig, parent=None) -> None:
         super().__init__(parent)
+        self._cfg = cfg
         self._conversations: list[Conversation] = []
         self._selected_conv: Conversation | None = None
         self._action_items: list[ActionItem] = []
+        self._poll_workers: list[_ImapPollWorker] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -74,6 +126,24 @@ class ConversationsView(QWidget):
                 "plus their replies, extracted commitments, and pending approvals.",
             )
         )
+
+        # ---- IMAP poll bar -----------------------------------------------
+        poll_row = QHBoxLayout()
+        poll_row.setSpacing(8)
+        self.poll_btn = QPushButton("🔄  Check for new replies")
+        self.poll_btn.setFixedHeight(30)
+        self.poll_btn.clicked.connect(self._poll_imap)
+        poll_row.addWidget(self.poll_btn)
+        self.poll_status = QLabel("")
+        self.poll_status.setStyleSheet(f"color:{TEXT_MUTED};font-size:12px;")
+        poll_row.addWidget(self.poll_status, 1)
+        root.addLayout(poll_row)
+
+        imap_configured = bool(cfg.email.imap_host and cfg.email.imap_username)
+        if not imap_configured:
+            self.poll_btn.setEnabled(False)
+            self.poll_btn.setToolTip("Configure IMAP in Settings → Email to enable automatic reply detection.")
+            self.poll_status.setText("IMAP not configured — configure in Settings → Email to detect rep replies automatically.")
 
         # Tabs: All Conversations | Needs Review | Action Items
         self.tabs = QTabWidget()
@@ -261,13 +331,8 @@ class ConversationsView(QWidget):
             2, f"Action Items ({open_actions})" if open_actions else "Action Items"
         )
         self.needs_review_changed.emit(needs)
-        # Highlight the Needs Review tab when there are pending replies
-        if needs > 0:
-            self.tabs.tabBar().setTabTextColor(
-                1, Qt.GlobalColor.red
-            )
-        else:
-            self.tabs.tabBar().setTabTextColor(1, Qt.GlobalColor.black)
+        # Tint the Needs Review tab red when there are pending items, reset otherwise.
+        self.tabs.tabBar().setTabTextColor(1, QColor("#DC2626") if needs > 0 else QColor())
 
     # ---------------------------------------------------------------- all conversations tab
     def _apply_filter(self, mode: str | None) -> None:
@@ -323,11 +388,7 @@ class ConversationsView(QWidget):
 
     def _load_thread(self, conv: Conversation) -> None:
         rep = conv.rep_name or conv.rep_id
-        status_color = _STATUS_COLORS.get(conv.status, "#475569")
-        self.thread_label.setText(
-            f"{rep} — {conv.subject}  "
-            f"[{conv.status}]"
-        )
+        self.thread_label.setText(f"{rep} — {conv.subject}  [{conv.status}]")
         try:
             messages = list_messages(conv.id)
         except Exception:
@@ -336,7 +397,7 @@ class ConversationsView(QWidget):
             self.thread_view.setHtml(
                 f"<p style='color:{TEXT_MUTED}'>No messages recorded in this thread yet.</p>"
                 "<p style='color:#64748B;font-size:12px;'>Messages will appear "
-                "here once you send emails via the Weekly Email view and reps reply.</p>"
+                "here once you send emails via the Weekly Email tab and reps reply.</p>"
             )
             return
         html_parts = []
@@ -344,15 +405,22 @@ class ConversationsView(QWidget):
             is_in = msg.direction == "inbound"
             bg = "#EFF6FF" if is_in else "#F0FDF4"
             who = f"From: {msg.from_address}" if is_in else f"To: {msg.to_address}"
-            body = (msg.body_text or "").replace("<", "&lt;").replace(">", "&gt;")
-            html_parts.append(
-                f"<div style='background:{bg};border-radius:8px;padding:10px 14px;"
-                f"margin:8px 0;'>"
-                f"<div style='font-size:11px;color:{TEXT_MUTED};margin-bottom:4px;'>"
+            header = (
+                f"<div style='font-size:11px;color:{TEXT_MUTED};margin-bottom:6px;'>"
                 f"{'← Rep reply' if is_in else '→ Sent'} · {msg.sent_at[:16]} · {who}"
                 f"</div>"
-                f"<div style='white-space:pre-wrap;font-size:13px;'>{body[:2000]}</div>"
-                f"</div>"
+            )
+            # Prefer HTML body; fall back to escaped plain text
+            if msg.body_html:
+                body_content = msg.body_html
+            else:
+                escaped = (msg.body_text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                body_content = f"<div style='white-space:pre-wrap;font-size:13px;'>{escaped[:4000]}</div>"
+            html_parts.append(
+                f"<div style='background:{bg};border-radius:8px;padding:10px 14px;"
+                f"margin:8px 0;border:1px solid {'#BFDBFE' if is_in else '#BBF7D0'};'>"
+                + header + body_content
+                + "</div>"
             )
         self.thread_view.setHtml("".join(html_parts))
 
@@ -400,11 +468,15 @@ class ConversationsView(QWidget):
         inbound = [m for m in messages if m.direction == "inbound"]
         if inbound:
             last = inbound[-1]
-            body = (last.body_text or "").replace("<", "&lt;").replace(">", "&gt;")
+            if last.body_html:
+                body_html = last.body_html
+            else:
+                escaped = (last.body_text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                body_html = f"<div style='white-space:pre-wrap;font-size:13px;'>{escaped[:3000]}</div>"
             self.review_detail.setHtml(
-                f"<p style='font-size:11px;color:{TEXT_MUTED};'>"
+                f"<p style='font-size:11px;color:{TEXT_MUTED};margin-bottom:6px;'>"
                 f"From: {last.from_address} · {last.sent_at[:16]}</p>"
-                f"<div style='white-space:pre-wrap;font-size:13px;'>{body[:3000]}</div>"
+                + body_html
             )
         else:
             self.review_detail.clear()
@@ -420,17 +492,19 @@ class ConversationsView(QWidget):
         try:
             conv = next((c for c in self._conversations if c.id == conv_id), None)
             if conv:
+                # Use the rep's configured email address if available, else a placeholder
+                rep_email = self._cfg.rep_emails.get(conv.rep_id, "") or conv.rep_id
                 save_message(
                     conversation_id=conv_id,
                     direction="outbound",
-                    from_address="(manual reply logged)",
-                    to_address=conv.rep_id,
+                    from_address=self._cfg.email.smtp_from_address or "(manager)",
+                    to_address=rep_email,
                     subject=conv.subject,
                     body_text="[Reply sent manually outside the app]",
                     ai_reasoning="Manual acknowledgment logged by manager.",
                 )
             self.review_status.setText("Marked as replied.")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self.review_status.setText(f"Error: {exc}")
         self.refresh()
 
@@ -490,4 +564,33 @@ class ConversationsView(QWidget):
         self._action_items = list_action_items(status="open")
         self._refresh_action_list()
         self._update_tab_badges()
+
+    # ---------------------------------------------------------------- IMAP polling
+    def _poll_imap(self) -> None:
+        """Kick off a background IMAP poll for new rep replies."""
+        self.poll_btn.setEnabled(False)
+        self.poll_status.setText("Checking inbox…")
+        worker = _ImapPollWorker(self._cfg, parent=self)
+        self._poll_workers.append(worker)
+        worker.found.connect(self._on_poll_found)
+        worker.error.connect(self._on_poll_error)
+        worker.done.connect(lambda: self._on_poll_done(worker))
+        worker.start()
+
+    def _on_poll_found(self, count: int) -> None:
+        if count:
+            self.poll_status.setText(f"✓  {count} new repl{'y' if count == 1 else 'ies'} saved.")
+            self.refresh()
+        else:
+            self.poll_status.setText("✓  No new replies found.")
+
+    def _on_poll_error(self, msg: str) -> None:
+        self.poll_status.setText(f"⚠  IMAP error: {msg}")
+
+    def _on_poll_done(self, worker: _ImapPollWorker) -> None:
+        self.poll_btn.setEnabled(bool(self._cfg.email.imap_host and self._cfg.email.imap_username))
+        try:
+            self._poll_workers.remove(worker)
+        except ValueError:
+            pass
 

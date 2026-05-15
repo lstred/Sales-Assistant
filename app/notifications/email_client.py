@@ -12,6 +12,8 @@ import logging
 import smtplib
 import ssl
 from dataclasses import dataclass
+from email import message_from_bytes as _msg_from_bytes
+from email.header import decode_header as _decode_header
 from email.message import EmailMessage
 from email.utils import make_msgid
 
@@ -114,6 +116,104 @@ class EmailClient:
             return True, f"SMTP login OK ({self.cfg.smtp_host}:{self.cfg.smtp_port})."
         except Exception as exc:  # noqa: BLE001
             return False, f"{type(exc).__name__}: {exc}"
+
+    # --------------------------------------------------------------- IMAP poll
+    def fetch_new_replies(self) -> list[dict]:
+        """Fetch unseen messages from the IMAP inbox.
+
+        Returns a list of message dicts (one per message) with keys:
+            message_id, in_reply_to, references, from_address,
+            subject, body_text, body_html, imap_uid.
+
+        Messages are NOT marked as seen — the caller decides.
+        Returns [] when IMAP is not configured or the fetch fails.
+        """
+        password = get_secret("IMAP", self.cfg.imap_username) if self.cfg.imap_username else None
+        if not self.cfg.imap_host or not password:
+            return []
+
+        results: list[dict] = []
+        try:
+            cls = imaplib.IMAP4_SSL if self.cfg.imap_ssl else imaplib.IMAP4
+            with cls(self.cfg.imap_host, self.cfg.imap_port) as imap:
+                imap.login(self.cfg.imap_username, password)
+                imap.select(self.cfg.imap_mailbox or "INBOX")
+
+                # BODY.PEEK[] fetches the full message without setting \Seen.
+                _, data = imap.uid("SEARCH", None, "UNSEEN")
+                uids = data[0].split() if data[0] else []
+
+                for uid in uids:
+                    try:
+                        _, msg_data = imap.uid("FETCH", uid, "(BODY.PEEK[])")
+                        if not msg_data or not msg_data[0] or not isinstance(msg_data[0], tuple):
+                            continue
+                        raw = msg_data[0][1]
+                        msg = _msg_from_bytes(raw)
+
+                        in_reply_to = msg.get("In-Reply-To", "").strip()
+                        references = msg.get("References", "").strip()
+                        message_id = msg.get("Message-ID", "").strip()
+                        from_raw = msg.get("From", "").strip()
+
+                        subject_raw = msg.get("Subject", "")
+                        try:
+                            subject = "".join(
+                                part.decode(enc or "utf-8", errors="replace")
+                                if isinstance(part, bytes) else part
+                                for part, enc in _decode_header(subject_raw)
+                            )
+                        except Exception:
+                            subject = subject_raw
+
+                        body_text, body_html = self._extract_body(msg)
+
+                        results.append({
+                            "message_id": message_id,
+                            "in_reply_to": in_reply_to,
+                            "references": references,
+                            "from_address": from_raw,
+                            "subject": subject,
+                            "body_text": body_text,
+                            "body_html": body_html,
+                            "imap_uid": uid.decode() if isinstance(uid, bytes) else str(uid),
+                        })
+                    except Exception as exc:
+                        log.warning("Failed to process IMAP uid=%s: %s", uid, exc)
+        except Exception as exc:
+            log.warning("IMAP fetch_new_replies failed: %s", exc)
+
+        return results
+
+    @staticmethod
+    def _extract_body(msg) -> tuple[str, str]:
+        """Return (body_text, body_html) from a parsed email.Message."""
+        body_text = ""
+        body_html = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if "attachment" in str(part.get("Content-Disposition", "")):
+                    continue
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                charset = part.get_content_charset() or "utf-8"
+                content = payload.decode(charset, errors="replace")
+                if ct == "text/plain" and not body_text:
+                    body_text = content
+                elif ct == "text/html" and not body_html:
+                    body_html = content
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                content = payload.decode(charset, errors="replace")
+                if msg.get_content_type() == "text/html":
+                    body_html = content
+                else:
+                    body_text = content
+        return body_text, body_html
 
     # --------------------------------------------------------------- IMAP test
     def test_imap(self) -> tuple[bool, str]:
