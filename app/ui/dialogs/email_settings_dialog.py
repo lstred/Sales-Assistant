@@ -14,21 +14,38 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 from app.config.models import EmailConfig
-from app.config.store import delete_secret, get_secret, set_secret
+from app.config.store import get_secret, set_secret
 from app.notifications.email_client import EmailClient
 from app.ui.theme import DANGER, SUCCESS, TEXT_MUTED
 
 
-def _password_field() -> QLineEdit:
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _password_field(placeholder: str = "(stored in Windows Credential Manager)") -> QLineEdit:
     e = QLineEdit()
     e.setEchoMode(QLineEdit.EchoMode.Password)
-    e.setPlaceholderText("(stored in Windows Credential Manager)")
+    e.setPlaceholderText(placeholder)
     return e
 
+
+def _inline_row(*widgets: QWidget, spacing: int = 6) -> QWidget:
+    """Pack widgets into a single QWidget with an HBoxLayout (no margins)."""
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(spacing)
+    for ww in widgets:
+        h.addWidget(ww)
+    return w
+
+
+# ── dialog ───────────────────────────────────────────────────────────────────
 
 class EmailSettingsDialog(QDialog):
     def __init__(self, cfg: EmailConfig, parent=None) -> None:
@@ -38,119 +55,194 @@ class EmailSettingsDialog(QDialog):
         self._cfg = cfg.model_copy(deep=True)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 16)
-        root.setSpacing(12)
+        root.setContentsMargins(20, 16, 20, 14)
+        root.setSpacing(10)
 
+        # ── one-line intro ────────────────────────────────────────────────
         intro = QLabel(
-            "SMTP is used to send drafts; IMAP picks up rep replies. "
-            "Passwords are stored securely in Windows Credential Manager — never on disk. "
-            "Outbound sending stays disabled until you flip 'Enable outbound send'."
+            "Passwords are saved in <b>Windows Credential Manager</b> — never on disk.  "
+            "Outbound sending is disabled by default until you enable it below."
         )
         intro.setWordWrap(True)
-        intro.setStyleSheet(f"color: {TEXT_MUTED};")
+        intro.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 12px;")
         root.addWidget(intro)
 
-        # ---------------- SMTP group ----------------
-        smtp_group = QGroupBox("SMTP (outbound)")
-        smtp_form = QFormLayout(smtp_group)
-        smtp_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        smtp_form.setHorizontalSpacing(14)
-        smtp_form.setVerticalSpacing(10)
+        # ── SMTP / IMAP tabs ──────────────────────────────────────────────
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        tabs.addTab(self._build_smtp_tab(), "  Outbound (SMTP)  ")
+        tabs.addTab(self._build_imap_tab(), "  Inbound (IMAP)  ")
+        root.addWidget(tabs, 1)
 
-        self.smtp_host = QLineEdit(self._cfg.smtp_host)
-        self.smtp_port = QSpinBox()
-        self.smtp_port.setRange(1, 65535)
-        self.smtp_port.setValue(self._cfg.smtp_port)
-        self.smtp_starttls = QCheckBox("Use STARTTLS")
-        self.smtp_starttls.setChecked(self._cfg.smtp_starttls)
-        self.smtp_username = QLineEdit(self._cfg.smtp_username)
-        self.smtp_password = _password_field()
-        existing_smtp = (
-            get_secret("SMTP", self._cfg.smtp_username) if self._cfg.smtp_username else None
+        # ── Safety (always visible — only 2 rows) ────────────────────────
+        safety = QGroupBox("Safety")
+        sf = QFormLayout(safety)
+        sf.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        sf.setHorizontalSpacing(14)
+        sf.setVerticalSpacing(8)
+        sf.setContentsMargins(14, 10, 14, 10)
+
+        self.enable_outbound = QCheckBox(
+            "Enable outbound send  (default OFF — manual review only)"
         )
-        if existing_smtp:
-            self.smtp_password.setPlaceholderText("(unchanged — leave blank to keep existing)")
-        self.smtp_from_name = QLineEdit(self._cfg.smtp_from_name)
-        self.smtp_from_address = QLineEdit(self._cfg.smtp_from_address)
-
-        smtp_form.addRow("Host", self.smtp_host)
-        smtp_form.addRow("Port", self.smtp_port)
-        smtp_form.addRow("", self.smtp_starttls)
-        smtp_form.addRow("Username", self.smtp_username)
-        smtp_form.addRow("Password", self.smtp_password)
-        smtp_form.addRow("From name", self.smtp_from_name)
-        smtp_form.addRow("From address", self.smtp_from_address)
-
-        smtp_test_row = QHBoxLayout()
-        self.smtp_test_btn = QPushButton("Test SMTP")
-        self.smtp_test_btn.clicked.connect(self._on_test_smtp)
-        smtp_test_row.addWidget(self.smtp_test_btn)
-        smtp_test_row.addStretch(1)
-        smtp_form.addRow("", _row(smtp_test_row))
-        self.smtp_test_result = QLabel("")
-        smtp_form.addRow("", self.smtp_test_result)
-
-        # ---------------- IMAP group ----------------
-        imap_group = QGroupBox("IMAP (inbound)")
-        imap_form = QFormLayout(imap_group)
-        imap_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        imap_form.setHorizontalSpacing(14)
-        imap_form.setVerticalSpacing(10)
-
-        self.imap_host = QLineEdit(self._cfg.imap_host)
-        self.imap_port = QSpinBox()
-        self.imap_port.setRange(1, 65535)
-        self.imap_port.setValue(self._cfg.imap_port)
-        self.imap_ssl = QCheckBox("Use SSL")
-        self.imap_ssl.setChecked(self._cfg.imap_ssl)
-        self.imap_username = QLineEdit(self._cfg.imap_username)
-        self.imap_password = _password_field()
-        existing_imap = (
-            get_secret("IMAP", self._cfg.imap_username) if self._cfg.imap_username else None
-        )
-        if existing_imap:
-            self.imap_password.setPlaceholderText("(unchanged — leave blank to keep existing)")
-        self.imap_mailbox = QLineEdit(self._cfg.imap_mailbox)
-
-        imap_form.addRow("Host", self.imap_host)
-        imap_form.addRow("Port", self.imap_port)
-        imap_form.addRow("", self.imap_ssl)
-        imap_form.addRow("Username", self.imap_username)
-        imap_form.addRow("Password", self.imap_password)
-        imap_form.addRow("Mailbox", self.imap_mailbox)
-
-        imap_test_row = QHBoxLayout()
-        self.imap_test_btn = QPushButton("Test IMAP")
-        self.imap_test_btn.clicked.connect(self._on_test_imap)
-        imap_test_row.addWidget(self.imap_test_btn)
-        imap_test_row.addStretch(1)
-        imap_form.addRow("", _row(imap_test_row))
-        self.imap_test_result = QLabel("")
-        imap_form.addRow("", self.imap_test_result)
-
-        # ---------------- Safety group ----------------
-        safety_group = QGroupBox("Safety")
-        safety_form = QFormLayout(safety_group)
-        safety_form.setHorizontalSpacing(14)
-        safety_form.setVerticalSpacing(10)
-        self.enable_outbound = QCheckBox("Enable outbound send (default OFF — manual review only)")
         self.enable_outbound.setChecked(self._cfg.enable_outbound_send)
+
         self.redirect_all_to = QLineEdit(self._cfg.redirect_all_to)
-        self.redirect_all_to.setPlaceholderText("Optional: redirect ALL outbound mail to this address (dry-run)")
-        safety_form.addRow("", self.enable_outbound)
-        safety_form.addRow("Redirect to", self.redirect_all_to)
+        self.redirect_all_to.setPlaceholderText(
+            "Optional: redirect ALL outbound mail here for testing (dry-run)"
+        )
 
-        root.addWidget(smtp_group)
-        root.addWidget(imap_group)
-        root.addWidget(safety_group)
+        sf.addRow("", self.enable_outbound)
+        sf.addRow("Redirect to", self.redirect_all_to)
+        root.addWidget(safety)
 
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        # ── buttons ───────────────────────────────────────────────────────
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
         bb.button(QDialogButtonBox.StandardButton.Save).setProperty("primary", True)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         root.addWidget(bb)
 
-    # ------------------------------------------------------------ collection
+    # ─────────────────────────────────────────── tab builders
+
+    def _build_smtp_tab(self) -> QWidget:
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(16, 14, 16, 14)
+        vl.setSpacing(0)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(9)
+
+        # Host + port + TLS on one line
+        self.smtp_host = QLineEdit(self._cfg.smtp_host)
+        self.smtp_host.setPlaceholderText("e.g. smtp.office365.com")
+        self.smtp_port = QSpinBox()
+        self.smtp_port.setRange(1, 65535)
+        self.smtp_port.setValue(self._cfg.smtp_port)
+        self.smtp_port.setFixedWidth(72)
+        self.smtp_starttls = QCheckBox("STARTTLS")
+        self.smtp_starttls.setChecked(self._cfg.smtp_starttls)
+        self.smtp_port.valueChanged.connect(self._on_smtp_port_changed)
+
+        form.addRow(
+            "Host / Port",
+            _inline_row(self.smtp_host, self.smtp_port, self.smtp_starttls),
+        )
+
+        self.smtp_username = QLineEdit(self._cfg.smtp_username)
+        self.smtp_username.setPlaceholderText("your@email.com")
+        form.addRow("Username", self.smtp_username)
+
+        _existing_smtp = (
+            get_secret("SMTP", self._cfg.smtp_username) if self._cfg.smtp_username else None
+        )
+        self.smtp_password = _password_field(
+            "(unchanged — leave blank to keep existing)"
+            if _existing_smtp
+            else "(stored in Windows Credential Manager)"
+        )
+        form.addRow("Password", self.smtp_password)
+
+        self.smtp_from_name = QLineEdit(self._cfg.smtp_from_name)
+        self.smtp_from_name.setPlaceholderText("Sales Assistant")
+        form.addRow("From name", self.smtp_from_name)
+
+        self.smtp_from_address = QLineEdit(self._cfg.smtp_from_address)
+        self.smtp_from_address.setPlaceholderText("address shown to recipients")
+        form.addRow("From address", self.smtp_from_address)
+
+        vl.addLayout(form)
+        vl.addSpacing(12)
+
+        # Test button + inline result
+        self.smtp_test_btn = QPushButton("Test SMTP connection")
+        self.smtp_test_btn.setFixedWidth(180)
+        self.smtp_test_btn.clicked.connect(self._on_test_smtp)
+        self.smtp_test_result = QLabel("")
+        self.smtp_test_result.setWordWrap(True)
+        test_row = QHBoxLayout()
+        test_row.setSpacing(10)
+        test_row.addWidget(self.smtp_test_btn)
+        test_row.addWidget(self.smtp_test_result, 1)
+        vl.addLayout(test_row)
+        vl.addStretch(1)
+        return w
+
+    def _build_imap_tab(self) -> QWidget:
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(16, 14, 16, 14)
+        vl.setSpacing(0)
+
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(9)
+
+        self.imap_host = QLineEdit(self._cfg.imap_host)
+        self.imap_host.setPlaceholderText("e.g. outlook.office365.com")
+        self.imap_port = QSpinBox()
+        self.imap_port.setRange(1, 65535)
+        self.imap_port.setValue(self._cfg.imap_port)
+        self.imap_port.setFixedWidth(72)
+        self.imap_ssl = QCheckBox("SSL")
+        self.imap_ssl.setChecked(self._cfg.imap_ssl)
+
+        form.addRow(
+            "Host / Port",
+            _inline_row(self.imap_host, self.imap_port, self.imap_ssl),
+        )
+
+        self.imap_username = QLineEdit(self._cfg.imap_username)
+        self.imap_username.setPlaceholderText("your@email.com")
+        form.addRow("Username", self.imap_username)
+
+        _existing_imap = (
+            get_secret("IMAP", self._cfg.imap_username) if self._cfg.imap_username else None
+        )
+        self.imap_password = _password_field(
+            "(unchanged — leave blank to keep existing)"
+            if _existing_imap
+            else "(stored in Windows Credential Manager)"
+        )
+        form.addRow("Password", self.imap_password)
+
+        self.imap_mailbox = QLineEdit(self._cfg.imap_mailbox)
+        self.imap_mailbox.setPlaceholderText("INBOX")
+        form.addRow("Mailbox", self.imap_mailbox)
+
+        vl.addLayout(form)
+        vl.addSpacing(12)
+
+        self.imap_test_btn = QPushButton("Test IMAP connection")
+        self.imap_test_btn.setFixedWidth(180)
+        self.imap_test_btn.clicked.connect(self._on_test_imap)
+        self.imap_test_result = QLabel("")
+        self.imap_test_result.setWordWrap(True)
+        test_row = QHBoxLayout()
+        test_row.setSpacing(10)
+        test_row.addWidget(self.imap_test_btn)
+        test_row.addWidget(self.imap_test_result, 1)
+        vl.addLayout(test_row)
+        vl.addStretch(1)
+        return w
+
+    # ─────────────────────────────────────────── smart defaults
+
+    def _on_smtp_port_changed(self, port: int) -> None:
+        """Auto-toggle STARTTLS based on well-known port numbers."""
+        if port == 587:
+            self.smtp_starttls.setChecked(True)
+        elif port == 465:
+            self.smtp_starttls.setChecked(False)
+
+    # ─────────────────────────────────────────── collection
+
     def _collect(self) -> EmailConfig:
         return EmailConfig(
             smtp_host=self.smtp_host.text().strip(),
@@ -171,32 +263,27 @@ class EmailSettingsDialog(QDialog):
     def commit_secrets(self) -> None:
         """Persist any newly entered passwords to keyring."""
         cfg = self._collect()
-        # SMTP
         smtp_pw = self.smtp_password.text()
-        if smtp_pw:
-            if cfg.smtp_username:
-                set_secret("SMTP", cfg.smtp_username, smtp_pw)
+        if smtp_pw and cfg.smtp_username:
+            set_secret("SMTP", cfg.smtp_username, smtp_pw)
             self.smtp_password.clear()
-        # If username changed and old one had no value, optionally clear stale.
-        # IMAP
         imap_pw = self.imap_password.text()
-        if imap_pw:
-            if cfg.imap_username:
-                set_secret("IMAP", cfg.imap_username, imap_pw)
+        if imap_pw and cfg.imap_username:
+            set_secret("IMAP", cfg.imap_username, imap_pw)
             self.imap_password.clear()
 
     def result_config(self) -> EmailConfig:
         return self._collect()
 
-    # ---------------------------------------------------------------- tests
+    # ─────────────────────────────────────────── connection tests
+
     def _on_test_smtp(self) -> None:
         cfg = self._collect()
-        # Temporarily store password if provided, so test works
         pw = self.smtp_password.text()
         if pw and cfg.smtp_username:
             set_secret("SMTP", cfg.smtp_username, pw)
         self.smtp_test_btn.setEnabled(False)
-        self.smtp_test_result.setText("Testing SMTP…")
+        self.smtp_test_result.setText("Testing…")
         ok, msg = EmailClient(cfg).test_smtp()
         color = SUCCESS if ok else DANGER
         self.smtp_test_result.setText(f"<span style='color:{color}'>{msg}</span>")
@@ -208,16 +295,9 @@ class EmailSettingsDialog(QDialog):
         if pw and cfg.imap_username:
             set_secret("IMAP", cfg.imap_username, pw)
         self.imap_test_btn.setEnabled(False)
-        self.imap_test_result.setText("Testing IMAP…")
+        self.imap_test_result.setText("Testing…")
         ok, msg = EmailClient(cfg).test_imap()
         color = SUCCESS if ok else DANGER
         self.imap_test_result.setText(f"<span style='color:{color}'>{msg}</span>")
         self.imap_test_btn.setEnabled(True)
 
-
-def _row(layout) -> "QWidget":  # noqa: F821 — Qt forward ref via local import
-    from PySide6.QtWidgets import QWidget
-
-    w = QWidget()
-    w.setLayout(layout)
-    return w
