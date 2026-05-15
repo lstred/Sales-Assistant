@@ -241,3 +241,79 @@ class _FrozenDate(date):
     @classmethod
     def today(cls):  # type: ignore[override]
         return cls._fixed if cls._fixed is not None else date.today()
+
+
+# ─── _compute_improvement_metrics tests ──────────────────────────────────────
+
+def _make_sales_df(rows: list[dict]) -> "pd.DataFrame":
+    import pandas as pd
+    return pd.DataFrame(rows)
+
+
+def _imp(today: date, days_into: int, days_left: int, period_number: int) -> str:
+    """Helper: call _compute_improvement_metrics and return the mode string."""
+    import pandas as pd
+    from app.ui.views.weekly_email_view import _compute_improvement_metrics
+    from app.services.fiscal_calendar import find_period, build_fiscal_year
+
+    p = find_period(today)
+    # Build a minimal df with one sale in the current period
+    df = _make_sales_df([{
+        "invoice_date": p.start,
+        "salesperson_desc": "REP A",
+        "account_number": "001",
+        "cost_center": "010",
+        "revenue": 1000.0,
+        "gross_profit": 300.0,
+    }])
+    # Ensure invoice_date is a date column
+    df["invoice_date"] = pd.to_datetime(df["invoice_date"]).dt.date
+
+    prior_df = df.copy()
+
+    mode, label, cur_avg, prior_avg = _compute_improvement_metrics(
+        df=df,
+        prior_df=prior_df,
+        today=today,
+        sw=[],
+        active_reps={"REP A"},
+        ytd_cur_avg={"REP A": 500.0},
+        ytd_prior_avg={"REP A": 400.0},
+    )
+    return mode
+
+
+def test_improvement_mode_first_week_returns_ytd_avg() -> None:
+    # May 2026 → FY27 P4 starts 2026-05-03 (Sunday)
+    # Day 3 of the period = first week
+    from app.services.fiscal_calendar import find_period
+    p = find_period(date(2026, 5, 3))
+    today = p.start + __import__("datetime").timedelta(days=3)  # day 4 of period
+    assert _imp(today, 3, p.weeks * 7 - 4, p.period) == "ytd_avg"
+
+
+def test_improvement_mode_last_week_non_quarter_returns_month_end() -> None:
+    # Find a period that is NOT a quarter-end (period 1 = Feb, not in {3,6,9,12})
+    from app.services.fiscal_calendar import build_fiscal_year
+    periods = build_fiscal_year(2027)
+    p = periods[0]  # P1 = February, not quarter end
+    today = p.end - __import__("datetime").timedelta(days=3)  # 3 days before end
+    assert _imp(today, (today - p.start).days, (p.end - today).days, p.period) == "month_end"
+
+
+def test_improvement_mode_last_week_quarter_end_returns_quarter_end() -> None:
+    # Period 3 = April = Q1 end
+    from app.services.fiscal_calendar import build_fiscal_year
+    periods = build_fiscal_year(2027)
+    p = periods[2]  # P3 = April
+    today = p.end - __import__("datetime").timedelta(days=3)
+    assert _imp(today, (today - p.start).days, (p.end - today).days, p.period) == "quarter_end"
+
+
+def test_improvement_mode_mid_month_returns_mtd_avg() -> None:
+    # Middle of a period (not first week, not last week)
+    from app.services.fiscal_calendar import build_fiscal_year
+    periods = build_fiscal_year(2027)
+    p = periods[1]  # P2 = March
+    today = p.start + __import__("datetime").timedelta(days=14)  # mid-period
+    assert _imp(today, 14, (p.end - today).days, p.period) == "mtd_avg"

@@ -56,7 +56,7 @@ from app.data.loaders import (
     load_price_class_lookup,
     load_rep_assignments,
 )
-from app.services.fiscal_calendar import find_period
+from app.services.fiscal_calendar import build_fiscal_year, find_period
 from app.services.manager_analytics import (
     PeriodOverview,
     RepScorecard,
@@ -193,8 +193,8 @@ class WeeklyEmailView(QWidget):
         root.setSpacing(12)
 
         _outbound_note = (
-            "Outbound sending is enabled — use \u2018Queue for review\u2019 to send."
-            if cfg.enable_outbound_send
+            "Outbound sending is enabled \u2014 use \u2018Queue for review\u2019 to send."
+            if cfg.email.enable_outbound_send
             else "Outbound stays disabled until you flip it on in Email settings."
         )
         root.addWidget(
@@ -551,13 +551,31 @@ class WeeklyEmailView(QWidget):
         # Top 3 for weekly shoutouts (must have non-zero weekly revenue).
         top3_weekly = [(rep, rev) for rep, rev in leaderboard if rev > 0][:3]
 
-        # Top 3 YTD improvement (dollar gain in avg vs prior year).
-        ytd_improvements: list[tuple[str, float]] = [
-            (rep, per_rep_ytd_avg.get(rep, 0.0) - per_rep_prior_ytd_avg.get(rep, 0.0))
-            for rep in active_reps
-            if per_rep_prior_ytd_avg.get(rep, 0.0) > 0  # need prior data to compare
-        ]
-        top3_ytd_improvement = sorted(ytd_improvements, key=lambda kv: -kv[1])[:3]
+        # Dynamic "Most Improved" section — metric and label change based on where
+        # we are in the fiscal calendar:
+        #   • last week of a period     → completed fiscal month vs same month LY
+        #   • last week of a quarter    → completed fiscal quarter vs same quarter LY
+        #   • first week of a period    → fiscal YTD avg vs prior YTD avg
+        #   • all other weeks           → fiscal MTD avg vs prior MTD avg
+        sw = list(self._cfg.fiscal.six_week_january_years)
+        imp_mode, imp_label, imp_cur_avg, imp_prior_avg = _compute_improvement_metrics(
+            df=self._df,
+            prior_df=self._prior_df,
+            today=today,
+            sw=sw,
+            active_reps=active_reps,
+            ytd_cur_avg=per_rep_ytd_avg,
+            ytd_prior_avg=per_rep_prior_ytd_avg,
+        )
+
+        top3_improvement: list[tuple[str, float]] = sorted(
+            [
+                (rep, imp_cur_avg.get(rep, 0.0) - imp_prior_avg.get(rep, 0.0))
+                for rep in active_reps
+                if imp_prior_avg.get(rep, 0.0) > 0
+            ],
+            key=lambda kv: -kv[1],
+        )[:3]
 
         # Shoutout text.
         if self._has_ai():
@@ -565,22 +583,27 @@ class WeeklyEmailView(QWidget):
                 self._ai_shoutouts(top3_weekly, category="weekly_top")
                 if top3_weekly else {}
             )
-            shoutouts_ytd = (
-                self._ai_shoutouts(top3_ytd_improvement, category="ytd_improvement",
-                                   ytd_avg=per_rep_ytd_avg, prior_ytd_avg=per_rep_prior_ytd_avg)
-                if top3_ytd_improvement else {}
+            shoutouts_imp = (
+                self._ai_shoutouts(
+                    top3_improvement,
+                    category=imp_mode,
+                    imp_label=imp_label,
+                    cur_avg=imp_cur_avg,
+                    prior_avg=imp_prior_avg,
+                )
+                if top3_improvement else {}
             )
         else:
             shoutouts_weekly = {
                 rep: _fallback_shoutout(rep, self._scorecards.get(rep))
                 for rep, _ in top3_weekly
             }
-            shoutouts_ytd = {
+            shoutouts_imp = {
                 rep: (
-                    f"Up ${per_rep_ytd_avg.get(rep, 0) - per_rep_prior_ytd_avg.get(rep, 0):,.0f}/wk "
+                    f"Up ${imp_cur_avg.get(rep, 0) - imp_prior_avg.get(rep, 0):,.0f}/wk "
                     f"vs prior year — solid upward trend."
                 )
-                for rep, _ in top3_ytd_improvement
+                for rep, _ in top3_improvement
             }
 
         anchor_note_needed = anchor < today
@@ -593,9 +616,12 @@ class WeeklyEmailView(QWidget):
             per_rep_prior_ytd_avg=per_rep_prior_ytd_avg,
             leaderboard=leaderboard,
             top3_weekly=top3_weekly,
-            top3_ytd_improvement=top3_ytd_improvement,
+            top3_improvement=top3_improvement,
+            imp_label=imp_label,
+            imp_cur_avg=imp_cur_avg,
+            imp_prior_avg=imp_prior_avg,
             shoutouts_weekly=shoutouts_weekly,
-            shoutouts_ytd=shoutouts_ytd,
+            shoutouts_imp=shoutouts_imp,
             period_overview=self._period_overview,
             anchor=anchor if anchor_note_needed else None,
             fb_start=fb_start,
@@ -631,34 +657,29 @@ class WeeklyEmailView(QWidget):
         entries: list[tuple[str, float]],
         *,
         category: str = "weekly_top",
+        imp_label: str = "",
+        cur_avg: dict[str, float] | None = None,
+        prior_avg: dict[str, float] | None = None,
+        # Legacy kwargs kept for any remaining call sites
         ytd_avg: dict[str, float] | None = None,
         prior_ytd_avg: dict[str, float] | None = None,
     ) -> dict[str, str]:
         """Generate one-line AI shout-outs for a list of (rep, value) tuples.
 
         ``category`` controls the framing:
-        - ``"weekly_top"`` — celebrate top weekly sellers.
-        - ``"ytd_improvement"`` — celebrate biggest YTD trend gains.
+        - ``"weekly_top"``  — celebrate top weekly sellers.
+        - ``"month_end"``   — completed fiscal month vs same month last year.
+        - ``"quarter_end"`` — completed fiscal quarter vs same quarter last year.
+        - ``"ytd_avg"``     — fiscal YTD weekly avg vs prior YTD weekly avg.
+        - ``"mtd_avg"``     — fiscal MTD weekly avg vs prior MTD weekly avg.
         """
+        # Consolidate legacy parameter names
+        _cur = cur_avg or ytd_avg or {}
+        _prior = prior_avg or prior_ytd_avg or {}
+
         provider = build_provider(self._cfg.ai)
 
-        if category == "ytd_improvement":
-            sys_msg = (
-                "You are a sales manager recognizing team members who have shown "
-                "the strongest improvement in their year-to-date weekly average vs "
-                "the prior year. Write ONE upbeat, specific sentence per rep that "
-                "calls out the momentum and improvement. Mention the dollar improvement "
-                "where possible. Format: REP_NAME: shout-out  (one line per rep)"
-            )
-            bullets = []
-            for rep, delta in entries:
-                cur = (ytd_avg or {}).get(rep, 0)
-                prior = (prior_ytd_avg or {}).get(rep, 0)
-                bullets.append(
-                    f"- {rep}: current YTD avg ${cur:,.0f}/wk vs prior ${prior:,.0f}/wk "
-                    f"(+${delta:,.0f}/wk improvement)"
-                )
-        else:
+        if category == "weekly_top":
             sys_msg = (
                 "You are a sales manager writing a one-line, upbeat public shout-out "
                 "for each top weekly seller on the team leaderboard. Be specific and "
@@ -677,6 +698,29 @@ class WeeklyEmailView(QWidget):
                 )
                 extras = "  ".join(filter(None, [l3, f"top account: {top}" if top else ""]))
                 bullets.append(f"- {rep}: ${rev:,.0f} this week  {extras}")
+        else:
+            # Improvement category: month_end / quarter_end / ytd_avg / mtd_avg
+            mode_desc = {
+                "month_end":   "the just-completed fiscal month vs the same month last year",
+                "quarter_end": "the just-completed fiscal quarter vs the same quarter last year",
+                "ytd_avg":     "fiscal year-to-date weekly average vs prior year same period",
+                "mtd_avg":     "fiscal month-to-date weekly average vs prior year same period",
+            }.get(category, imp_label or "vs prior year")
+            sys_msg = (
+                f"You are a sales manager publicly recognizing team members who are "
+                f"leading in improvement for {mode_desc}. "
+                f"Write ONE upbeat, specific sentence per rep that calls out their "
+                f"momentum. Mention the dollar improvement where possible. "
+                f"Format: REP_NAME: shout-out  (one line per rep)"
+            )
+            bullets = []
+            for rep, delta in entries:
+                c = _cur.get(rep, 0.0)
+                p = _prior.get(rep, 0.0)
+                bullets.append(
+                    f"- {rep}: ${c:,.0f}/wk now vs ${p:,.0f}/wk last year "
+                    f"(+${delta:,.0f}/wk improvement)"
+                )
 
         user_msg = "Team members:\n" + "\n".join(bullets)
         try:
@@ -802,7 +846,7 @@ class WeeklyEmailView(QWidget):
         ready = sum(1 for k, d in self._drafts.items() if k != MASTER_KEY and d["to"])
         missing = sum(1 for k, d in self._drafts.items() if k != MASTER_KEY and not d["to"])
         master = "yes" if MASTER_KEY in self._drafts else "no"
-        if self._cfg.enable_outbound_send:
+        if self._cfg.email.enable_outbound_send:
             send_note = (
                 f"<p style='color:#16A34A;font-size:11px;'>"
                 f"Outbound sending is enabled. Actual dispatch coming in next release.</p>"
@@ -917,6 +961,102 @@ def _scorecard_footer_html(sc: RepScorecard) -> str:
     )
 
 
+# ============================================================ improvement mode
+_IMP_QUARTER_PERIODS = {3, 6, 9, 12}
+_IMP_QUARTER_NAMES = {3: "Q1", 6: "Q2", 9: "Q3", 12: "Q4"}
+
+
+def _compute_improvement_metrics(
+    *,
+    df: "pd.DataFrame",
+    prior_df: "pd.DataFrame | None",
+    today: date,
+    sw: list[int],
+    active_reps: set[str],
+    ytd_cur_avg: dict[str, float],
+    ytd_prior_avg: dict[str, float],
+) -> tuple[str, str, dict[str, float], dict[str, float]]:
+    """Determine the "Most Improved" comparison mode and compute per-rep averages.
+
+    Returns ``(mode, label, cur_avg_by_rep, prior_avg_by_rep)`` where all
+    monetary values are **weekly averages** ($/week).
+
+    Modes:
+    - ``"ytd_avg"``     — 1st week of a new period: fiscal YTD avg vs prior YTD avg.
+    - ``"mtd_avg"``     — mid-month: fiscal MTD avg vs prior year same MTD avg.
+    - ``"month_end"``   — last week of a period: completed month avg vs prior year.
+    - ``"quarter_end"`` — last week of a quarter-close period (3,6,9,12): quarter avg.
+    """
+    try:
+        current_p = find_period(today, sw)
+    except Exception:  # noqa: BLE001
+        # Fallback: just return YTD
+        return ("ytd_avg", "Fiscal YTD Avg/Wk", ytd_cur_avg, ytd_prior_avg)
+
+    days_into = (today - current_p.start).days
+    days_left = (current_p.end - today).days
+    first_week = days_into < 7
+    last_week = days_left < 7
+    is_qtr = current_p.period in _IMP_QUARTER_PERIODS
+
+    # ── 1st week of new period: use YTD ──────────────────────────────────────
+    if first_week:
+        return ("ytd_avg", "Fiscal YTD Avg/Wk", ytd_cur_avg, ytd_prior_avg)
+
+    # ── Last week of period ───────────────────────────────────────────────────
+    if last_week and is_qtr:
+        mode = "quarter_end"
+        q_name = _IMP_QUARTER_NAMES[current_p.period]
+        q_start_period = current_p.period - 2  # periods 1,4,7,10
+        try:
+            fy_periods = build_fiscal_year(current_p.fiscal_year, sw)
+            cur_start = fy_periods[q_start_period - 1].start
+        except Exception:  # noqa: BLE001
+            cur_start = current_p.start
+        cur_end = min(today, current_p.end)
+        label = f"{q_name} Avg/Wk vs Prior Year"
+    elif last_week:
+        mode = "month_end"
+        cur_start = current_p.start
+        cur_end = min(today, current_p.end)
+        label = f"{current_p.name} Avg/Wk vs Prior Year"
+    else:
+        # ── Mid-month: MTD avg ────────────────────────────────────────────────
+        mode = "mtd_avg"
+        cur_start = current_p.start
+        cur_end = today
+        label = f"{current_p.name} MTD Avg/Wk vs Prior Year"
+
+    # Prior-year equivalent window
+    try:
+        prior_start = cur_start.replace(year=cur_start.year - 1)
+        prior_end = cur_end.replace(year=cur_end.year - 1)
+    except ValueError:
+        prior_start = cur_start - timedelta(days=365)
+        prior_end = cur_end - timedelta(days=365)
+
+    weeks_cur = max(1.0, (cur_end - cur_start).days / 7.0)
+    weeks_prior = max(1.0, (prior_end - prior_start).days / 7.0)
+
+    cur_rev = revenue_in_window(df, cur_start, cur_end, by="rep")
+    cur_avg = {
+        rep: rev / weeks_cur
+        for rep, rev in cur_rev.items()
+        if rep in active_reps
+    }
+
+    prior_avg: dict[str, float] = {}
+    if prior_df is not None and not prior_df.empty:
+        pr_rev = revenue_in_window(prior_df, prior_start, prior_end, by="rep")
+        prior_avg = {
+            rep: rev / weeks_prior
+            for rep, rev in pr_rev.items()
+            if rep in active_reps
+        }
+
+    return (mode, label, cur_avg, prior_avg)
+
+
 def _render_master_html(
     *,
     wk_start: date,
@@ -927,9 +1067,12 @@ def _render_master_html(
     per_rep_prior_ytd_avg: dict[str, float],
     leaderboard: list[tuple[str, float]],
     top3_weekly: list[tuple[str, float]],
-    top3_ytd_improvement: list[tuple[str, float]],
+    top3_improvement: list[tuple[str, float]],
+    imp_label: str,
+    imp_cur_avg: dict[str, float],
+    imp_prior_avg: dict[str, float],
     shoutouts_weekly: dict[str, str],
-    shoutouts_ytd: dict[str, str],
+    shoutouts_imp: dict[str, str],
     period_overview: PeriodOverview | None,
     anchor: date | None = None,
     fb_start: date | None = None,
@@ -973,10 +1116,10 @@ def _render_master_html(
         shoutouts_weekly,
         "— ${:,.0f} in sales",
     )
-    shoutout_ytd_html = _shoutout_html(
-        "📈 Most Improved vs Prior FY YTD (Avg/Week)",
-        top3_ytd_improvement,
-        shoutouts_ytd,
+    shoutout_imp_html = _shoutout_html(
+        f"📈 Most Improved — {imp_label}",
+        top3_improvement,
+        shoutouts_imp,
         "— +${:,.0f}/wk gain",
     )
 
@@ -1051,7 +1194,7 @@ def _render_master_html(
         + overview
         + anchor_note
         + shoutout_weekly_html
-        + shoutout_ytd_html
+        + shoutout_imp_html
         + f"<h3 style='margin:18px 0 8px 0;font-size:14px;'>"
           f"Leaderboard — {week_kind}: {wk_start.isoformat()} → {wk_end.isoformat()}</h3>"
         + "<table cellpadding='0' cellspacing='0' "
@@ -1089,13 +1232,13 @@ def _render_master_html(
                 shoutout_lines.append(f"       {txt}")
         shoutout_lines.append("")
 
-    if top3_ytd_improvement:
-        shoutout_lines.append("📈  MOST IMPROVED vs PRIOR YEAR  (YTD Avg/Week)")
+    if top3_improvement:
+        shoutout_lines.append(f"📈  MOST IMPROVED — {imp_label.upper()}")
         shoutout_lines.append("")
-        for i, (rep, delta) in enumerate(top3_ytd_improvement):
-            cur = per_rep_ytd_avg.get(rep, 0.0)
-            prev = per_rep_prior_ytd_avg.get(rep, 0.0)
-            txt = shoutouts_ytd.get(rep, "")
+        for i, (rep, delta) in enumerate(top3_improvement):
+            cur = imp_cur_avg.get(rep, 0.0)
+            prev = imp_prior_avg.get(rep, 0.0)
+            txt = shoutouts_imp.get(rep, "")
             shoutout_lines.append(
                 f"  {medals[i]}  {rep}  —  ${cur:,.0f}/wk now  vs  ${prev:,.0f}/wk last year  (+${delta:,.0f}/wk)"
             )
