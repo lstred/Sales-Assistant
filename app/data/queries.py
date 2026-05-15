@@ -196,9 +196,9 @@ WHERE   LTRIM(RTRIM(b.[BCCAT])) = 'DT'
 # context (e.g. "WIN WIN", "ALLURE", "TOP GUN").
 PRICE_CLASS_LOOKUP = """
 SELECT  LTRIM(RTRIM(p.[$PRCCD])) AS price_class,
-        MAX(LTRIM(RTRIM(p.[$DESC]))) AS price_class_desc
+        MAX(NULLIF(LTRIM(RTRIM(p.[$DESC])), '')) AS price_class_desc
 FROM    dbo.PRICE AS p
 WHERE   ISNULL(LTRIM(RTRIM(p.[$PRCCD])), '') <> ''
 GROUP BY LTRIM(RTRIM(p.[$PRCCD]))
-ORDER BY p.[$PRCCD]
+ORDER BY LTRIM(RTRIM(p.[$PRCCD]))
 """

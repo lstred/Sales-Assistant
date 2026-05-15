@@ -469,7 +469,8 @@ def compute_rep_scorecards(
                 pc_grp = pc_grp.sort_values("revenue", ascending=False).head(8)
                 for r in pc_grp.to_dict("records"):
                     pc = str(r.get("price_class") or "").strip()
-                    desc = (price_class_lookup or {}).get(pc, pc)
+                    # Use "" as the default so the caller's `desc or code` fallback works.
+                    desc = (price_class_lookup or {}).get(pc) or ""
                     rev_pc = float(r.get("revenue") or 0.0)
                     gp_pc = float(r.get("gross_profit") or 0.0)
                     gp_pct_pc = (gp_pc / rev_pc * 100.0) if rev_pc else 0.0

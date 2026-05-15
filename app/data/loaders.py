@@ -363,7 +363,16 @@ def load_price_class_lookup(db: DatabaseConfig) -> dict[str, str]:
         df = read_dataframe(db, queries.PRICE_CLASS_LOOKUP)
         if df is None or df.empty:
             return {}
-        return dict(zip(df["price_class"].astype(str), df["price_class_desc"].astype(str)))
+        result: dict[str, str] = {}
+        for code, desc in zip(df["price_class"], df["price_class_desc"]):
+            code_s = str(code).strip() if code is not None else ""
+            if not code_s:
+                continue
+            # Skip NaN / None / blank descriptions — caller falls back to the code.
+            if pd.isna(desc) or not str(desc).strip():
+                continue
+            result[code_s] = str(desc).strip()
+        return result
     except Exception:  # noqa: BLE001
         return {}
 
