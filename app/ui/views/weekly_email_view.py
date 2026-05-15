@@ -35,6 +35,7 @@ from typing import Callable
 import pandas as pd
 from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -222,6 +223,11 @@ class WeeklyEmailView(QWidget):
         self.master_btn.setEnabled(False)
         self.master_btn.clicked.connect(self._generate_master)
         actions.addWidget(self.master_btn)
+        self.copy_btn = QPushButton("📋 Copy leaderboard")
+        self.copy_btn.setEnabled(False)
+        self.copy_btn.setToolTip("Copy leaderboard as plain text — paste directly into an email")
+        self.copy_btn.clicked.connect(self._copy_leaderboard)
+        actions.addWidget(self.copy_btn)
         self.queue_btn = QPushButton("Queue for review")
         self.queue_btn.setEnabled(False)
         self.queue_btn.clicked.connect(self._queue)
@@ -485,27 +491,115 @@ class WeeklyEmailView(QWidget):
         if self._df is None or self._df.empty:
             return
         self._ensure_scorecards()
-        # Anchor weekly windows to the most recent invoice date present in
-        # the loaded data — if the manager's date range ended a week or
-        # more ago, today's calendar week would be empty and the master
-        # email would silently render "no invoiced sales last week".
+
+        # Anchor weekly windows to the latest invoice date in scope.
         anchor = self._anchor_date()
-        wk_start, wk_end = previous_week_range(anchor)
-        cur_start, cur_end_full = current_week_range(anchor)
-        cur_end = min(anchor, cur_end_full)
 
-        per_rep_last = revenue_in_window(self._df, wk_start, wk_end, by="rep")
-        per_rep_curr = revenue_in_window(self._df, cur_start, cur_end, by="rep")
-        leaderboard = sorted(per_rep_last.items(), key=lambda kv: -kv[1])
+        # Week selection rule: if today is Friday (4) or Saturday (5), use
+        # the current (in-progress) week; otherwise use the last full week.
+        today = date.today()
+        if today.weekday() >= 4:  # Friday or Saturday
+            wk_start, wk_end_full = current_week_range(anchor)
+            wk_end = min(anchor, wk_end_full)
+            using_current_week = True
+        else:
+            wk_start, wk_end = previous_week_range(anchor)
+            using_current_week = False
 
-        body_html = _render_master_html(
-            week_start=wk_start, week_end=wk_end,
-            cur_start=cur_start, cur_end=cur_end,
-            per_rep_last=per_rep_last, per_rep_curr=per_rep_curr,
-            period_overview=self._period_overview,
-            anchor=anchor,
+        # Per-rep weekly revenue for the chosen window.
+        per_rep_weekly = revenue_in_window(self._df, wk_start, wk_end, by="rep")
+
+        # Fiscal YTD weekly averages (current and prior year).
+        fb_start, fb_end = self.filter_bar.date_range()
+        weeks_elapsed = max(1.0, (fb_end - fb_start).days / 7.0)
+
+        per_rep_ytd_rev = revenue_in_window(self._df, fb_start, fb_end, by="rep")
+        per_rep_ytd_avg = {rep: rev / weeks_elapsed for rep, rev in per_rep_ytd_rev.items()}
+
+        per_rep_prior_ytd_avg: dict[str, float] = {}
+        if self._prior_df is not None and not self._prior_df.empty:
+            try:
+                prior_start = fb_start.replace(year=fb_start.year - 1)
+                prior_end = fb_end.replace(year=fb_end.year - 1)
+            except ValueError:
+                prior_start = fb_start - timedelta(days=365)
+                prior_end = fb_end - timedelta(days=365)
+            per_rep_prior_ytd_rev = revenue_in_window(
+                self._prior_df, prior_start, prior_end, by="rep"
+            )
+            per_rep_prior_ytd_avg = {
+                rep: rev / weeks_elapsed for rep, rev in per_rep_prior_ytd_rev.items()
+            }
+
+        # All reps that appear in any column — exclude where both YTD avgs ≤ 0.
+        all_reps = set(per_rep_weekly) | set(per_rep_ytd_avg) | set(per_rep_prior_ytd_avg)
+        active_reps = {
+            rep for rep in all_reps
+            if per_rep_ytd_avg.get(rep, 0.0) > 0 or per_rep_prior_ytd_avg.get(rep, 0.0) > 0
+        }
+
+        # Leaderboard sorted by weekly revenue descending.
+        leaderboard: list[tuple[str, float]] = sorted(
+            [(rep, per_rep_weekly.get(rep, 0.0)) for rep in active_reps],
+            key=lambda kv: -kv[1],
         )
-        subject = f"Team scoreboard \u2014 week of {wk_start.isoformat()}"
+
+        # Top 3 for weekly shoutouts (must have non-zero weekly revenue).
+        top3_weekly = [(rep, rev) for rep, rev in leaderboard if rev > 0][:3]
+
+        # Top 3 YTD improvement (dollar gain in avg vs prior year).
+        ytd_improvements: list[tuple[str, float]] = [
+            (rep, per_rep_ytd_avg.get(rep, 0.0) - per_rep_prior_ytd_avg.get(rep, 0.0))
+            for rep in active_reps
+            if per_rep_prior_ytd_avg.get(rep, 0.0) > 0  # need prior data to compare
+        ]
+        top3_ytd_improvement = sorted(ytd_improvements, key=lambda kv: -kv[1])[:3]
+
+        # Shoutout text.
+        if self._has_ai():
+            shoutouts_weekly = (
+                self._ai_shoutouts(top3_weekly, category="weekly_top")
+                if top3_weekly else {}
+            )
+            shoutouts_ytd = (
+                self._ai_shoutouts(top3_ytd_improvement, category="ytd_improvement",
+                                   ytd_avg=per_rep_ytd_avg, prior_ytd_avg=per_rep_prior_ytd_avg)
+                if top3_ytd_improvement else {}
+            )
+        else:
+            shoutouts_weekly = {
+                rep: _fallback_shoutout(rep, self._scorecards.get(rep))
+                for rep, _ in top3_weekly
+            }
+            shoutouts_ytd = {
+                rep: (
+                    f"Up ${per_rep_ytd_avg.get(rep, 0) - per_rep_prior_ytd_avg.get(rep, 0):,.0f}/wk "
+                    f"vs prior year — solid upward trend."
+                )
+                for rep, _ in top3_ytd_improvement
+            }
+
+        anchor_note_needed = anchor < today
+        body_html, plain_text = _render_master_html(
+            wk_start=wk_start,
+            wk_end=wk_end,
+            using_current_week=using_current_week,
+            per_rep_weekly=per_rep_weekly,
+            per_rep_ytd_avg=per_rep_ytd_avg,
+            per_rep_prior_ytd_avg=per_rep_prior_ytd_avg,
+            leaderboard=leaderboard,
+            top3_weekly=top3_weekly,
+            top3_ytd_improvement=top3_ytd_improvement,
+            shoutouts_weekly=shoutouts_weekly,
+            shoutouts_ytd=shoutouts_ytd,
+            period_overview=self._period_overview,
+            anchor=anchor if anchor_note_needed else None,
+            fb_start=fb_start,
+            fb_end=fb_end,
+        )
+
+        week_label = f"{wk_start.isoformat()} → {wk_end.isoformat()}"
+        subject = f"Team scoreboard — week of {wk_start.isoformat()}"
         self._drafts[MASTER_KEY] = {
             "rep_name": "All reps (master leaderboard)",
             "salesman_number": "",
@@ -513,61 +607,80 @@ class WeeklyEmailView(QWidget):
             "cc": "",
             "subject": subject,
             "body_html": body_html,
+            "plain_text": plain_text,
             "scorecard": {},
             "week_lines": {},
         }
-        existing = self.list.findItems(
-            "\u2605 Master leaderboard", Qt.MatchFlag.MatchStartsWith
-        )
-        if existing:
-            for it in existing:
-                self.list.takeItem(self.list.row(it))
-        item = QListWidgetItem(
-            f"\u2605 Master leaderboard  ({wk_start.isoformat()} \u2192 {wk_end.isoformat()})"
-        )
+
+        existing = self.list.findItems("\u2605 Master leaderboard", Qt.MatchFlag.MatchStartsWith)
+        for it in existing:
+            self.list.takeItem(self.list.row(it))
+
+        item = QListWidgetItem(f"\u2605 Master leaderboard  ({week_label})")
         item.setData(Qt.ItemDataRole.UserRole, MASTER_KEY)
         self.list.insertItem(0, item)
         self.list.setCurrentRow(0)
         self.queue_btn.setEnabled(True)
 
-    def _ai_shoutouts(self, leaderboard: list[tuple[str, float]]) -> dict[str, str]:
+    def _ai_shoutouts(
+        self,
+        entries: list[tuple[str, float]],
+        *,
+        category: str = "weekly_top",
+        ytd_avg: dict[str, float] | None = None,
+        prior_ytd_avg: dict[str, float] | None = None,
+    ) -> dict[str, str]:
+        """Generate one-line AI shout-outs for a list of (rep, value) tuples.
+
+        ``category`` controls the framing:
+        - ``"weekly_top"`` — celebrate top weekly sellers.
+        - ``"ytd_improvement"`` — celebrate biggest YTD trend gains.
+        """
         provider = build_provider(self._cfg.ai)
-        sys_msg = (
-            "You are a sales manager preparing a one-line, upbeat shout-out "
-            "for each rep on a public team leaderboard. ALWAYS find something "
-            "honestly positive to say (largest deal, biggest growing account, "
-            "best week, most consistent, etc.) even for reps near the bottom \u2014 "
-            "never insult or shame. ONE short sentence per rep, no preamble, "
-            "no closing. Output exactly one line per rep in the format: "
-            "REP_NAME: shout-out"
-        )
-        bullets = []
-        for rep, rev in leaderboard:
-            sc = self._scorecards.get(rep)
-            if sc is not None and sc.is_yoy_outlier:
-                yoy_part = "YoY=outlier (territory transfer; ignore)"
-            elif sc is None or sc.yoy_pct is None:
-                yoy_part = "YoY=n/a"
-            else:
-                yoy_part = f"YoY={sc.yoy_pct:+.1f}%"
-            top = (
-                format_account_label(sc.top_growing_accounts[0])
-                if sc and sc.top_growing_accounts else "n/a"
+
+        if category == "ytd_improvement":
+            sys_msg = (
+                "You are a sales manager recognizing team members who have shown "
+                "the strongest improvement in their year-to-date weekly average vs "
+                "the prior year. Write ONE upbeat, specific sentence per rep that "
+                "calls out the momentum and improvement. Mention the dollar improvement "
+                "where possible. Format: REP_NAME: shout-out  (one line per rep)"
             )
-            l3 = (
-                f"3mo={sc.last_3mo_vs_prior_3mo_pct:+.1f}%"
-                if sc and sc.last_3mo_vs_prior_3mo_pct is not None else "3mo=n/a"
+            bullets = []
+            for rep, delta in entries:
+                cur = (ytd_avg or {}).get(rep, 0)
+                prior = (prior_ytd_avg or {}).get(rep, 0)
+                bullets.append(
+                    f"- {rep}: current YTD avg ${cur:,.0f}/wk vs prior ${prior:,.0f}/wk "
+                    f"(+${delta:,.0f}/wk improvement)"
+                )
+        else:
+            sys_msg = (
+                "You are a sales manager writing a one-line, upbeat public shout-out "
+                "for each top weekly seller on the team leaderboard. Be specific and "
+                "energetic. ONE sentence per rep. Format: REP_NAME: shout-out"
             )
-            bullets.append(
-                f"- {rep}: week ${rev:,.0f}; {yoy_part}; {l3}; top growing {top}"
-            )
-        user_msg = "Reps and last-week numbers:\n" + "\n".join(bullets)
+            bullets = []
+            for rep, rev in entries:
+                sc = self._scorecards.get(rep)
+                l3 = (
+                    f"3mo trend={sc.last_3mo_vs_prior_3mo_pct:+.1f}%"
+                    if sc and sc.last_3mo_vs_prior_3mo_pct is not None else ""
+                )
+                top = (
+                    format_account_label(sc.top_growing_accounts[0])
+                    if sc and sc.top_growing_accounts else ""
+                )
+                extras = "  ".join(filter(None, [l3, f"top account: {top}" if top else ""]))
+                bullets.append(f"- {rep}: ${rev:,.0f} this week  {extras}")
+
+        user_msg = "Team members:\n" + "\n".join(bullets)
         try:
             res = provider.complete(
                 [ChatMessage("system", sys_msg), ChatMessage("user", user_msg)],
                 model=self._cfg.ai.model,
-                max_output_tokens=self._cfg.ai.max_output_tokens,
-                temperature=0.6,
+                max_output_tokens=512,
+                temperature=0.65,
                 timeout_seconds=self._cfg.ai.request_timeout_seconds,
             )
             out: dict[str, str] = {}
@@ -575,13 +688,10 @@ class WeeklyEmailView(QWidget):
                 if ":" in line:
                     name, _, msg = line.partition(":")
                     out[name.strip()] = msg.strip()
-            for rep, _ in leaderboard:
-                out.setdefault(rep, _fallback_shoutout(rep, self._scorecards.get(rep)))
             return out
         except Exception as exc:  # noqa: BLE001
-            log.warning("AI shout-outs failed: %s", exc)
-            return {rep: _fallback_shoutout(rep, self._scorecards.get(rep))
-                    for rep, _ in leaderboard}
+            log.warning("AI shout-outs failed (%s): %s", category, exc)
+            return {}
 
     # --------------------------------------------------------------- helpers
     def _has_ai(self) -> bool:
@@ -655,6 +765,8 @@ class WeeklyEmailView(QWidget):
         d = self._drafts.get(key)
         if not d:
             return
+        is_master = (key == MASTER_KEY)
+        self.copy_btn.setEnabled(is_master and bool(d.get("plain_text")))
         no_email = d['to'] or "(no email on file \u2014 set in Sales Reps)"
         header = (
             f"<div style='color:{TEXT_MUTED};font-size:12px;margin-bottom:8px;'>"
@@ -663,6 +775,24 @@ class WeeklyEmailView(QWidget):
             + f"<b>Subject:</b> {d['subject']}</div>"
         )
         self.preview.setHtml(header + d["body_html"])
+
+    def _copy_leaderboard(self) -> None:
+        items = self.list.selectedItems()
+        if not items:
+            return
+        key = items[0].data(Qt.ItemDataRole.UserRole)
+        d = self._drafts.get(key)
+        if not d or not d.get("plain_text"):
+            return
+        QApplication.clipboard().setText(d["plain_text"])
+        orig = self.copy_btn.text()
+        self.copy_btn.setText("✓ Copied!")
+        self.copy_btn.setEnabled(False)
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(2000, lambda: (
+            self.copy_btn.setText(orig),
+            self.copy_btn.setEnabled(True),
+        ))
 
     def _queue(self) -> None:
         ready = sum(1 for k, d in self._drafts.items() if k != MASTER_KEY and d["to"])
@@ -777,74 +907,217 @@ def _scorecard_footer_html(sc: RepScorecard) -> str:
 
 def _render_master_html(
     *,
-    week_start: date,
-    week_end: date,
-    cur_start: date,
-    cur_end: date,
-    per_rep_last: dict[str, float],
-    per_rep_curr: dict[str, float],
+    wk_start: date,
+    wk_end: date,
+    using_current_week: bool,
+    per_rep_weekly: dict[str, float],
+    per_rep_ytd_avg: dict[str, float],
+    per_rep_prior_ytd_avg: dict[str, float],
+    leaderboard: list[tuple[str, float]],
+    top3_weekly: list[tuple[str, float]],
+    top3_ytd_improvement: list[tuple[str, float]],
+    shoutouts_weekly: dict[str, str],
+    shoutouts_ytd: dict[str, str],
     period_overview: PeriodOverview | None,
     anchor: date | None = None,
-) -> str:
-    sorted_last = sorted(per_rep_last.items(), key=lambda kv: -kv[1])
-    rows = []
-    for i, (rep, rev) in enumerate(sorted_last, 1):
-        cur = per_rep_curr.get(rep, 0.0)
+    fb_start: date | None = None,
+    fb_end: date | None = None,
+) -> tuple[str, str]:
+    """Render master leaderboard. Returns ``(html, plain_text)``."""
+
+    week_kind = "This week (in progress)" if using_current_week else "Last week"
+    period_label = (
+        f"{fb_start.isoformat()} → {fb_end.isoformat()}"
+        if fb_start and fb_end else "Fiscal YTD"
+    )
+    medals = ["🥇", "🥈", "🥉"]
+
+    # ---- shoutout sections ------------------------------------------------
+    def _shoutout_html(title: str, entries: list[tuple[str, float]],
+                       texts: dict[str, str], value_fmt: str) -> str:
+        if not entries:
+            return ""
+        items_html = "".join(
+            f"<div style='margin:6px 0;'>"
+            f"<span style='font-size:18px;margin-right:8px;'>{medals[i]}</span>"
+            f"<strong>{rep}</strong> "
+            f"<span style='color:#475569;'>{value_fmt.format(val)}</span>"
+            f"<br><span style='color:#1E3A5F;margin-left:26px;font-style:italic;'>"
+            f"{texts.get(rep, '')}</span></div>"
+            for i, (rep, val) in enumerate(entries)
+        )
+        return (
+            f"<div style='background:#EFF6FF;border:1px solid #BFDBFE;border-radius:8px;"
+            f"padding:12px 16px;margin:10px 0;'>"
+            f"<div style='font-size:13px;font-weight:700;color:#1D4ED8;margin-bottom:8px;'>"
+            f"{title}</div>"
+            + items_html
+            + "</div>"
+        )
+
+    shoutout_weekly_html = _shoutout_html(
+        "⭐ Top 3 This Week",
+        top3_weekly,
+        shoutouts_weekly,
+        "— ${:,.0f} in sales",
+    )
+    shoutout_ytd_html = _shoutout_html(
+        "📈 Most Improved vs Prior FY YTD (Avg/Week)",
+        top3_ytd_improvement,
+        shoutouts_ytd,
+        "— +${:,.0f}/wk gain",
+    )
+
+    # ---- table rows -------------------------------------------------------
+    total_weekly = total_ytd_avg = total_prior_ytd_avg = 0.0
+    rows_html: list[str] = []
+    for i, (rep, _) in enumerate(leaderboard, 1):
+        weekly = per_rep_weekly.get(rep, 0.0)
+        ytd = per_rep_ytd_avg.get(rep, 0.0)
+        prior = per_rep_prior_ytd_avg.get(rep, 0.0)
+        total_weekly += weekly
+        total_ytd_avg += ytd
+        total_prior_ytd_avg += prior
         zebra = "#FFFFFF" if i % 2 else "#F8FAFC"
-        rows.append(
+        rows_html.append(
             f"<tr style='background:{zebra};'>"
             f"<td style='padding:6px 10px;color:#64748B;'>{i}</td>"
             f"<td style='padding:6px 10px;font-weight:600;color:#0F172A;'>{rep}</td>"
-            f"<td style='padding:6px 10px;text-align:right;font-variant-numeric:tabular-nums;'>${rev:,.0f}</td>"
-            f"<td style='padding:6px 10px;text-align:right;color:#475569;font-variant-numeric:tabular-nums;'>${cur:,.0f}</td>"
+            f"<td style='padding:6px 10px;text-align:right;font-variant-numeric:tabular-nums;'>"
+            f"{'$' + f'{weekly:,.0f}' if weekly > 0 else '—'}</td>"
+            f"<td style='padding:6px 10px;text-align:right;color:#0F172A;font-variant-numeric:tabular-nums;'>"
+            f"${ytd:,.0f}</td>"
+            f"<td style='padding:6px 10px;text-align:right;color:#475569;font-variant-numeric:tabular-nums;'>"
+            f"{'$' + f'{prior:,.0f}' if prior > 0 else '—'}</td>"
             f"</tr>"
         )
-    table_rows = "".join(rows) or (
-        "<tr><td colspan='4' style='padding:12px;color:#888;'>No invoiced sales last week.</td></tr>"
+
+    totals_row = (
+        "<tr style='background:#F1F5F9;font-weight:700;border-top:2px solid #CBD5E1;'>"
+        "<td style='padding:8px 10px;'></td>"
+        "<td style='padding:8px 10px;color:#0F172A;'>TOTAL</td>"
+        f"<td style='padding:8px 10px;text-align:right;font-variant-numeric:tabular-nums;'>${total_weekly:,.0f}</td>"
+        f"<td style='padding:8px 10px;text-align:right;font-variant-numeric:tabular-nums;'>${total_ytd_avg:,.0f}</td>"
+        f"<td style='padding:8px 10px;text-align:right;font-variant-numeric:tabular-nums;color:#475569;'>"
+        f"{'$' + f'{total_prior_ytd_avg:,.0f}' if total_prior_ytd_avg > 0 else '—'}</td>"
+        "</tr>"
     )
+
+    if not rows_html:
+        table_body = "<tr><td colspan='5' style='padding:12px;color:#888;'>No sales data in scope.</td></tr>"
+    else:
+        table_body = "".join(rows_html) + totals_row
+
+    # ---- overview & notes -------------------------------------------------
     overview = ""
     if period_overview is not None and period_overview.revenue:
         overview = (
-            f"<p style='font-size:13px;'><b>{period_overview.label} \u2014 company recap:</b> "
+            f"<p style='font-size:13px;'><b>{period_overview.label} — company recap:</b> "
             f"${period_overview.revenue:,.0f}"
             + ("" if period_overview.yoy_pct is None
                else f" ({period_overview.yoy_pct:+.1f}% YoY)")
-            + f" \u00b7 GP {period_overview.gpp_pct:.1f}% \u00b7 "
-            + f"{period_overview.active_reps} active reps \u00b7 "
+            + f" · GP {period_overview.gpp_pct:.1f}% · "
+            + f"{period_overview.active_reps} active reps · "
             + f"{period_overview.active_accounts:,} active accounts.</p>"
         )
+
     anchor_note = ""
     if anchor and anchor < date.today():
         anchor_note = (
             f"<p style='color:#92400E;font-size:11px;background:#FEF3C7;"
             f"border:1px solid #FCD34D;border-radius:6px;padding:6px 10px;"
             f"display:inline-block;margin:6px 0;'>"
-            f"Anchored to last invoice date in scope ({anchor.isoformat()}) "
-            f"\u2014 widen the date range to include this calendar week."
+            f"⚠ Anchored to last invoice date in scope ({anchor.isoformat()}) "
+            f"— widen the date range to include this calendar week."
             f"</p>"
         )
-    return (
-        "<p>Team \u2014 here\u2019s the scoreboard for last week. Great work to "
-        "everyone on the list \u2014 keep grinding.</p>"
+
+    # ---- assemble HTML ----------------------------------------------------
+    html = (
+        "<p style='color:#475569;'>Team — here's this week's scoreboard. "
+        "Great effort from everyone on the list.</p>"
         + overview
         + anchor_note
-        + f"<h3 style='margin:14px 0 8px 0;'>Week of {week_start.isoformat()} \u2192 {week_end.isoformat()}</h3>"
+        + shoutout_weekly_html
+        + shoutout_ytd_html
+        + f"<h3 style='margin:18px 0 8px 0;font-size:14px;'>"
+          f"Leaderboard — {week_kind}: {wk_start.isoformat()} → {wk_end.isoformat()}</h3>"
         + "<table cellpadding='0' cellspacing='0' "
           "style='border-collapse:collapse;width:100%;font-size:13px;"
           "border:1px solid #E2E8F0;border-radius:6px;overflow:hidden;'>"
         + "<thead><tr style='background:#0F172A;color:#F8FAFC;'>"
           "<th style='padding:8px 10px;text-align:left;'>#</th>"
           "<th style='padding:8px 10px;text-align:left;'>Rep</th>"
-          "<th style='padding:8px 10px;text-align:right;'>Last week</th>"
-          "<th style='padding:8px 10px;text-align:right;'>Week to date</th>"
+          f"<th style='padding:8px 10px;text-align:right;'>Weekly Sales</th>"
+          f"<th style='padding:8px 10px;text-align:right;'>Fiscal YTD Avg/Wk</th>"
+          f"<th style='padding:8px 10px;text-align:right;'>Prev FY YTD Avg/Wk</th>"
           "</tr></thead>"
-        + "<tbody>" + table_rows + "</tbody></table>"
-        + f"<p style='color:#475569;font-size:12px;margin-top:14px;'>"
-          f"Week to date covers {cur_start.isoformat()} \u2192 {cur_end.isoformat()}.</p>"
-        + "<p style='color:#64748B;font-size:11px;margin-top:6px;'>"
-          "Generated by Sales Assistant. Numbers are invoiced (shipped/billed) "
-          "lines from the warehouse \u2014 open orders are not included.</p>"
+        + "<tbody>" + table_body + "</tbody></table>"
+        + f"<p style='color:#475569;font-size:12px;margin-top:10px;'>"
+          f"YTD averages use {period_label}. "
+          f"Reps with $0 in both YTD columns are excluded.</p>"
+        + "<p style='color:#64748B;font-size:11px;margin-top:4px;'>"
+          "Numbers are invoiced lines from the warehouse — open orders are not included.</p>"
     )
+
+    # ---- plain text for clipboard -----------------------------------------
+    col_w = (3, 24, 14, 18, 18)  # column widths: #, rep, weekly, ytd, prior ytd
+    sep = "  "
+
+    def _row(rank: str, name: str, wk: str, ytd: str, prior: str) -> str:
+        return (
+            rank.rjust(col_w[0]) + sep
+            + name.ljust(col_w[1]) + sep
+            + wk.rjust(col_w[2]) + sep
+            + ytd.rjust(col_w[3]) + sep
+            + prior.rjust(col_w[4])
+        )
+
+    divider = "-" * (sum(col_w) + len(sep) * 4)
+    plain_lines: list[str] = [
+        f"TEAM LEADERBOARD — {week_kind.upper()}",
+        f"Week: {wk_start.isoformat()} → {wk_end.isoformat()}",
+        f"YTD period: {period_label}",
+        "",
+        _row("#", "Rep", "Weekly Sales", "Fiscal YTD Avg", "Prev FY YTD Avg"),
+        divider,
+    ]
+    for i, (rep, _) in enumerate(leaderboard, 1):
+        weekly = per_rep_weekly.get(rep, 0.0)
+        ytd = per_rep_ytd_avg.get(rep, 0.0)
+        prior = per_rep_prior_ytd_avg.get(rep, 0.0)
+        plain_lines.append(_row(
+            str(i),
+            rep[:col_w[1]],
+            f"${weekly:,.0f}" if weekly > 0 else "—",
+            f"${ytd:,.0f}",
+            f"${prior:,.0f}" if prior > 0 else "—",
+        ))
+    plain_lines += [
+        divider,
+        _row("", "TOTAL",
+             f"${total_weekly:,.0f}",
+             f"${total_ytd_avg:,.0f}",
+             f"${total_prior_ytd_avg:,.0f}" if total_prior_ytd_avg > 0 else "—"),
+        "",
+    ]
+
+    if top3_weekly:
+        plain_lines.append("⭐ TOP 3 THIS WEEK")
+        for i, (rep, rev) in enumerate(top3_weekly):
+            txt = shoutouts_weekly.get(rep, "")
+            plain_lines.append(f"  {medals[i]} {rep} — ${rev:,.0f}{(': ' + txt) if txt else ''}")
+        plain_lines.append("")
+
+    if top3_ytd_improvement:
+        plain_lines.append("📈 MOST IMPROVED vs PRIOR FY YTD (Avg/Week)")
+        for i, (rep, delta) in enumerate(top3_ytd_improvement):
+            txt = shoutouts_ytd.get(rep, "")
+            plain_lines.append(f"  {medals[i]} {rep} — +${delta:,.0f}/wk{(': ' + txt) if txt else ''}")
+        plain_lines.append("")
+
+    plain_text = "\n".join(plain_lines)
+    return html, plain_text
 
 
 # ============================================================ AI prompts

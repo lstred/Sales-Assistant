@@ -287,7 +287,23 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
-- **2026-05-17 (latest)** — Per-page filter defaults + relative date options:
+- **2026-05-17 (latest)** — Master leaderboard overhaul:
+  - **Three columns** — "Weekly Sales", "Fiscal YTD Avg/Wk", "Prev FY YTD Avg/Wk" (replaces old "Last week" + "Week to date").
+  - **Weekly column logic** — if today is Friday (4) or Saturday (5): use the current in-progress week; Monday–Thursday: use the last full week (Sun–Sat). Anchored to `_anchor_date()` as before.
+  - **Fiscal YTD Avg/Wk** — total revenue for the rep in `_df` divided by `weeks_elapsed = max(1.0, (fb_end - fb_start).days / 7)` where `fb_start, fb_end = filter_bar.date_range()`.
+  - **Prev FY YTD Avg/Wk** — same calculation against `_prior_df` for `(fb_start.year-1, fb_end.year-1)`.
+  - **Exclusion rule** — reps where BOTH ytd avg ≤ 0 AND prior ytd avg ≤ 0 are omitted from the table.
+  - **Totals row** at the bottom of the table for all three numeric columns.
+  - **Shoutout sections** (before the table):
+    - "⭐ Top 3 This Week" — top 3 by weekly revenue, AI-generated (or fallback) one-liner each.
+    - "📈 Most Improved vs Prior FY YTD (Avg/Week)" — top 3 by (current_ytd_avg − prior_ytd_avg), AI-generated (or fallback) one-liner each.
+  - **`_ai_shoutouts` rewritten** — now accepts `category="weekly_top"|"ytd_improvement"` and optional `ytd_avg`/`prior_ytd_avg` dicts for context. Returns `dict[str, str]` (rep name → shout-out sentence).
+  - **`_render_master_html` now returns `(html, plain_text)`** — plain text is a formatted ASCII table plus shoutout sections, ready to paste into an email.
+  - **"📋 Copy leaderboard" button** added to actions row. Enabled only when master leaderboard is selected; copies `plain_text` from the draft dict to the clipboard. Shows "✓ Copied!" for 2 seconds then resets.
+  - **`_show_selected`** updated to enable/disable the copy button based on whether the master leaderboard item is selected.
+  - **22/22 tests pass.**
+
+- **2026-05-17** — Per-page filter defaults + relative date options:
   - **`PageFilterDefault` model** added to `AppConfig` in `app/config/models.py`:
     `start_relative`, `end_relative` (relative-date tokens), `start_iso`, `end_iso` (ISO fallbacks), `cost_centers`, `vs_prior_year`. Persisted under `page_defaults: dict[str, PageFilterDefault]` keyed by page_id.
   - **`SalesFilterBar` new `page_id` param**: When provided, a "⭐ Save as default" button appears. Clicking it persists the current filter state (relative tokens when applicable, ISO dates otherwise) via `save_config(cfg)`. A confirmation label shows the saved range.
