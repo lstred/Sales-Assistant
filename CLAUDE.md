@@ -287,7 +287,16 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
-- **2026-05-17 (latest)** — Email sending, structured leaderboard, budget persistence:
+- **2026-05-17 (latest)** — Leaderboard exclusions, HTML clipboard, email send, shoutout polish:
+  - **`_EXCLUDED_REPS` constant**: `frozenset({"", "house account"})` — blank rep names and HOUSE ACCOUNT are excluded from `active_reps` before the leaderboard is built, so they never appear in the standings table, shoutout sections, or improvement calculations.
+  - **"Copy leaderboard" now copies rich HTML** via `QMimeData.setHtml()`. Outlook and Gmail accept `text/html` clipboard data and render the table with proper proportional-font alignment — no more misaligned columns. Plain text is still set as a fallback via `QMimeData.setText()`.
+  - **"📧 Email leaderboard" button** added to the actions row (enabled only when master leaderboard is selected). Opens a `QInputDialog` asking for a To: address, then sends the leaderboard HTML directly via `EmailClient.send()`. Requires SMTP to be configured and `enable_outbound_send = True`.
+  - **Shoutout prompts cleaned up**: Percentages removed from AI shoutout context (`l3mo %` removed from weekly bullets; `%` strings forbidden in sys_msg). Prompts now instruct the AI to mention account names and dollar amounts. "Most Improved" fallback text says "building solid momentum" without a % sign.
+  - **Inline `from PySide6.QtCore import QTimer`** removed from `_copy_leaderboard` (was orphaned; `QTimer` now imported at module top).
+  - **`QTimer` and `QMimeData` added to top-level imports**; `QInputDialog` and `QLineEdit` added for the email dialog.
+  - **26/26 tests pass.**
+
+- **2026-05-17** — Email sending, structured leaderboard, budget persistence:
   - **Send Review dialog** — `_queue()` now opens `_SendReviewDialog` instead of a static summary. The dialog shows all drafts in a scrollable checklist (pre-checked for reps with email addresses on file), with a live preview panel on the right. Supports Select All / Deselect All. "Send Selected (N)" button dispatches via `EmailClient.send()` in a background `_SendWorker` QThread. Per-row status shows ✓ Sent or ✗ Failed (with error tooltip). Works for per-rep drafts and the master leaderboard item. Disabled (amber warning) if SMTP is not configured or `enable_outbound_send` is False.
   - **Leaderboard clipboard format redesigned**: Shoutout sections now each use a mini-table (rank | rep | sales, then quotes on wrapped indented lines below). "Most Improved" section shows a three-column mini-table (Now/Wk | Prev/Wk | +/-/Wk). Main standings table uses dynamic column widths, `═` heavy rules for section headers, `─` light rule below header row. All sections clearly delineated. Renders cleanly when pasted into Outlook/Gmail with proportional fonts.
   - **Budget upload persistence** — `BudgetConfig.rep_cc_growth_pct_saved` field added (JSON-serializable nested dict: rep_number → cc → pct). When a CSV/Excel upload is applied in the budget settings panel, overrides are saved to `config.json` via `save_config()`. On next launch, `_SettingsPanel._load_saved_overrides()` restores them automatically — no re-upload needed.

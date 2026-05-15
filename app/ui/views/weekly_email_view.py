@@ -33,7 +33,7 @@ from datetime import date, timedelta
 from typing import Callable
 
 import pandas as pd
-from PySide6.QtCore import QThread, Qt, Signal
+from PySide6.QtCore import QMimeData, QThread, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -41,7 +41,9 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -84,6 +86,9 @@ from app.ui.widgets.sales_filter_bar import SalesFilterBar
 log = logging.getLogger(__name__)
 
 MASTER_KEY = "__MASTER__"
+
+# Rep names (lower-cased) that should never appear in the leaderboard or shoutouts.
+_EXCLUDED_REPS: frozenset[str] = frozenset({"", "house account"})
 
 
 # ============================================================ background work
@@ -490,9 +495,14 @@ class WeeklyEmailView(QWidget):
         actions.addWidget(self.master_btn)
         self.copy_btn = QPushButton("📋 Copy leaderboard")
         self.copy_btn.setEnabled(False)
-        self.copy_btn.setToolTip("Copy leaderboard as plain text — paste directly into an email")
+        self.copy_btn.setToolTip("Copy leaderboard as rich HTML — paste directly into Outlook or Gmail")
         self.copy_btn.clicked.connect(self._copy_leaderboard)
         actions.addWidget(self.copy_btn)
+        self.email_lb_btn = QPushButton("📧 Email leaderboard")
+        self.email_lb_btn.setEnabled(False)
+        self.email_lb_btn.setToolTip("Send the leaderboard email via SMTP")
+        self.email_lb_btn.clicked.connect(self._email_leaderboard)
+        actions.addWidget(self.email_lb_btn)
         self.queue_btn = QPushButton("Queue for review")
         self.queue_btn.setEnabled(False)
         self.queue_btn.clicked.connect(self._queue)
@@ -796,11 +806,13 @@ class WeeklyEmailView(QWidget):
                 rep: rev / weeks_elapsed for rep, rev in per_rep_prior_ytd_rev.items()
             }
 
-        # All reps that appear in any column — exclude where both YTD avgs ≤ 0.
+        # All reps that appear in any column — exclude where both YTD avgs ≤ 0
+        # and strip reps with blank names or excluded entries (e.g. HOUSE ACCOUNT).
         all_reps = set(per_rep_weekly) | set(per_rep_ytd_avg) | set(per_rep_prior_ytd_avg)
         active_reps = {
             rep for rep in all_reps
-            if per_rep_ytd_avg.get(rep, 0.0) > 0 or per_rep_prior_ytd_avg.get(rep, 0.0) > 0
+            if rep.strip().lower() not in _EXCLUDED_REPS
+            and (per_rep_ytd_avg.get(rep, 0.0) > 0 or per_rep_prior_ytd_avg.get(rep, 0.0) > 0)
         }
 
         # Leaderboard sorted by weekly revenue descending.
@@ -862,7 +874,7 @@ class WeeklyEmailView(QWidget):
             shoutouts_imp = {
                 rep: (
                     f"Up ${imp_cur_avg.get(rep, 0) - imp_prior_avg.get(rep, 0):,.0f}/wk "
-                    f"vs prior year — solid upward trend."
+                    f"vs prior year \u2014 building solid momentum."
                 )
                 for rep, _ in top3_improvement
             }
@@ -943,24 +955,28 @@ class WeeklyEmailView(QWidget):
         if category == "weekly_top":
             sys_msg = (
                 "You are a sales manager writing a one-line, upbeat public shout-out "
-                "for each top weekly seller on the team leaderboard. Be specific and "
-                "energetic. ONE sentence per rep. Format: REP_NAME: shout-out"
+                "for each top weekly seller on the team leaderboard. Be specific — "
+                "mention dollar amounts and account names where available. "
+                "Do NOT use any percentages or percentage signs. "
+                "ONE sentence per rep. Format: REP_NAME: shout-out"
             )
             bullets = []
             for rep, rev in entries:
                 sc = self._scorecards.get(rep)
-                l3 = (
-                    f"3mo trend={sc.last_3mo_vs_prior_3mo_pct:+.1f}%"
-                    if sc and sc.last_3mo_vs_prior_3mo_pct is not None else ""
-                )
                 top = (
                     format_account_label(sc.top_growing_accounts[0])
                     if sc and sc.top_growing_accounts else ""
                 )
-                extras = "  ".join(filter(None, [l3, f"top account: {top}" if top else ""]))
-                bullets.append(f"- {rep}: ${rev:,.0f} this week  {extras}")
+                new_acct = (
+                    format_account_label(sc.new_accounts[0])
+                    if sc and sc.new_accounts else ""
+                )
+                context = "  ".join(filter(None, [
+                    f"top growing account: {top}" if top else "",
+                    f"new account win: {new_acct}" if new_acct else "",
+                ]))
+                bullets.append(f"- {rep}: ${rev:,.0f} this week  {context}")
         else:
-            # Improvement category: month_end / quarter_end / ytd_avg / mtd_avg
             mode_desc = {
                 "month_end":   "the just-completed fiscal month vs the same month last year",
                 "quarter_end": "the just-completed fiscal quarter vs the same quarter last year",
@@ -970,17 +986,24 @@ class WeeklyEmailView(QWidget):
             sys_msg = (
                 f"You are a sales manager publicly recognizing team members who are "
                 f"leading in improvement for {mode_desc}. "
-                f"Write ONE upbeat, specific sentence per rep that calls out their "
-                f"momentum. Mention the dollar improvement where possible. "
+                f"Write ONE upbeat, specific sentence per rep that highlights their "
+                f"momentum — mention account names and dollar growth where available. "
+                f"Do NOT use any percentages or percentage signs. "
                 f"Format: REP_NAME: shout-out  (one line per rep)"
             )
             bullets = []
             for rep, delta in entries:
                 c = _cur.get(rep, 0.0)
                 p = _prior.get(rep, 0.0)
+                sc = self._scorecards.get(rep)
+                top = (
+                    format_account_label(sc.top_growing_accounts[0])
+                    if sc and sc.top_growing_accounts else ""
+                )
                 bullets.append(
                     f"- {rep}: ${c:,.0f}/wk now vs ${p:,.0f}/wk last year "
                     f"(+${delta:,.0f}/wk improvement)"
+                    + (f" — driven in large part by {top}" if top else "")
                 )
 
         user_msg = "Team members:\n" + "\n".join(bullets)
@@ -1075,7 +1098,8 @@ class WeeklyEmailView(QWidget):
         if not d:
             return
         is_master = (key == MASTER_KEY)
-        self.copy_btn.setEnabled(is_master and bool(d.get("plain_text")))
+        self.copy_btn.setEnabled(is_master and bool(d.get("body_html")))
+        self.email_lb_btn.setEnabled(is_master and bool(d.get("body_html")))
         no_email = d['to'] or "(no email on file \u2014 set in Sales Reps)"
         header = (
             f"<div style='color:{TEXT_MUTED};font-size:12px;margin-bottom:8px;'>"
@@ -1086,22 +1110,83 @@ class WeeklyEmailView(QWidget):
         self.preview.setHtml(header + d["body_html"])
 
     def _copy_leaderboard(self) -> None:
+        """Copy the leaderboard as rich HTML to the clipboard.
+
+        Outlook and Gmail both accept ``text/html`` clipboard data and will
+        render the table just like they would from an email, so column
+        alignment is preserved without relying on monospace fonts.
+        """
         items = self.list.selectedItems()
         if not items:
             return
         key = items[0].data(Qt.ItemDataRole.UserRole)
         d = self._drafts.get(key)
-        if not d or not d.get("plain_text"):
+        if not d or not d.get("body_html"):
             return
-        QApplication.clipboard().setText(d["plain_text"])
+        html_body = d["body_html"]
+        # Wrap in a complete HTML document so clipboard consumers can render it.
+        full_html = (
+            "<!DOCTYPE html><html><head>"
+            "<meta charset='utf-8'>"
+            "<style>body{font-family:Calibri,Arial,sans-serif;font-size:14px;}"
+            "table{border-collapse:collapse;}"
+            "td,th{padding:6px 12px;}"
+            "</style></head><body>"
+            + html_body
+            + "</body></html>"
+        )
+        mime = QMimeData()
+        mime.setHtml(full_html)
+        mime.setText(d.get("plain_text", ""))
+        QApplication.clipboard().setMimeData(mime)
         orig = self.copy_btn.text()
         self.copy_btn.setText("✓ Copied!")
         self.copy_btn.setEnabled(False)
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(2000, lambda: (
             self.copy_btn.setText(orig),
             self.copy_btn.setEnabled(True),
         ))
+
+    def _email_leaderboard(self) -> None:
+        """Prompt for a recipient address and send the leaderboard via SMTP."""
+        items = self.list.selectedItems()
+        if not items:
+            return
+        key = items[0].data(Qt.ItemDataRole.UserRole)
+        d = self._drafts.get(key)
+        if not d or not d.get("body_html"):
+            return
+
+        if not self._cfg.email.enable_outbound_send or not self._cfg.email.smtp_host:
+            QMessageBox.warning(
+                self, "Email not configured",
+                "Outbound sending is disabled or SMTP is not configured.\n"
+                "Enable it in Settings → Email.",
+            )
+            return
+
+        addr, ok = QInputDialog.getText(
+            self, "Email leaderboard",
+            "Send leaderboard to:",
+            QLineEdit.EchoMode.Normal,
+            self._cfg.email.smtp_from_address,
+        )
+        if not ok or not addr.strip():
+            return
+        addr = addr.strip()
+
+        client = EmailClient(self._cfg.email)
+        result = client.send(
+            to_address=addr,
+            subject=d.get("subject", "Team leaderboard"),
+            body_text="",
+            body_html=d["body_html"],
+        )
+        if result.ok:
+            QMessageBox.information(self, "Sent", f"Leaderboard sent to {addr}.")
+        else:
+            QMessageBox.critical(self, "Send failed", result.error)
+
 
     def _queue(self) -> None:
         if not self._drafts:
