@@ -287,7 +287,17 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
-- **2026-05-16 (latest)** — Weekly email: new 5-section AI prompt structure; account name enforcement; fallback body rewrite:
+- **2026-05-16 (latest)** — Ask AI deep-dive quality + weekly email period clarity:
+  - **Ask AI output token limit raised**: `_AskWorker` now uses `max(4096, cfg.ai.max_output_tokens)` for Ask AI requests. Weekly email drafts continue using the config value. `_AI_CHAT_MIN_OUTPUT_TOKENS = 4096` constant.
+  - **SYSTEM_PROMPT rewritten** for highest-quality analysis: explicit rules to weight toward large sample sizes (not one-off outliers), require time periods on ALL sales figures (`'$25,239 (Feb–Apr 2025) → $12,548 (Feb–Apr 2026)'`), use account names + bank numbers (`ABC FLOORING (#50342)`), use price class descriptions not codes, lead with highest-impact findings, find correlations, no fluff.
+  - **Account names in aggregates**: `_format_aggregates` now accepts `acct_lookup: dict[str, dict]`. Loaded lazily in `_ask()` via `load_rep_assignments`. `by_account` table now shows `Account Name (#old) [new_acct]` labels.
+  - **Price class descriptions in CSV**: `_ask()` adds a `price_class_desc` column to the enriched DataFrame copy sent to the AI. Also includes a `PRICE CLASS REFERENCE` section (code → description) in the user_msg.
+  - **Account info + price class lookup cached** on `AIChatView` (`self._pc_lookup`, `self._acct_lookup`) — loaded once on first ask, reused thereafter.
+  - **`get_db` stored on AIChatView** (`self._get_db`) so lookups can be loaded on demand.
+  - **Weekly email sys_msg**: added explicit rule: "When citing a sales figure for an account, ALWAYS show BOTH periods: '$25,239 (Feb–Apr 2025) → $12,548 (Feb–Apr 2026)'. Never mention just one dollar amount without its time period." Also added: "Use PRODUCT DESCRIPTIONS (e.g. 'Carpet Residential') NOT 6-character price class codes."
+  - **22/22 tests pass.**
+
+- **2026-05-16** — Weekly email: new 5-section AI prompt structure; account name enforcement; fallback body rewrite:
   - **`_build_rep_prompt` sys_msg completely rewritten** with a new 5-section structure that replaces the old HIGHLIGHT/LOWLIGHT format:
     1. **QUICK SCOREBOARD** (3–5 short bullets): weekly sales vs prior week, period YoY, top product line, ranking movement.
     2. **BIGGEST WIN** (2–3 sentences): one specific success story with account name + number and a dollar figure or trend.

@@ -39,6 +39,7 @@ from app.ai.base import ChatMessage
 from app.ai.factory import build_provider
 from app.ai.token_estimator import estimate_df_tokens, estimate_text_tokens
 from app.config.models import AppConfig, DatabaseConfig
+from app.data.loaders import load_price_class_lookup, load_rep_assignments
 from app.services.manager_analytics import aggregate_for_ai
 from app.storage.repos import (
     AIAnalysis,
@@ -55,32 +56,57 @@ from app.ui.widgets.cards import KpiCard
 from app.ui.widgets.sales_filter_bar import SalesFilterBar
 
 
-SYSTEM_PROMPT = (
-    "You are an analytical assistant for a sales manager at a flooring "
-    "distributor. Be BLUNT and DIRECT. The manager wants to know what's "
-    "working and what isn't, who is performing well and who isn't, what's "
-    "good and what's bad — don't soften the truth or hedge unnecessarily. "
-    "Call out underperformers by name. Highlight winners by name. Say clearly "
-    "when a trend is bad, not just 'there is room for improvement'.\n\n"
-    "The user message contains: (1) PRE-AGGREGATED TABLES computed from the "
-    "FULL filtered dataset (totals, by-rep, by-cost-center, by-account, "
-    "by-fiscal-period) — use these as ground truth for any ranking, totals, "
-    "or comparison questions. (2) A FULL CSV of all individual invoiced lines "
-    "for row-level detail queries. ALWAYS prefer the aggregate tables for "
-    "ranking/totals; use the CSV for line-level specifics. Answer concisely, "
-    "citing exact numbers. If the data does not support the answer, say so "
-    "explicitly. Format dollar amounts with $ and thousands separators. When "
-    "listing reps, use the salesperson_desc field."
-)
+SYSTEM_PROMPT = """\
+You are an analytical assistant for a sales manager at a flooring distributor.
+Your role is to deliver the HIGHEST LEVEL of analysis the data supports — not a summary, not a surface read.
+The manager is looking for deep dives, meaningful correlations, and the highest-impact items to act on.
+
+BE BLUNT AND DIRECT. Call out underperformers by name. Name winners specifically. When a trend is bad, say it's bad.
+Do not soften, hedge, or add corporate filler. No opening pleasantries, no closing remarks.
+Every sentence must either surface an insight, flag a risk, or recommend an action.
+
+DATA SOURCES (trust in this order):
+1. PRE-AGGREGATED TABLES — ground truth for all rankings, totals, and comparisons.
+2. FULL CSV — use for line-level detail, account-specific trends, or correlation analysis.
+Always prefer aggregates for summary questions; use CSV for granular lookups.
+
+ANALYSIS QUALITY RULES:
+- Weight your analysis toward LARGE SAMPLE SIZES. A rep with 2 accounts at +40% is not a top performer.
+  A rep with 50 accounts at +15% across multiple cost centers is a real signal. Distinguish outliers from trends.
+- When you find correlations (e.g. display placements → higher volume), quantify them if the data supports it.
+- Don't report what the manager can read from the table — tell them what the table means.
+- Flag the SINGLE most actionable insight or area of concern prominently. Lead with highest-impact findings.
+- If a number looks anomalous (e.g. one account driving 60% of a rep's YoY swing), call it out and discount it.
+
+FORMATTING RULES — follow these strictly:
+- ALWAYS include the time period with every sales figure.
+  Say: '$25,239 (Feb–Apr 2025) → $12,548 (Feb–Apr 2026)' — NEVER just '$12,548' without a date range.
+- ALWAYS pair account numbers with their name: 'ABC FLOORING (#50342)' or '#50342 · ABC FLOORING'.
+  Never cite a bare account number alone.
+- ALWAYS use price class/product descriptions, NOT 6-character price class codes.
+  Say 'Carpet Residential' not 'CPTRES'. The PRICE CLASS REFERENCE in the data block maps codes → names.
+- Format all dollar amounts with $ and thousands separators: $25,239.
+- Use GP% for profitability (gross profit as % of revenue).
+- When listing reps, use the name from the data; when listing accounts, use name + number.
+"""
+
+
+# Higher default output limit for the Ask AI view — the manager expects deep analysis,
+# not truncated responses. Use at least 4096 tokens; honour any higher config value.
+_AI_CHAT_MIN_OUTPUT_TOKENS = 4096
 
 
 class _AskWorker(QThread):
     answered = Signal(str, dict)
     failed = Signal(str)
 
-    def __init__(self, cfg: AppConfig, system: str, user: str) -> None:
+    def __init__(self, cfg: AppConfig, system: str, user: str,
+                 max_output_tokens: int | None = None) -> None:
         super().__init__()
         self._cfg, self._system, self._user = cfg, system, user
+        self._max_tokens = max_output_tokens or max(
+            _AI_CHAT_MIN_OUTPUT_TOKENS, cfg.ai.max_output_tokens
+        )
 
     def run(self) -> None:
         try:
@@ -89,7 +115,7 @@ class _AskWorker(QThread):
                 [ChatMessage("system", self._system),
                  ChatMessage("user", self._user)],
                 model=self._cfg.ai.model,
-                max_output_tokens=self._cfg.ai.max_output_tokens,
+                max_output_tokens=self._max_tokens,
                 temperature=self._cfg.ai.temperature,
                 timeout_seconds=self._cfg.ai.request_timeout_seconds,
             )
@@ -102,8 +128,12 @@ class AIChatView(QWidget):
     def __init__(self, cfg: AppConfig, get_db: Callable[[], DatabaseConfig], parent=None) -> None:
         super().__init__(parent)
         self._cfg = cfg
+        self._get_db = get_db
         self._df: pd.DataFrame | None = None
         self._workers: list[_AskWorker] = []
+        # Enrichment lookups loaded lazily when first ask is made
+        self._pc_lookup: dict[str, str] = {}   # price_class_code -> description
+        self._acct_lookup: dict[str, dict] = {}  # account_number -> {name, old}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -266,16 +296,47 @@ class AIChatView(QWidget):
             self.status.setText("Type a question first.")
             return
 
+        # --- Lazy-load enrichment lookups (fast queries, done once per session) ---
+        if not self._pc_lookup:
+            try:
+                self._pc_lookup = load_price_class_lookup(self._get_db())
+            except Exception:  # noqa: BLE001
+                pass
+        if not self._acct_lookup:
+            try:
+                adf = load_rep_assignments(self._get_db())
+                if adf is not None and not adf.empty:
+                    for row in adf[["account_number", "account_name", "old_account_number"]].drop_duplicates(
+                        subset=["account_number"]
+                    ).itertuples(index=False):
+                        acct = str(row.account_number).strip()
+                        name = str(row.account_name or "").strip().lstrip("*").strip()
+                        old = str(row.old_account_number or "").strip()
+                        if acct:
+                            self._acct_lookup[acct] = {"name": name, "old": old}
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Enrich the DataFrame copy: add price_class_desc so the CSV sent to
+        # the AI uses descriptions, not 6-char codes.
+        df_enriched = self._df.copy()
+        if self._pc_lookup and "price_class" in df_enriched.columns:
+            df_enriched["price_class_desc"] = (
+                df_enriched["price_class"].astype(str).map(
+                    lambda c: self._pc_lookup.get(c.strip(), c)
+                )
+            )
+
         # Full dataset — no row cap. The aggregate tables handle large datasets
         # efficiently; the raw CSV is also sent in full so the AI can answer
         # line-level questions without losing data.
         buf = io.StringIO()
-        self._df.to_csv(buf, index=False)
+        df_enriched.to_csv(buf, index=False)
         csv_text = buf.getvalue()
 
         # Pre-aggregate the FULL filtered dataset (ground truth for rankings).
         agg = aggregate_for_ai(self._df)
-        agg_text = _format_aggregates(agg)
+        agg_text = _format_aggregates(agg, acct_lookup=self._acct_lookup)
 
         s, e = self.filter_bar.date_range()
         ccs = self.filter_bar.selected_codes() or ["ALL"]
@@ -319,15 +380,25 @@ class AIChatView(QWidget):
                 f"{', '.join(related_displays)}\n"
             )
 
+        # Build price class reference table so AI can resolve codes → descriptions.
+        pc_ref = ""
+        if self._pc_lookup:
+            pc_ref = "\nPRICE CLASS REFERENCE (code → description):\n"
+            pc_ref += "\n".join(
+                f"  {code}: {desc}" for code, desc in sorted(self._pc_lookup.items())
+            ) + "\n"
+
         user_msg = (
             f"Date range (invoice date): {s.isoformat()} to {e.isoformat()}\n"
             f"Cost centers in scope: {', '.join(ccs)}\n"
             f"{scope_extra}"
-            f"Total rows: {len(self._df):,} (full dataset — no truncation).\n\n"
+            f"Total rows: {len(df_enriched):,} (full dataset — no truncation).\n\n"
             f"PRE-AGGREGATED TABLES (full dataset \u2014 use these for ranking "
             f"and totals):\n{agg_text}\n"
+            f"{pc_ref}"
             f"Question: {question}\n\n"
-            f"FULL INVOICED LINES (CSV \u2014 all {len(self._df):,} rows):\n{csv_text}"
+            f"FULL INVOICED LINES (CSV \u2014 all {len(df_enriched):,} rows, "
+            f"price_class_desc column added for readability):\n{csv_text}"
         )
 
         self.transcript.append(
@@ -489,8 +560,16 @@ class AIChatView(QWidget):
 
 
 # --------------------------------------------------------------- helpers
-def _format_aggregates(agg: dict) -> str:
-    """Render the aggregate_for_ai() output as compact text tables."""
+def _format_aggregates(
+    agg: dict,
+    *,
+    acct_lookup: dict[str, dict] | None = None,
+) -> str:
+    """Render the aggregate_for_ai() output as compact text tables.
+
+    ``acct_lookup`` maps account_number -> {name, old} so the by_account
+    section shows human-readable labels instead of bare account numbers.
+    """
     lines: list[str] = []
     by_rep = agg.get("by_rep") or []
     by_cc = agg.get("by_cc") or []
@@ -531,10 +610,21 @@ def _format_aggregates(agg: dict) -> str:
                 f"accts {int(r.get('accounts',0)):>4}"
             )
     if by_account:
-        lines.append("\nTOP ACCOUNTS (by revenue, up to 100):")
-        for r in by_account[:100]:
+        lines.append("\nTOP ACCOUNTS (by revenue, up to 200):")
+        for r in by_account[:200]:
+            acct_num = str(r.get("account_number", ""))
+            info = (acct_lookup or {}).get(acct_num, {})
+            name = info.get("name", "")
+            old = info.get("old", "")
+            # Build label: "Account Name (#old) [new_acct]" or just account_number
+            if name and old and old != acct_num:
+                label = f"{name} (#{old}) [{acct_num}]"
+            elif name:
+                label = f"{name} [{acct_num}]"
+            else:
+                label = acct_num
             lines.append(
-                f"  {str(r.get('account_number','')):<14}  "
+                f"  {label:<55}  "
                 f"${float(r.get('revenue',0)):>14,.0f}  "
                 f"gp ${float(r.get('gross_profit',0)):>12,.0f}  "
                 f"lines {int(r.get('lines',0)):>5}"
