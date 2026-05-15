@@ -287,6 +287,18 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
+- **2026-05-17 (latest)** — Per-page filter defaults + relative date options:
+  - **`PageFilterDefault` model** added to `AppConfig` in `app/config/models.py`:
+    `start_relative`, `end_relative` (relative-date tokens), `start_iso`, `end_iso` (ISO fallbacks), `cost_centers`, `vs_prior_year`. Persisted under `page_defaults: dict[str, PageFilterDefault]` keyed by page_id.
+  - **`SalesFilterBar` new `page_id` param**: When provided, a "⭐ Save as default" button appears. Clicking it persists the current filter state (relative tokens when applicable, ISO dates otherwise) via `save_config(cfg)`. A confirmation label shows the saved range.
+  - **Relative date picker (▾ button)** added next to each `QDateEdit`. Clicking shows a `QMenu` with 11 practical options: Today, Yesterday, 1 week ago, Start of this month, 1 month/3 months/6 months ago, Start of calendar year, Start of fiscal year, Start/End of last full fiscal month.
+  - **`resolve_relative_date(token, six_week_january_years) → date`** module-level helper in `sales_filter_bar.py`. Tokens re-evaluate fresh on every app load so "yesterday" always means yesterday.
+  - **Auto-load on init**: If `page_id` is set and a `PageFilterDefault` exists in config, it is applied immediately after widgets are built — resolving relative tokens fresh.
+  - **`_run()` re-resolves** any active relative tokens each time Run fires.
+  - **Presets and `apply_filters()`** clear relative tokens (they set absolute dates).
+  - **`page_id` wired in all 4 views**: `ask_ai`, `sales_by_cc`, `sales_by_rep`, `weekly_email`.
+  - **22/22 tests pass.**
+
 - **2026-05-16 (latest)** — Ask AI deep-dive quality + weekly email period clarity:
   - **Ask AI output token limit raised**: `_AskWorker` now uses `max(4096, cfg.ai.max_output_tokens)` for Ask AI requests. Weekly email drafts continue using the config value. `_AI_CHAT_MIN_OUTPUT_TOKENS = 4096` constant.
   - **SYSTEM_PROMPT rewritten** for highest-quality analysis: explicit rules to weight toward large sample sizes (not one-off outliers), require time periods on ALL sales figures (`'$25,239 (Feb–Apr 2025) → $12,548 (Feb–Apr 2026)'`), use account names + bank numbers (`ABC FLOORING (#50342)`), use price class descriptions not codes, lead with highest-impact findings, find correlations, no fluff.
