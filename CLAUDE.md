@@ -288,9 +288,10 @@ Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
 - **2026-05-17 (latest)** — Leaderboard exclusions, HTML clipboard, email send, shoutout polish:
-  - **`_EXCLUDED_REPS` constant**: `frozenset({"", "house account"})` — blank rep names and HOUSE ACCOUNT are excluded from `active_reps` before the leaderboard is built, so they never appear in the standings table, shoutout sections, or improvement calculations.
+  - **`_EXCLUDED_REPS` constant**: `frozenset({"", "house account", "(legacy / pre-aug 2025)"})` — blank rep names, HOUSE ACCOUNT, and the legacy pre-Aug-2025 synthetic rep are excluded from `active_reps` before the leaderboard is built, so they never appear in the standings table, shoutout sections, or improvement calculations.
   - **"Copy leaderboard" now copies rich HTML** via `QMimeData.setHtml()`. Outlook and Gmail accept `text/html` clipboard data and render the table with proper proportional-font alignment — no more misaligned columns. Plain text is still set as a fallback via `QMimeData.setText()`.
   - **"📧 Email leaderboard" button** added to the actions row (enabled only when master leaderboard is selected). Opens a `QInputDialog` asking for a To: address, then sends the leaderboard HTML directly via `EmailClient.send()`. Requires SMTP to be configured and `enable_outbound_send = True`.
+  - **Shoutout italic quotes removed**: The italic call-out sentences beneath each rep's sales figures in the HTML shoutout boxes have been removed. Shoutouts now show only the medal + name + value — clean and scannable. Plain-text shoutout blocks similarly have no quote lines.
   - **Shoutout prompts cleaned up**: Percentages removed from AI shoutout context (`l3mo %` removed from weekly bullets; `%` strings forbidden in sys_msg). Prompts now instruct the AI to mention account names and dollar amounts. "Most Improved" fallback text says "building solid momentum" without a % sign.
   - **Inline `from PySide6.QtCore import QTimer`** removed from `_copy_leaderboard` (was orphaned; `QTimer` now imported at module top).
   - **`QTimer` and `QMimeData` added to top-level imports**; `QInputDialog` and `QLineEdit` added for the email dialog.

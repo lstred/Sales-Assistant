@@ -88,7 +88,7 @@ log = logging.getLogger(__name__)
 MASTER_KEY = "__MASTER__"
 
 # Rep names (lower-cased) that should never appear in the leaderboard or shoutouts.
-_EXCLUDED_REPS: frozenset[str] = frozenset({"", "house account"})
+_EXCLUDED_REPS: frozenset[str] = frozenset({"", "house account", "(legacy / pre-aug 2025)"})
 
 
 # ============================================================ background work
@@ -1425,8 +1425,7 @@ def _render_master_html(
             f"<span style='font-size:18px;margin-right:8px;'>{medals[i]}</span>"
             f"<strong>{rep}</strong> "
             f"<span style='color:#475569;'>{value_fmt.format(val)}</span>"
-            f"<br><span style='color:#1E3A5F;margin-left:26px;font-style:italic;'>"
-            f"{texts.get(rep, '')}</span></div>"
+            f"</div>"
             for i, (rep, val) in enumerate(entries)
         )
         return (
@@ -1599,26 +1598,6 @@ def _render_master_html(
                 f"  {medals_txt[i]:>3}  {rep:<{shout_name_w}}  ${rev:>{wk_inner_w-1},.0f}"
             )
         plain_lines.append("")
-        # Quotes below the mini-table
-        for rep, _ in top3_weekly:
-            txt = shoutouts_weekly.get(rep, "")
-            if txt:
-                # Wrap quote to ~80 chars with indent
-                q_indent = " " * (shout_name_w + 8)
-                words = txt.split()
-                line, lines = "", []
-                for w in words:
-                    if len(line) + len(w) + 1 > 76:
-                        lines.append(line)
-                        line = w
-                    else:
-                        line = (line + " " + w).strip()
-                if line:
-                    lines.append(line)
-                plain_lines.append(f"  {rep}:")
-                for ln in lines:
-                    plain_lines.append(f"      {ln}")
-        plain_lines.append("")
 
     if top3_improvement:
         # mini-table for improvement section with Now/Wk | Prev/Wk | +/-/Wk
@@ -1638,23 +1617,6 @@ def _render_master_html(
                 f"  ${prev:>{pi_w-1},.0f}"
                 f"  {sign}${abs(delta):>{di_w-2},.0f}"
             )
-        plain_lines.append("")
-        for rep, _ in top3_improvement:
-            txt = shoutouts_imp.get(rep, "")
-            if txt:
-                words = txt.split()
-                line, lines = "", []
-                for w in words:
-                    if len(line) + len(w) + 1 > 76:
-                        lines.append(line)
-                        line = w
-                    else:
-                        line = (line + " " + w).strip()
-                if line:
-                    lines.append(line)
-                plain_lines.append(f"  {rep}:")
-                for ln in lines:
-                    plain_lines.append(f"      {ln}")
         plain_lines.append("")
 
     # ---- main standings table -------------------------------------------
