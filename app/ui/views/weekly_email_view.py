@@ -617,6 +617,7 @@ class WeeklyEmailView(QWidget):
             core_displays_by_cc=self._cfg.core_displays_by_cc,
             sample_to_product_cc=self._cfg.sample_to_product_cc,
             price_class_lookup=self._price_class_lookup or None,
+            selected_ccs=self.filter_bar.selected_codes() or None,
         )
         s, e = self.filter_bar.date_range()
         try:
@@ -1286,6 +1287,12 @@ def _scorecard_footer_html(sc: RepScorecard) -> str:
     yoy_extra = "  (outlier \u2014 likely territory transfer)" if sc.is_yoy_outlier else ""
     if yoy_extra:
         yoy = yoy + yoy_extra
+    core_display_li = (
+        f"<li>Core-display coverage: <b>{coverage}</b> "
+        f"({sc.accounts_with_core_displays}/{sc.total_accounts})</li>"
+        if sc.core_display_configured
+        else ""
+    )
     return (
         f"<hr style='border:none;border-top:1px solid #E2E8F0;margin:18px 0;'>"
         f"<div style='font-size:12px;color:#334155;'>"
@@ -1296,8 +1303,7 @@ def _scorecard_footer_html(sc: RepScorecard) -> str:
         f"<li>Last 3 months vs prior 3: <b>{last3}</b></li>"
         f"<li>Active accounts: <b>{sc.active_accounts}/{sc.total_accounts}</b> "
         f"({sc.active_account_pct:.0f}%)</li>"
-        f"<li>Core-display coverage: <b>{coverage}</b> "
-        f"({sc.accounts_with_core_displays}/{sc.total_accounts})</li>"
+        f"{core_display_li}"
         f"<li>Samples placed: <b>{sc.sample_lines}</b> ({samples})</li>"
         f"<li>Top growing: {growing}</li>"
         f"<li>Top declining: {declining}</li>"
@@ -1757,8 +1763,13 @@ def _build_rep_prompt(
         "account (name + number) and quantify the gap.\n\n"
         "4. COACHING INSIGHT (1–2 sentences):\n"
         "   The most valuable part. One smart observation about a pattern, behavior, or "
-        "correlation in their data. Examples: 'Your accounts with core displays are buying "
-        "at 2x the rate of those without.' or 'Your top growth accounts this period all share "
+        "correlation in their data. Examples: "
+        + (
+            "'Your accounts with core displays are buying at 2x the rate of those without.' or "
+            if scorecard.core_display_configured
+            else ""
+        )
+        + "'Your top growth accounts this period all share "
         "the same product category — worth expanding that playbook.' Make it feel like "
         "you personally studied their territory.\n\n"
         f"{section5_instruction}\n\n"
@@ -1769,8 +1780,12 @@ def _build_rep_prompt(
         "— skip it otherwise.\n\n"
         "GOOD EXAMPLES:\n"
         "- 'Your sample placements this quarter are converting into stronger repeat orders.'\n"
-        "- 'Accounts with 2+ core displays average significantly higher weekly volume.'\n"
-        "- 'Several dormant accounts still carry strong historical sales potential.'\n\n"
+        + (
+            "- 'Accounts with 2+ core displays average significantly higher weekly volume.'\n"
+            if scorecard.core_display_configured
+            else ""
+        )
+        + "- 'Several dormant accounts still carry strong historical sales potential.'\n\n"
         "BAD EXAMPLES (never write these):\n"
         "- 'Please continue your efforts.'\n"
         "- 'Sales were up 3.2%.'\n"
@@ -1865,9 +1880,13 @@ def _build_rep_prompt(
         f"  gp%={sc.gpp_pct:.1f}, lines={sc.invoice_lines}\n"
         f"  total_accounts={sc.total_accounts}, active={sc.active_accounts} "
         f"({sc.active_account_pct:.0f}%)\n"
-        f"  accounts_with_core_displays={sc.accounts_with_core_displays} "
-        f"({sc.core_display_coverage_pct:.0f}%)\n"
-        f"  sample_lines={sc.sample_lines}, samples_per_account={sc.samples_per_account:.2f}\n"
+        + (
+            f"  accounts_with_core_displays={sc.accounts_with_core_displays} "
+            f"({sc.core_display_coverage_pct:.0f}%)\n"
+            if sc.core_display_configured
+            else ""
+        )
+        + f"  sample_lines={sc.sample_lines}, samples_per_account={sc.samples_per_account:.2f}\n"
         f"  last_3mo=${sc.last_3mo_revenue:,.0f}, prior_3mo=${sc.prior_3mo_revenue:,.0f}, "
         f"vs_prior_3mo={l3}, yoy_3mo={l3y}\n\n"
         f"TOP PRODUCTS BY REVENUE (what this rep is actually selling):\n{pc_lines}\n\n"

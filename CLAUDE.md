@@ -287,6 +287,26 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
+- **2026-05-19 (latest)** — Core display coverage made CC-specific; AI/footer conditional:
+  - **Root cause**: `compute_rep_scorecards` flattened ALL configured core displays from ALL CCs into one `flat_core` set, so choosing CCs 031/032 (which have no core displays configured) still used CC 010's display codes and produced spurious coverage numbers and coaching text.
+  - **`app/services/manager_analytics.py`**:
+    - `RepScorecard` gains `core_display_configured: bool = True` — set to `False` when the selected CCs have no core-display configuration.
+    - `compute_rep_scorecards` gains `selected_ccs: list[str] | None = None`. When provided, `core_displays_by_cc` is filtered to only those CCs before computing `flat_core`. If the selected CCs have entries in `core_displays_by_cc` → normal coverage computation. If the selected CCs have **no** entries → `core_configured_for_scope = False`, coverage left at 0, and a note is appended ("Core-display coverage is not configured for the selected product lines — this metric is omitted from the email."). If `selected_ccs=None` (all-scope) and nothing configured → the existing "any display" fallback is preserved.
+  - **`app/ui/views/weekly_email_view.py`**:
+    - `_ensure_scorecards` passes `selected_ccs=self.filter_bar.selected_codes() or None` to `compute_rep_scorecards`.
+    - `_scorecard_footer_html`: core-display `<li>` is only rendered when `sc.core_display_configured` is `True`; otherwise the line is omitted entirely.
+    - `_build_rep_prompt` user_msg: `accounts_with_core_displays` and `core_display_coverage_pct` lines are only included when `sc.core_display_configured`. Sys_msg coaching insight examples and GOOD EXAMPLES bullet for core displays are also gated on `scorecard.core_display_configured`.
+  - **26/26 tests pass.**
+
+- **2026-05-18 (latest)** — AI Reply in Conversations view; Needs Review tab redesign; orphaned code removed; `timeout_seconds` → `request_timeout_seconds` fix; reply save/badge/scheduling fixes:
+  - **`_AiReplyWorker(QThread)`** new class: drafts a data-rich 100–220 word reply using fresh warehouse data, fulfilling the rep's specific request. Temperature 0.35. `get_db` passed from `main_window.py`.
+  - **`_ReplyComposeDialog(QDialog)`** new class: polished compose window with readonly To/Subject, collapsible thread history, editable draft body, Send Reply button (dispatches via SMTP with `In-Reply-To` header, then calls `save_message()` on the **existing** conversation — not `record_send()` — so `needs_reply` is cleared correctly).
+  - **AI system prompt** restricted to data-only service offers (no scheduling calls, meetings, or check-ins).
+  - **Needs Review tab redesigned** with `QSplitter` + "✨ Draft AI Reply" + "Mark as replied (manual)" buttons.
+  - **`request_timeout_seconds`** fix: `_AiReplyWorker._generate()` was referencing the non-existent `cfg.ai.timeout_seconds`; corrected to `cfg.ai.request_timeout_seconds`.
+  - **Orphaned ~480 lines** of old `ConversationsView` body removed from `conversations_view.py`.
+  - **26/26 tests pass.**
+
 - **2026-05-15 (latest)** — Conversations view fully wired; IMAP reply detection:
   - **Root cause fixed**: Emails sent via `_SendWorker` / `_SendReviewDialog` were never written to SQLite — the Conversations view showed "No conversations yet" even after real emails had been sent. Fix: `_SendWorker.run()` now calls `record_send()` after every successful SMTP send, creating the conversation row (idempotent via `INSERT OR IGNORE`) and recording the outbound message.
   - **`app/storage/repos.py`** — four new helper functions:

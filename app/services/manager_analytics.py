@@ -57,6 +57,7 @@ class RepScorecard:
     active_account_pct: float = 0.0
     accounts_with_core_displays: int = 0
     core_display_coverage_pct: float = 0.0
+    core_display_configured: bool = True   # False when the selected CCs have no core-display config
     sample_lines: int = 0
     sample_revenue: float = 0.0
     samples_per_account: float = 0.0
@@ -178,6 +179,7 @@ def compute_rep_scorecards(
     core_displays_by_cc: dict[str, list[str]] | None = None,
     sample_to_product_cc: dict[str, str] | None = None,
     price_class_lookup: dict[str, str] | None = None,
+    selected_ccs: list[str] | None = None,
     today: date | None = None,
 ) -> dict[str, RepScorecard]:
     """Compute one :class:`RepScorecard` per rep from already-loaded
@@ -278,31 +280,44 @@ def compute_rep_scorecards(
             open_accts_by_rep[rep] = accts
             total_accts[rep] = len(accts)
 
-    # Core-display coverage per rep. If the manager has not configured any
-    # "core" displays for the cost centers in scope, we fall back to
-    # "any display placement counts as coverage" so the metric reflects
-    # reality instead of always reading 0.
+    # Core-display coverage per rep.
+    # Only considers core displays configured for the *selected* CCs so that
+    # choosing CCs 031/032 (which have no core-display config) doesn't pull
+    # in displays configured for CC 010 or any other unrelated CC.
     core_set: set[tuple[str, str]] = set()
     used_any_display_fallback = False
+    core_configured_for_scope = True
     if displays_df is not None and not displays_df.empty:
         d = displays_df.copy()
         d["account_number"] = d.get("account_number", "").astype(str).str.strip()
         d["display_code"] = d.get("display_code", "").astype(str).str.strip()
-        flat_core = (
-            {c for codes in (core_displays_by_cc or {}).values() for c in codes}
-            if core_displays_by_cc else set()
-        )
+        # Restrict core-display lookup to the CCs being analysed.
+        relevant_cc_map = {
+            cc: codes
+            for cc, codes in (core_displays_by_cc or {}).items()
+            if selected_ccs is None or cc in selected_ccs
+        }
+        flat_core = {c for codes in relevant_cc_map.values() for c in codes}
         if flat_core:
             d = d[d["display_code"].isin(flat_core)]
+        elif selected_ccs is not None:
+            # The user chose specific CCs but none of them have core displays
+            # configured — the metric is not applicable for this scope.
+            core_configured_for_scope = False
         else:
+            # No CCs selected (all-scope) and no global config — any display counts.
             used_any_display_fallback = True
-        for r in d.itertuples(index=False):
-            core_set.add((r.account_number, r.display_code))
+        if core_configured_for_scope or used_any_display_fallback:
+            for r in d.itertuples(index=False):
+                core_set.add((r.account_number, r.display_code))
     accounts_with_core: dict[str, set[str]] = {}
     for acct, _code in core_set:
         for rep, accts in open_accts_by_rep.items():
             if acct in accts:
                 accounts_with_core.setdefault(rep, set()).add(acct)
+
+    # Propagate the scope-level flag to each scorecard so the UI can
+    # suppress the metric when it's not meaningful.
 
     # Samples per rep. Sample order lines almost always have a blank
     # ``salesperson_desc`` (samples are pulled by inside-sales / customer
@@ -450,6 +465,11 @@ def compute_rep_scorecards(
                 "No core displays configured for these cost centers — "
                 "coverage shown is *any* display on file."
             )
+        if not core_configured_for_scope:
+            notes.append(
+                "Core-display coverage is not configured for the selected "
+                "product lines — this metric is omitted from the email."
+            )
 
         # Top price classes (by revenue) for this rep — used to surface
         # product-type patterns in the coaching email and AI prompt.
@@ -504,6 +524,7 @@ def compute_rep_scorecards(
             core_display_coverage_pct=(
                 (accts_with_core / accts_total * 100.0) if accts_total else 0.0
             ),
+            core_display_configured=core_configured_for_scope,
             sample_lines=sample_lines,
             sample_revenue=sample_rev,
             samples_per_account=(sample_lines / accts_total) if accts_total else 0.0,
