@@ -287,6 +287,20 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
+- **2026-05-16 (latest)** — Weekly email: new 5-section AI prompt structure; account name enforcement; fallback body rewrite:
+  - **`_build_rep_prompt` sys_msg completely rewritten** with a new 5-section structure that replaces the old HIGHLIGHT/LOWLIGHT format:
+    1. **QUICK SCOREBOARD** (3–5 short bullets): weekly sales vs prior week, period YoY, top product line, ranking movement.
+    2. **BIGGEST WIN** (2–3 sentences): one specific success story with account name + number and a dollar figure or trend.
+    3. **BIGGEST OPPORTUNITY** (2–3 sentences): one actionable opportunity — stale account, display gap, product gap — always names the account.
+    4. **COACHING INSIGHT** (1–2 sentences): one intelligent correlation or behavioral pattern from the data (e.g. display accounts outperforming non-display accounts).
+    5. **THIS WEEK'S FOCUS**: ONE simple action. Struggling reps get a firm expectation; performing reps get an opportunity/momentum play. Tier logic preserved via `is_struggling`.
+    - Optional **SERVICE OFFER** (1 line) if a specific data question warrants a deeper pull.
+  - **Account label enforcement**: sys_msg now contains a hard rule: "ALWAYS pair account numbers with the account name when mentioning accounts (#1234 · ABC FLOORING or ABC FLOORING (#1234)). Never cite a number alone." `format_account_label` already produces this format — the new instruction ensures the AI respects it.
+  - **Stale accounts block**: fixed "prior period" to use explicit date labels (`prior_start_label`–`prior_end_label`), consistent with the no-vague-dates rule.
+  - **`_fallback_body` rewritten** to mirror the new 5-section structure (QUICK SCOREBOARD → BIGGEST WIN → BIGGEST OPPORTUNITY → COACHING INSIGHT → THIS WEEK'S FOCUS) so the no-AI fallback is structurally consistent with AI-generated emails.
+  - **Orphaned code removed**: `closing_instruction` variable (formerly used to separate struggling vs performing closing sections) removed; tier logic is now embedded inline inside the `section5_instruction` block within the new sys_msg.
+  - **22/22 tests pass.**
+
 - **2026-05-15 (latest)** — Ask AI full-dataset + blunt tone; weekly email HIGHLIGHT/LOWLIGHT structure; dashboard KPIs wired; conversations view with reply queue; help section:
   - **Ask the AI**: Removed 1500-row cap — full DataFrame CSV is now sent to the AI. `estimate_df_tokens` updated accordingly. New KPI card shows estimated token cost at gpt-4.1 pricing ($2/1M input tokens). System prompt rewritten to be blunt and direct: "Call out underperformers by name. Say clearly when a trend is bad, not just 'there is room for improvement'."
   - **Weekly email new structure**: Every email now starts with `HIGHLIGHT:` (best result, real numbers) then `LOWLIGHT:` (biggest concern), followed by FOCUS AREAS (2-3 bullets), closing action items or opportunities, and a `SERVICE OFFER` section where the AI offers a deeper data pull (e.g. "Want a month-by-month breakdown of carpet sales at #1234 since Jan 2026? Reply YES"). Target length 150-250 words (was 200-350). All date references are explicit (e.g. "February 2026–April 2026") — "previous period" is forbidden.

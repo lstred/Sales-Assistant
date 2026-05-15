@@ -877,52 +877,75 @@ def _build_rep_prompt(
     is_struggling = _bottom_40 and (_declining or _low_activation)
 
     if is_struggling:
-        closing_instruction = (
-            "4. Close with 1–2 SPECIFIC ASSIGNED ACTION ITEMS for next week. "
-            "Format each as: 'Action: [exact task] — [account label and dollar "
-            "context]'. These are not suggestions — they are expectations.\n"
+        section5_instruction = (
+            "5. THIS WEEK'S FOCUS: Give ONE specific, high-impact action the rep must "
+            "take this week. Format: 'This week: [concrete task] — [account name and "
+            "dollar context]'. For underperformers this is an expectation, not a suggestion."
         )
     else:
-        closing_instruction = (
-            "4. Close with 1–2 insight-framed OPPORTUNITIES — not prescriptions. "
-            "Point to a data pattern they can act on: product line momentum, "
-            "display correlation, territory upside. Frame as 'worth exploring...' "
-            "not a directive.\n"
+        section5_instruction = (
+            "5. THIS WEEK'S FOCUS: Give ONE simple, high-upside action worth prioritizing "
+            "this week. Frame as an opportunity, not an order. Make it specific to their data."
         )
 
     sys_msg = (
-        "You are a senior sales manager at a flooring distributor writing a "
-        "weekly coaching email to ONE sales rep. Keep it TIGHT (150-250 words "
-        "total). Reps don't read long emails. Be human, specific, direct. "
-        f"Tone: {tone_word}.\n\n"
-        "STRUCTURE — write exactly in this order:\n"
-        "1. HIGHLIGHT (1 sentence): Best thing from their data this week. "
-        "Must cite a real number or account. Never generic praise.\n"
-        "2. LOWLIGHT (1 sentence): Biggest concern. Name it plainly. "
-        "HIGH-IMPACT FLAG: any account with >$5,000 decline or a consistent "
-        "buyer now at $0 must be called out here — every week until resolved.\n"
-        "3. FOCUS AREAS (2-3 bullet points): Concrete, numbered-backed items "
-        "ranked by impact. Always use EXACT dates (e.g. 'February–April 2026') "
-        "— never say 'previous period' or 'last period' without specifying the "
-        "months. Use rep-friendly account labels from the data (e.g. '#1234 · "
-        "ABC FLOORING').\n"
-        f"{closing_instruction}"
-        "5. SERVICE OFFER (1 line, optional): If you see a specific data pattern "
-        "that warrants a deeper dive (e.g. month-by-month breakdown of a "
-        "declining product line, account-level detail on stale accounts, or "
-        "display ROI analysis), offer it with a clear yes/no ask. Example: "
-        "'Want a month-by-month breakdown of your carpet sales at #1234 since "
-        "January 2026? Reply YES and I'll pull it.' Only offer if there is a "
-        "genuinely useful data question to answer — do not offer something "
-        "vague.\n\n"
-        "Hard rules:\n"
-        "- Only reference numbers in the data block. Do not invent figures.\n"
-        "- Always write full date ranges, never 'previous period'.\n"
-        "- Skip the scorecard table at the bottom — the system appends it.\n"
-        "- No subject line, no greeting like 'Hi REP'. Start with HIGHLIGHT:.\n"
-        "- If a metric is unavailable (None / n/a), skip it.\n"
-        "- Do NOT give everyone things to do. Struggling reps get assigned "
-        "tasks; performing reps get insights and opportunities."
+        "You are a senior sales manager at a flooring distributor. "
+        "You are generating a WEEKLY TERRITORY PERFORMANCE EMAIL for ONE sales rep. "
+        "Your job is NOT to summarize raw data. Your job is to identify meaningful changes, "
+        "recognize wins, surface missed opportunities, detect behavioral patterns, and coach "
+        "the rep toward actions that will increase sales. "
+        "Keep the rep engaged — every email should feel slightly different.\n\n"
+        f"TONE: {tone_word}. Rep tier: {'STRUGGLING — be direct about expectations' if is_struggling else 'PERFORMING — be insight-led and motivating'}.\n\n"
+        "IMPORTANT RULES:\n"
+        "- Total length: 150–250 words. Reps don't read long emails.\n"
+        "- Use short sections and bullets. No long paragraphs.\n"
+        "- Conversational, direct, motivating, concise. Avoid corporate language.\n"
+        "- Do NOT dump raw statistics. Prioritize interesting insights over comprehensive reporting.\n"
+        "- Only reference numbers that appear in the data block. Do not invent figures.\n"
+        "- Always write full date ranges (e.g. 'February–April 2026'), never 'previous period'.\n"
+        "- ALWAYS pair account numbers with the account name when mentioning accounts "
+        "(e.g. '#1234 · ABC FLOORING' or 'ABC FLOORING (#1234)'). Never cite a number alone.\n"
+        "- No subject line. No greeting ('Hi REP'). Start directly with the scoreboard.\n"
+        "- Skip the scorecard footer — the system appends it automatically.\n"
+        "- HIGH-IMPACT FLAG: any account with >$5,000 decline or a consistent buyer now at "
+        "$0 must appear in BIGGEST OPPORTUNITY every week until resolved.\n\n"
+        "EMAIL STRUCTURE — write exactly in this order:\n\n"
+        "1. QUICK SCOREBOARD (3–5 short lines or bullets):\n"
+        "   - Weekly sales + change vs prior week\n"
+        "   - MTD or period-to-date vs prior year (use exact months)\n"
+        "   - Top product line or category this week\n"
+        "   - Any notable ranking movement or display addition\n"
+        "   Keep each item to one short line. No editorializing here.\n\n"
+        "2. BIGGEST WIN (2–3 sentences):\n"
+        "   Highlight one meaningful success. Must cite a real account name + number and "
+        "a dollar figure or trend. Examples of good wins: a dormant account that reactivated, "
+        "a big growth account, a strong sample-to-sale conversion, a display payoff.\n\n"
+        "3. BIGGEST OPPORTUNITY (2–3 sentences):\n"
+        "   Identify ONE actionable opportunity in their territory. Could be: a stale account "
+        "with strong history, a display account underperforming its potential, a product gap "
+        "in a high-volume account, a momentum shift worth chasing. Be specific — name the "
+        "account (name + number) and quantify the gap.\n\n"
+        "4. COACHING INSIGHT (1–2 sentences):\n"
+        "   The most valuable part. One smart observation about a pattern, behavior, or "
+        "correlation in their data. Examples: 'Your accounts with core displays are buying "
+        "at 2x the rate of those without.' or 'Your top growth accounts this period all share "
+        "the same product category — worth expanding that playbook.' Make it feel like "
+        "you personally studied their territory.\n\n"
+        f"{section5_instruction}\n\n"
+        "6. SERVICE OFFER (1 line, optional):\n"
+        "   If a specific data question would help the rep act, offer a deeper pull with a "
+        "yes/no ask. Example: 'Want a month-by-month breakdown of ABC FLOORING (#1234) since "
+        "January 2026? Reply YES.' Only include this if there is a genuinely useful question "
+        "— skip it otherwise.\n\n"
+        "GOOD EXAMPLES:\n"
+        "- 'Your sample placements this quarter are converting into stronger repeat orders.'\n"
+        "- 'Accounts with 2+ core displays average significantly higher weekly volume.'\n"
+        "- 'Several dormant accounts still carry strong historical sales potential.'\n\n"
+        "BAD EXAMPLES (never write these):\n"
+        "- 'Please continue your efforts.'\n"
+        "- 'Sales were up 3.2%.'\n"
+        "- 'Thank you for all you do.'\n"
+        "- 'Attached is your weekly summary.'"
     )
     if scorecard.is_yoy_outlier:
         sys_msg += (
@@ -968,7 +991,7 @@ def _build_rep_prompt(
         for a in sc.top_declining_accounts
     ) or "  (none)"
     stale_lines = "\n".join(
-        f"  - {format_account_label(a)}: was ${a['prior']:,.0f} prior period, $0 this period"
+        f"  - {format_account_label(a)}: was ${a['prior']:,.0f} ({prior_start_label}–{prior_end_label}), $0 this period"
         for a in sc.stale_accounts
     ) or "  (none)"
     new_lines = "\n".join(
@@ -1033,46 +1056,93 @@ def _fallback_body(
     period_overview: PeriodOverview | None,
     week_lines: dict | None,
 ) -> str:
+    """Deterministic fallback when AI is not configured or fails.
+    Matches the new 5-section structure (scoreboard / win / opportunity /
+    coaching insight / focus) so the format is consistent."""
     parts: list[str] = []
-    parts.append(f"Hi {sc.rep_name.split()[0] if sc.rep_name else 'team'},")
+
+    # 1. QUICK SCOREBOARD
+    scoreboard: list[str] = []
+    if week_lines:
+        prev_rev = week_lines.get("previous_week_revenue", 0.0)
+        scoreboard.append(f"Last week: ${prev_rev:,.0f}")
+    if sc.yoy_pct is not None and not sc.is_yoy_outlier:
+        scoreboard.append(f"Period YoY: {sc.yoy_pct:+.1f}%")
+    elif sc.last_3mo_vs_prior_3mo_pct is not None:
+        scoreboard.append(f"3-month trend: {sc.last_3mo_vs_prior_3mo_pct:+.1f}%")
+    if sc.active_accounts and sc.total_accounts:
+        scoreboard.append(f"Active accounts: {sc.active_accounts}/{sc.total_accounts} ({sc.active_account_pct:.0f}%)")
+    if scoreboard:
+        parts.append("QUICK SCOREBOARD\n" + "\n".join(f"• {s}" for s in scoreboard))
+
+    # 2. BIGGEST WIN
     if sc.top_growing_accounts:
         a = sc.top_growing_accounts[0]
         parts.append(
-            f"Nice work on {format_account_label(a)} \u2014 you're up "
-            f"${a['delta']:,.0f} on that account vs last year."
+            f"BIGGEST WIN\n"
+            f"{format_account_label(a)} is up ${a['delta']:,.0f} vs last year — "
+            f"that's ${a['current']:,.0f} in the period vs ${a['prior']:,.0f} prior."
         )
-    yoy = sc.yoy_pct
-    if (
-        yoy is not None
-        and sc.peer_avg_yoy_pct is not None
-        and not sc.is_yoy_outlier
-    ):
+    elif sc.new_accounts:
+        a = sc.new_accounts[0]
         parts.append(
-            f"Overall you're at {yoy:+.1f}% YoY vs the peer average of "
-            f"{sc.peer_avg_yoy_pct:+.1f}%."
+            f"BIGGEST WIN\n"
+            f"New account activated: {format_account_label(a)} at ${a['current']:,.0f} — "
+            f"great prospecting work."
         )
-    elif sc.is_yoy_outlier and sc.last_3mo_vs_prior_3mo_pct is not None:
-        parts.append(
-            f"Your year-over-year swing is unusual (likely a territory "
-            f"shift) so let's look at recent momentum instead: last 3 "
-            f"months vs prior 3 is {sc.last_3mo_vs_prior_3mo_pct:+.1f}%."
-        )
-    if sc.top_declining_accounts:
-        a = sc.top_declining_accounts[0]
-        parts.append(
-            f"Biggest opportunity: {format_account_label(a)} is off "
-            f"${-a['delta']:,.0f} \u2014 worth a focused conversation."
-        )
+
+    # 3. BIGGEST OPPORTUNITY
     if sc.stale_accounts:
         a = sc.stale_accounts[0]
         parts.append(
-            f"Heads-up: {format_account_label(a)} bought ${a['prior']:,.0f} "
-            "last year and nothing this period. A visit or call could "
-            "re-engage them."
+            f"BIGGEST OPPORTUNITY\n"
+            f"{format_account_label(a)} bought ${a['prior']:,.0f} last year and "
+            f"nothing this period. A call or visit could re-engage them."
         )
-    parts.append(
-        "Full numbers in the scorecard below. Hit reply with any questions."
-    )
+    elif sc.top_declining_accounts:
+        a = sc.top_declining_accounts[0]
+        parts.append(
+            f"BIGGEST OPPORTUNITY\n"
+            f"{format_account_label(a)} is down ${-a['delta']:,.0f} — "
+            f"worth a focused conversation to understand what changed."
+        )
+
+    # 4. COACHING INSIGHT
+    if sc.core_display_coverage_pct > 0:
+        parts.append(
+            f"COACHING INSIGHT\n"
+            f"{sc.core_display_coverage_pct:.0f}% of your accounts have core displays in place. "
+            f"Accounts with strong display presence typically drive more repeat volume — "
+            f"it's worth reviewing placements on your larger accounts."
+        )
+    elif sc.samples_per_account > 0:
+        parts.append(
+            f"COACHING INSIGHT\n"
+            f"Sample activity ({sc.sample_lines} placements) is a strong leading indicator. "
+            f"Keep that up — early placements tend to convert into orders in the next 60 days."
+        )
+
+    # 5. THIS WEEK'S FOCUS
+    if sc.stale_accounts:
+        a = sc.stale_accounts[0]
+        parts.append(
+            f"THIS WEEK'S FOCUS\n"
+            f"Reconnect with {format_account_label(a)} — they've gone quiet and have strong history."
+        )
+    elif sc.top_declining_accounts:
+        a = sc.top_declining_accounts[0]
+        parts.append(
+            f"THIS WEEK'S FOCUS\n"
+            f"Have a conversation with {format_account_label(a)} about what's changed."
+        )
+    elif sc.top_growing_accounts:
+        a = sc.top_growing_accounts[0]
+        parts.append(
+            f"THIS WEEK'S FOCUS\n"
+            f"Double down on {format_account_label(a)} — momentum is on your side there."
+        )
+
+    parts.append("Full numbers in the scorecard below. Hit reply with any questions.")
     return "\n\n".join(parts)
 
 
