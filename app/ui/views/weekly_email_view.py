@@ -1531,8 +1531,8 @@ def _render_master_html(
           "<th style='padding:8px 10px;text-align:left;'>#</th>"
           "<th style='padding:8px 10px;text-align:left;'>Rep</th>"
           f"<th style='padding:8px 10px;text-align:right;'>Weekly Sales</th>"
-          f"<th style='padding:8px 10px;text-align:right;'>Fiscal YTD Avg/Wk</th>"
-          f"<th style='padding:8px 10px;text-align:right;'>Prev FY YTD Avg/Wk</th>"
+          f"<th style='padding:8px 10px;text-align:right;'>Weekly Avg YTD</th>"
+          f"<th style='padding:8px 10px;text-align:right;'>Weekly Avg Prev YTD</th>"
           "</tr></thead>"
         + "<tbody>" + table_body + "</tbody></table>"
         + f"<p style='color:#475569;font-size:12px;margin-top:10px;'>"
@@ -1624,7 +1624,7 @@ def _render_master_html(
         heavy,
         "FULL STANDINGS",
         heavy,
-        _row("#", "Rep", "This Week", "YTD Avg/Wk", "Prev YTD Avg"),
+        _row("#", "Rep", "This Week", "Avg/Wk YTD", "Avg/Wk Prev YTD"),
         light,
     ]
     for i, (rep, _) in enumerate(leaderboard, 1):
