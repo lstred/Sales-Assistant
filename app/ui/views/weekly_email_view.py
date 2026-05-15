@@ -202,7 +202,7 @@ class WeeklyEmailView(QWidget):
 
         body = QHBoxLayout()
         body.setSpacing(12)
-        self.filter_bar = SalesFilterBar(get_db, cfg=cfg, code_prefix_filter="0")
+        self.filter_bar = SalesFilterBar(get_db, cfg=cfg, code_prefix_filter="0", page_id="weekly_email")
         self.filter_bar.sales_loaded_with_prior.connect(self._on_sales_loaded)
         self.filter_bar.busy_state_changed.connect(self.busy_state_changed.emit)
         body.addWidget(self.filter_bar)

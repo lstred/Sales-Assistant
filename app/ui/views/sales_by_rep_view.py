@@ -46,7 +46,7 @@ class SalesByRepView(QWidget):
 
         body = QHBoxLayout()
         body.setSpacing(12)
-        self.filter_bar = SalesFilterBar(get_db, cfg=cfg, code_prefix_filter="0")
+        self.filter_bar = SalesFilterBar(get_db, cfg=cfg, code_prefix_filter="0", page_id="sales_by_rep")
         self.filter_bar.sales_loaded_with_prior.connect(self._on_loaded_with_prior)
         body.addWidget(self.filter_bar)
 

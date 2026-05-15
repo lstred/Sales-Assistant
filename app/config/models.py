@@ -133,6 +133,23 @@ class GlobalFiltersConfig(BaseModel):
     vs_prior_year: bool = True
 
 
+class PageFilterDefault(BaseModel):
+    """Per-page saved filter state.
+
+    ``start_relative`` / ``end_relative`` hold a relative-date token (e.g.
+    ``"today"``, ``"yesterday"``, ``"fiscal_ytd_start"``) so the date is
+    re-evaluated fresh every time the page loads.  When set, they take
+    priority over the ISO strings.  Empty string means "use the ISO date".
+    """
+
+    start_relative: str = ""    # relative token or ""
+    end_relative: str = ""      # relative token or ""
+    start_iso: str = ""         # absolute fallback / override
+    end_iso: str = ""
+    cost_centers: list[str] = Field(default_factory=list)
+    vs_prior_year: bool = True
+
+
 class AppConfig(BaseModel):
     schema_version: int = 1
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
@@ -142,6 +159,8 @@ class AppConfig(BaseModel):
     fiscal: FiscalCalendarConfig = Field(default_factory=FiscalCalendarConfig)
     defaults: GlobalFiltersConfig = Field(default_factory=GlobalFiltersConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    page_defaults: dict[str, PageFilterDefault] = Field(default_factory=dict)
+    """Per-page saved filter defaults keyed by page_id string."""
 
     # User-maintained mappings (free-form, edited in UI later):
     sample_to_product_cc: dict[str, str] = Field(default_factory=dict)
