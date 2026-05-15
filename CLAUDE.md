@@ -287,7 +287,12 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
-- **2026-05-17 (latest)** — Master leaderboard overhaul:
+- **2026-05-17 (latest)** — Outbound status fix + leaderboard clipboard format:
+  - **"Outbound disabled" message fixed**: The `ViewHeader` subtitle and `_queue()` body now read `cfg.enable_outbound_send` at construction time instead of hardcoding "disabled". When the flag is `True`, the header says "Outbound sending is enabled" and the queue pane shows a green confirmation note.
+  - **Plain-text leaderboard restructured**: Shoutouts now appear FIRST (before the table), each with the rep name, dollar value, and AI quote on separate indented lines. The table uses dynamic name-column width, `═` top rule, `─` body rules, clean labeling ("This Week | YTD Avg/Wk | Prev YTD Avg"), and a simple footer note. Date formatting uses `%b %#d, %Y` (Windows-compatible). Result pastes cleanly into Outlook/Gmail with proportional fonts.
+  - **22/22 tests pass.**
+
+- **2026-05-17** — Master leaderboard overhaul:
   - **Three columns** — "Weekly Sales", "Fiscal YTD Avg/Wk", "Prev FY YTD Avg/Wk" (replaces old "Last week" + "Week to date").
   - **Weekly column logic** — if today is Friday (4) or Saturday (5): use the current in-progress week; Monday–Thursday: use the last full week (Sun–Sat). Anchored to `_anchor_date()` as before.
   - **Fiscal YTD Avg/Wk** — total revenue for the rep in `_df` divided by `weeks_elapsed = max(1.0, (fb_end - fb_start).days / 7)` where `fb_start, fb_end = filter_bar.date_range()`.

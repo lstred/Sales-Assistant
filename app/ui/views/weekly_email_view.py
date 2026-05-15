@@ -192,12 +192,16 @@ class WeeklyEmailView(QWidget):
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(12)
 
+        _outbound_note = (
+            "Outbound sending is enabled — use \u2018Queue for review\u2019 to send."
+            if cfg.enable_outbound_send
+            else "Outbound stays disabled until you flip it on in Email settings."
+        )
         root.addWidget(
             ViewHeader(
                 "Weekly Sales Email",
-                "AI-coached, manager-style drafts \u2014 one per rep \u2014 plus an "
-                "optional master leaderboard email. Outbound stays disabled "
-                "until you flip it on in Email settings.",
+                f"AI-coached, manager-style drafts \u2014 one per rep \u2014 plus an "
+                f"optional master leaderboard email. {_outbound_note}",
             )
         )
 
@@ -798,6 +802,16 @@ class WeeklyEmailView(QWidget):
         ready = sum(1 for k, d in self._drafts.items() if k != MASTER_KEY and d["to"])
         missing = sum(1 for k, d in self._drafts.items() if k != MASTER_KEY and not d["to"])
         master = "yes" if MASTER_KEY in self._drafts else "no"
+        if self._cfg.enable_outbound_send:
+            send_note = (
+                f"<p style='color:#16A34A;font-size:11px;'>"
+                f"Outbound sending is enabled. Actual dispatch coming in next release.</p>"
+            )
+        else:
+            send_note = (
+                f"<p style='color:{TEXT_MUTED};font-size:11px;'>Outbound sending "
+                f"is disabled \u2014 enable it in Email settings to send.</p>"
+            )
         self.preview.setHtml(
             f"<h3>Ready to queue</h3>"
             f"<ul>"
@@ -805,9 +819,7 @@ class WeeklyEmailView(QWidget):
             f"<li>{missing} per-rep draft(s) are missing an email \u2014 set them in Sales Reps.</li>"
             f"<li>Master leaderboard included: <b>{master}</b>.</li>"
             f"</ul>"
-            f"<p style='color:{TEXT_MUTED};font-size:11px;'>Outbound sending "
-            f"is disabled until you flip it on in Email settings; this button "
-            f"will become the actual queue handoff in the next release.</p>"
+            + send_note
         )
 
 
@@ -1061,8 +1073,43 @@ def _render_master_html(
     )
 
     # ---- plain text for clipboard -----------------------------------------
-    col_w = (3, 24, 14, 18, 18)  # column widths: #, rep, weekly, ytd, prior ytd
-    sep = "  "
+    # Format dates for display (e.g. "May 10" / "May 14, 2026")
+    def _fmt_date(d: date) -> str:
+        return d.strftime("%b %#d, %Y") if hasattr(d, "strftime") else str(d)
+
+    # Build shoutout blocks (placed FIRST, before the table)
+    shoutout_lines: list[str] = []
+    if top3_weekly:
+        shoutout_lines.append("⭐  TOP 3 THIS WEEK")
+        shoutout_lines.append("")
+        for i, (rep, rev) in enumerate(top3_weekly):
+            txt = shoutouts_weekly.get(rep, "")
+            shoutout_lines.append(f"  {medals[i]}  {rep}  —  ${rev:,.0f}")
+            if txt:
+                shoutout_lines.append(f"       {txt}")
+        shoutout_lines.append("")
+
+    if top3_ytd_improvement:
+        shoutout_lines.append("📈  MOST IMPROVED vs PRIOR YEAR  (YTD Avg/Week)")
+        shoutout_lines.append("")
+        for i, (rep, delta) in enumerate(top3_ytd_improvement):
+            cur = per_rep_ytd_avg.get(rep, 0.0)
+            prev = per_rep_prior_ytd_avg.get(rep, 0.0)
+            txt = shoutouts_ytd.get(rep, "")
+            shoutout_lines.append(
+                f"  {medals[i]}  {rep}  —  ${cur:,.0f}/wk now  vs  ${prev:,.0f}/wk last year  (+${delta:,.0f}/wk)"
+            )
+            if txt:
+                shoutout_lines.append(f"       {txt}")
+        shoutout_lines.append("")
+
+    # Table: use fixed-width columns (works in Outlook/Gmail with monospace paste)
+    # Determine dynamic column widths based on actual rep names
+    max_name = max((len(rep) for rep, _ in leaderboard), default=10)
+    name_w = max(max_name, 20)
+    col_w = (3, name_w, 13, 15, 15)
+    sep = "   "
+    rule = "─" * (sum(col_w) + len(sep) * 4)
 
     def _row(rank: str, name: str, wk: str, ytd: str, prior: str) -> str:
         return (
@@ -1073,48 +1120,47 @@ def _render_master_html(
             + prior.rjust(col_w[4])
         )
 
-    divider = "-" * (sum(col_w) + len(sep) * 4)
-    plain_lines: list[str] = [
-        f"TEAM LEADERBOARD — {week_kind.upper()}",
-        f"Week: {wk_start.isoformat()} → {wk_end.isoformat()}",
-        f"YTD period: {period_label}",
-        "",
-        _row("#", "Rep", "Weekly Sales", "Fiscal YTD Avg", "Prev FY YTD Avg"),
-        divider,
+    table_lines: list[str] = [
+        _row("#", "Rep", "This Week", "YTD Avg/Wk", "Prev YTD Avg"),
+        rule,
     ]
     for i, (rep, _) in enumerate(leaderboard, 1):
         weekly = per_rep_weekly.get(rep, 0.0)
         ytd = per_rep_ytd_avg.get(rep, 0.0)
         prior = per_rep_prior_ytd_avg.get(rep, 0.0)
-        plain_lines.append(_row(
+        table_lines.append(_row(
             str(i),
-            rep[:col_w[1]],
+            rep[:name_w],
             f"${weekly:,.0f}" if weekly > 0 else "—",
             f"${ytd:,.0f}",
             f"${prior:,.0f}" if prior > 0 else "—",
         ))
-    plain_lines += [
-        divider,
+    table_lines += [
+        rule,
         _row("", "TOTAL",
              f"${total_weekly:,.0f}",
              f"${total_ytd_avg:,.0f}",
              f"${total_prior_ytd_avg:,.0f}" if total_prior_ytd_avg > 0 else "—"),
-        "",
     ]
 
-    if top3_weekly:
-        plain_lines.append("⭐ TOP 3 THIS WEEK")
-        for i, (rep, rev) in enumerate(top3_weekly):
-            txt = shoutouts_weekly.get(rep, "")
-            plain_lines.append(f"  {medals[i]} {rep} — ${rev:,.0f}{(': ' + txt) if txt else ''}")
-        plain_lines.append("")
-
-    if top3_ytd_improvement:
-        plain_lines.append("📈 MOST IMPROVED vs PRIOR FY YTD (Avg/Week)")
-        for i, (rep, delta) in enumerate(top3_ytd_improvement):
-            txt = shoutouts_ytd.get(rep, "")
-            plain_lines.append(f"  {medals[i]} {rep} — +${delta:,.0f}/wk{(': ' + txt) if txt else ''}")
-        plain_lines.append("")
+    # Final assembly — shoutouts FIRST, then table
+    top_rule = "═" * (sum(col_w) + len(sep) * 4)
+    plain_lines: list[str] = [
+        f"📊  WEEKLY TEAM LEADERBOARD",
+        f"Week: {_fmt_date(wk_start)} → {_fmt_date(wk_end)}"
+        + ("  (in progress)" if using_current_week else ""),
+        f"YTD period: {period_label}",
+        top_rule,
+        "",
+    ]
+    plain_lines += shoutout_lines
+    plain_lines.append("FULL STANDINGS")
+    plain_lines.append("")
+    plain_lines += table_lines
+    plain_lines += [
+        "",
+        "* Invoiced sales only (open orders excluded).",
+    ]
 
     plain_text = "\n".join(plain_lines)
     return html, plain_text
