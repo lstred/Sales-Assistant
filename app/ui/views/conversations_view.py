@@ -266,7 +266,7 @@ class _AiReplyWorker(QThread):
             model=self._cfg.ai.model,
             max_output_tokens=max(1024, self._cfg.ai.max_output_tokens),
             temperature=0.35,
-            timeout_seconds=self._cfg.ai.timeout_seconds,
+            timeout_seconds=self._cfg.ai.request_timeout_seconds,
         )
         return result.text.strip()
 
