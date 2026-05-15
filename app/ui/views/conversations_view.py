@@ -43,7 +43,6 @@ from app.storage.repos import (
     list_conversations,
     list_messages,
     record_inbound,
-    record_send,
     resolve_action_item,
     save_message,
 )
@@ -244,7 +243,11 @@ class _AiReplyWorker(QThread):
             "- Cite specific account names and dollar figures from the data provided.\n"
             "- Keep it 100–220 words. Write plain paragraphs only — no markdown, no asterisks.\n"
             "- Do NOT add a sign-off or signature.\n"
-            "- End with ONE forward-looking action prompt.\n"
+            "- If appropriate, close with ONE offer of additional data the assistant can pull from "
+            "the warehouse (e.g. month-by-month breakdowns, account-level trends, GP% by product "
+            "line, display-vs-non-display comparison). Do NOT suggest scheduling calls, meetings, "
+            "check-ins, or any action that requires human coordination — only offer things the AI "
+            "data assistant can actually deliver.\n"
             "- Never invent numbers not present in the supplied data."
         )
 
@@ -434,18 +437,18 @@ class _ReplyComposeDialog(QDialog):
             return
 
         try:
-            record_send(
-                salesman_number=self._conv.rep_id,
-                rep_name=self._conv.rep_name or self._conv.rep_id,
-                subject=subj,
-                thread_key=res.message_id,
+            save_message(
+                conversation_id=self._conv.id,
+                direction="outbound",
+                message_id=res.message_id,
+                in_reply_to=self._last_msg_id,
                 from_address=self._cfg.email.smtp_from_address or "(manager)",
                 to_address=self._rep_email,
-                body_html="",
-                cost_center=self._conv.cost_center or "",
+                subject=subj,
+                body_text=body,
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("record_send error after reply: %s", exc)
+            log.warning("save_message error after reply: %s", exc)
 
         self.sent.emit()
         self.accept()
