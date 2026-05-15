@@ -287,7 +287,14 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
-- **2026-05-17 (latest)** — Outbound status fix + leaderboard clipboard format:
+- **2026-05-17 (latest)** — Email sending, structured leaderboard, budget persistence:
+  - **Send Review dialog** — `_queue()` now opens `_SendReviewDialog` instead of a static summary. The dialog shows all drafts in a scrollable checklist (pre-checked for reps with email addresses on file), with a live preview panel on the right. Supports Select All / Deselect All. "Send Selected (N)" button dispatches via `EmailClient.send()` in a background `_SendWorker` QThread. Per-row status shows ✓ Sent or ✗ Failed (with error tooltip). Works for per-rep drafts and the master leaderboard item. Disabled (amber warning) if SMTP is not configured or `enable_outbound_send` is False.
+  - **Leaderboard clipboard format redesigned**: Shoutout sections now each use a mini-table (rank | rep | sales, then quotes on wrapped indented lines below). "Most Improved" section shows a three-column mini-table (Now/Wk | Prev/Wk | +/-/Wk). Main standings table uses dynamic column widths, `═` heavy rules for section headers, `─` light rule below header row. All sections clearly delineated. Renders cleanly when pasted into Outlook/Gmail with proportional fonts.
+  - **Budget upload persistence** — `BudgetConfig.rep_cc_growth_pct_saved` field added (JSON-serializable nested dict: rep_number → cc → pct). When a CSV/Excel upload is applied in the budget settings panel, overrides are saved to `config.json` via `save_config()`. On next launch, `_SettingsPanel._load_saved_overrides()` restores them automatically — no re-upload needed.
+  - **Help view updated**: Weekly Email section revised to document the Send Review dialog and the new "Copy leaderboard" plain-text format. Budget section notes that uploads are saved and restored automatically.
+  - **26/26 tests pass.**
+
+- **2026-05-17** — Outbound status fix + leaderboard clipboard format:
   - **"Outbound disabled" message fixed**: The `ViewHeader` subtitle and `_queue()` body now read `cfg.email.enable_outbound_send` (was incorrectly `cfg.enable_outbound_send`, causing an AttributeError crash on launch). When the flag is `True`, the header says "Outbound sending is enabled" and the queue pane shows a green confirmation note.
   - **Dynamic "Most Improved" shoutout section**: Replaces the static "Fiscal YTD Avg" comparison with a mode that adapts to the fiscal calendar position:
     - **First week of new period** → Fiscal YTD Avg/Wk vs prior YTD avg (unchanged from before).

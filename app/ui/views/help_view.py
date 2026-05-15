@@ -155,7 +155,9 @@ rep scorecards.</p>
 <li>Set the <b>budget fiscal year</b> (the year you're budgeting for).</li>
 <li>Set a <b>growth %</b> per cost center, or accept the default (0%).</li>
 <li>Optionally upload a <b>rep-level growth override</b> CSV to set different
-    growth rates for specific rep × CC combinations.</li>
+    growth rates for specific rep × CC combinations. <b>Uploads are automatically
+    saved</b> and restored when you reopen the app — you don't need to re-upload
+    every session.</li>
 <li>Click <b>Compute budget</b> to see results by CC, rep, or customer.</li>
 </ol>
 
@@ -183,8 +185,16 @@ weekly coaching emails for every sales rep based on their current performance da
 <li>Load sales data using the filter bar on the left.</li>
 <li>Click <b>Generate AI drafts</b> — one email per rep is drafted in the background.</li>
 <li>Select each rep from the list on the right to review the draft.</li>
-<li>Click <b>Queue for review</b> when you're ready to send.</li>
+<li>Click <b>Queue for review</b> to open the Send Review dialog. You can choose to send
+    all drafts, some (using checkboxes), or any individual draft. Click <b>Send Selected</b>
+    to dispatch via SMTP. Each email shows a ✓ Sent or ✗ Failed status inline.</li>
 </ol>
+
+<h3>Sending requirements</h3>
+<p>Outbound sending must be enabled in <b>Settings → Email</b>. You need a valid SMTP host
+and password stored in Windows Credential Manager. When <b>Redirect all to</b> is set,
+all emails go to that address instead of the rep — useful for testing. Reps
+without an email address on file are shown in the dialog but cannot be selected.</p>
 
 <h3>Email structure</h3>
 <p>Every email follows the same format:</p>
@@ -217,9 +227,20 @@ These reps get assigned action items with explicit expectations.</p>
 </ul>
 
 <h3>Master leaderboard</h3>
-<p>Click <b>Generate master leaderboard</b> to create a single team-wide email
-showing last week's revenue ranking for all reps. Useful for a team-wide
-Monday morning email.</p>
+<p>Click <b>Generate master leaderboard</b> to create a single team-wide email showing
+last week's revenue ranking for all reps, plus YTD average comparisons. Useful for
+a Monday morning team email.</p>
+<p>Click <b>Copy leaderboard</b> to copy a structured plain-text version directly to
+your clipboard — paste it into Outlook or Gmail and it will be readable even with
+proportional fonts. The layout includes:</p>
+<ul>
+<li><b>Top 3 This Week</b> — mini-table showing rank, name, sales, with AI shoutout quotes below.</li>
+<li><b>Most Improved</b> — mini-table with now/wk, prev/wk, and +/−/wk columns. The comparison
+    mode changes automatically based on where you are in the fiscal calendar: first week of a new
+    period shows Fiscal YTD avg, mid-month shows MTD avg, end of period shows completed-month avg,
+    and end of Q1/Q2/Q3/Q4 shows completed-quarter avg.</li>
+<li><b>Full Standings</b> — ranked table with This Week, YTD Avg/Wk, and Prev YTD Avg/Wk columns.</li>
+</ul>
 
 <h3>Rep service requests</h3>
 <p>When a rep replies "YES" to a service offer in an email, that reply will

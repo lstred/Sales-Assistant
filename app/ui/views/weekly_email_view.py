@@ -36,11 +36,18 @@ import pandas as pd
 from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTextBrowser,
     QVBoxLayout,
@@ -56,6 +63,7 @@ from app.data.loaders import (
     load_price_class_lookup,
     load_rep_assignments,
 )
+from app.notifications.email_client import EmailClient
 from app.services.fiscal_calendar import build_fiscal_year, find_period
 from app.services.manager_analytics import (
     PeriodOverview,
@@ -165,6 +173,259 @@ class _AIDraftWorker(QThread):
             except Exception as exc:  # noqa: BLE001
                 self.failed.emit(rep_key, f"{type(exc).__name__}: {exc}")
         self.finished_all.emit()
+
+
+# ============================================================ send review dialog
+class _SendWorker(QThread):
+    """Sends a batch of emails sequentially; emits per-item results."""
+
+    result = Signal(str, bool, str)   # key, ok, message
+    finished_all = Signal()
+
+    def __init__(self, jobs: list[tuple[str, dict]], client: EmailClient) -> None:
+        super().__init__()
+        self._jobs = jobs
+        self._client = client
+
+    def run(self) -> None:
+        for key, draft in self._jobs:
+            try:
+                res = self._client.send(
+                    to_address=draft["to"],
+                    subject=draft["subject"],
+                    body_text="",           # html-only; email clients fall back gracefully
+                    body_html=draft.get("body_html", ""),
+                    cc_address=draft.get("cc", ""),
+                )
+                self.result.emit(key, res.ok, res.error)
+            except Exception as exc:  # noqa: BLE001
+                self.result.emit(key, False, str(exc))
+        self.finished_all.emit()
+
+
+class _SendReviewDialog(QDialog):
+    """Modal dialog: review drafts, select which to send, confirm & dispatch."""
+
+    def __init__(self, drafts: dict, cfg: AppConfig, parent=None) -> None:
+        super().__init__(parent)
+        self._drafts = drafts
+        self._cfg = cfg
+        self._worker: _SendWorker | None = None
+        self._checkboxes: dict[str, QCheckBox] = {}
+        self._status_labels: dict[str, QLabel] = {}
+
+        self.setWindowTitle("Review & Send Emails")
+        self.setMinimumSize(1000, 620)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(14)
+
+        # ---- header info ------------------------------------------------
+        outbound_ok = cfg.email.enable_outbound_send and bool(cfg.email.smtp_host)
+        if outbound_ok:
+            info_text = (
+                f"<b>Outbound sending is enabled</b> · SMTP: {cfg.email.smtp_host}:{cfg.email.smtp_port}"
+                f"{'  ·  Redirecting all to: ' + cfg.email.redirect_all_to if cfg.email.redirect_all_to else ''}"
+            )
+            info_style = "background:#DCFCE7;border:1px solid #86EFAC;border-radius:6px;padding:8px 12px;font-size:12px;"
+        else:
+            reason = ("SMTP not configured" if not cfg.email.smtp_host
+                      else "outbound sending is disabled in Email settings")
+            info_text = f"<b>Sending unavailable</b> — {reason}. Open Email settings to configure."
+            info_style = "background:#FEF3C7;border:1px solid #FCD34D;border-radius:6px;padding:8px 12px;font-size:12px;"
+        info = QLabel(info_text)
+        info.setStyleSheet(info_style)
+        info.setWordWrap(True)
+        root.addWidget(info)
+
+        # ---- body: checklist left, preview right -------------------------
+        body = QHBoxLayout()
+        body.setSpacing(12)
+
+        # Left: scrollable checklist
+        left = QFrame()
+        left.setStyleSheet(f"QFrame {{ border: 1px solid {BORDER}; border-radius: 8px; background: {SURFACE}; }}")
+        left.setFixedWidth(340)
+        left_lay = QVBoxLayout(left)
+        left_lay.setContentsMargins(8, 8, 8, 8)
+        left_lay.setSpacing(4)
+
+        sel_row = QHBoxLayout()
+        sel_all = QPushButton("Select all")
+        sel_all.setFixedHeight(26)
+        sel_all.clicked.connect(lambda: self._set_all(True))
+        desel_all = QPushButton("Deselect all")
+        desel_all.setFixedHeight(26)
+        desel_all.clicked.connect(lambda: self._set_all(False))
+        sel_row.addWidget(sel_all)
+        sel_row.addWidget(desel_all)
+        sel_row.addStretch()
+        left_lay.addLayout(sel_row)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        inner_lay = QVBoxLayout(inner)
+        inner_lay.setContentsMargins(4, 4, 4, 4)
+        inner_lay.setSpacing(2)
+
+        rep_keys = [k for k in drafts if k != MASTER_KEY]
+        if MASTER_KEY in drafts:
+            rep_keys = [MASTER_KEY] + rep_keys
+
+        for key in rep_keys:
+            d = drafts[key]
+            has_email = bool(d.get("to"))
+            row_w = QWidget()
+            row_lay = QHBoxLayout(row_w)
+            row_lay.setContentsMargins(4, 3, 4, 3)
+            row_lay.setSpacing(8)
+
+            cb = QCheckBox()
+            cb.setChecked(has_email)
+            cb.setEnabled(has_email)
+            cb.stateChanged.connect(self._update_send_btn)
+            self._checkboxes[key] = cb
+            row_lay.addWidget(cb)
+
+            lbl = QLabel(
+                f"<b>{d['rep_name']}</b><br>"
+                f"<span style='color:#64748B;font-size:11px;'>"
+                f"{d['to'] if has_email else '<i>no email on file</i>'}</span>"
+            )
+            lbl.setWordWrap(False)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            lbl.mousePressEvent = lambda _, k=key: self._preview_key(k)
+            row_lay.addWidget(lbl, 1)
+
+            st = QLabel("")
+            st.setFixedWidth(60)
+            st.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            st.setStyleSheet("font-size: 11px; font-weight: 600;")
+            self._status_labels[key] = st
+            row_lay.addWidget(st)
+
+            inner_lay.addWidget(row_w)
+
+        inner_lay.addStretch()
+        scroll.setWidget(inner)
+        left_lay.addWidget(scroll, 1)
+        body.addWidget(left)
+
+        # Right: preview browser
+        self.preview = QTextBrowser()
+        self.preview.setOpenExternalLinks(False)
+        self.preview.setStyleSheet(
+            f"QTextBrowser {{ background: {SURFACE}; border: 1px solid {BORDER};"
+            f" border-radius: 8px; padding: 14px; }}"
+        )
+        body.addWidget(self.preview, 1)
+        root.addLayout(body, 1)
+
+        # ---- status bar -------------------------------------------------
+        self._status_bar = QLabel("")
+        self._status_bar.setStyleSheet(f"font-size: 11px; color: {TEXT_MUTED};")
+        root.addWidget(self._status_bar)
+
+        # ---- buttons ----------------------------------------------------
+        btn_row = QHBoxLayout()
+        self.send_btn = QPushButton("Send Selected")
+        self.send_btn.setProperty("primary", True)
+        self.send_btn.setEnabled(outbound_ok)
+        self.send_btn.clicked.connect(self._send)
+        btn_row.addWidget(self.send_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+        # Preview first item
+        if rep_keys:
+            self._preview_key(rep_keys[0])
+        self._update_send_btn()
+
+    # ---------------------------------------------------------------- helpers
+    def _set_all(self, state: bool) -> None:
+        for key, cb in self._checkboxes.items():
+            if cb.isEnabled():
+                cb.setChecked(state)
+
+    def _update_send_btn(self) -> None:
+        n = sum(1 for cb in self._checkboxes.values() if cb.isChecked())
+        self.send_btn.setText(f"Send Selected ({n})" if n else "Send Selected")
+        self.send_btn.setEnabled(
+            n > 0
+            and self._cfg.email.enable_outbound_send
+            and bool(self._cfg.email.smtp_host)
+            and (self._worker is None)
+        )
+
+    def _preview_key(self, key: str) -> None:
+        d = self._drafts.get(key)
+        if not d:
+            return
+        no_email = d["to"] or "(no email on file)"
+        header = (
+            f"<div style='color:{TEXT_MUTED};font-size:12px;margin-bottom:8px;'>"
+            f"<b>To:</b> {no_email}<br>"
+            + (f"<b>Cc:</b> {d['cc']}<br>" if d.get("cc") else "")
+            + f"<b>Subject:</b> {d['subject']}</div>"
+        )
+        self.preview.setHtml(header + d.get("body_html", ""))
+
+    # ---------------------------------------------------------------- send
+    def _send(self) -> None:
+        jobs = [
+            (k, self._drafts[k])
+            for k, cb in self._checkboxes.items()
+            if cb.isChecked()
+        ]
+        if not jobs:
+            return
+
+        self.send_btn.setEnabled(False)
+        self._status_bar.setText(f"Sending {len(jobs)} email(s)…")
+        for k in self._checkboxes:
+            self._status_labels[k].setText("")
+
+        client = EmailClient(self._cfg.email)
+        self._worker = _SendWorker(jobs, client)
+        self._worker.result.connect(self._on_result)
+        self._worker.finished_all.connect(self._on_finished)
+        self._worker.start()
+
+    def _on_result(self, key: str, ok: bool, error: str) -> None:
+        lbl = self._status_labels.get(key)
+        if lbl is None:
+            return
+        if ok:
+            lbl.setText("✓ Sent")
+            lbl.setStyleSheet("font-size:11px;font-weight:600;color:#16A34A;")
+        else:
+            lbl.setText("✗ Failed")
+            lbl.setToolTip(error)
+            lbl.setStyleSheet("font-size:11px;font-weight:600;color:#DC2626;")
+
+    def _on_finished(self) -> None:
+        sent = sum(
+            1 for k, lbl in self._status_labels.items()
+            if "Sent" in lbl.text()
+        )
+        failed = sum(
+            1 for k, lbl in self._status_labels.items()
+            if "Failed" in lbl.text()
+        )
+        self._status_bar.setText(
+            f"Done — {sent} sent, {failed} failed."
+            + (" Hover ✗ Failed items to see the error." if failed else "")
+        )
+        self._worker = None
+        self._update_send_btn()
 
 
 # ============================================================ view
@@ -843,28 +1104,10 @@ class WeeklyEmailView(QWidget):
         ))
 
     def _queue(self) -> None:
-        ready = sum(1 for k, d in self._drafts.items() if k != MASTER_KEY and d["to"])
-        missing = sum(1 for k, d in self._drafts.items() if k != MASTER_KEY and not d["to"])
-        master = "yes" if MASTER_KEY in self._drafts else "no"
-        if self._cfg.email.enable_outbound_send:
-            send_note = (
-                f"<p style='color:#16A34A;font-size:11px;'>"
-                f"Outbound sending is enabled. Actual dispatch coming in next release.</p>"
-            )
-        else:
-            send_note = (
-                f"<p style='color:{TEXT_MUTED};font-size:11px;'>Outbound sending "
-                f"is disabled \u2014 enable it in Email settings to send.</p>"
-            )
-        self.preview.setHtml(
-            f"<h3>Ready to queue</h3>"
-            f"<ul>"
-            f"<li>{ready} per-rep draft(s) have a recipient.</li>"
-            f"<li>{missing} per-rep draft(s) are missing an email \u2014 set them in Sales Reps.</li>"
-            f"<li>Master leaderboard included: <b>{master}</b>.</li>"
-            f"</ul>"
-            + send_note
-        )
+        if not self._drafts:
+            return
+        dlg = _SendReviewDialog(self._drafts, self._cfg, parent=self)
+        dlg.exec()
 
 
 # ============================================================ rendering
@@ -1216,93 +1459,147 @@ def _render_master_html(
     )
 
     # ---- plain text for clipboard -----------------------------------------
-    # Format dates for display (e.g. "May 10" / "May 14, 2026")
+    # Format dates for display (e.g. "May 10, 2026")
     def _fmt_date(d: date) -> str:
         return d.strftime("%b %#d, %Y") if hasattr(d, "strftime") else str(d)
 
-    # Build shoutout blocks (placed FIRST, before the table)
-    shoutout_lines: list[str] = []
-    if top3_weekly:
-        shoutout_lines.append("⭐  TOP 3 THIS WEEK")
-        shoutout_lines.append("")
-        for i, (rep, rev) in enumerate(top3_weekly):
-            txt = shoutouts_weekly.get(rep, "")
-            shoutout_lines.append(f"  {medals[i]}  {rep}  —  ${rev:,.0f}")
-            if txt:
-                shoutout_lines.append(f"       {txt}")
-        shoutout_lines.append("")
-
-    if top3_improvement:
-        shoutout_lines.append(f"📈  MOST IMPROVED — {imp_label.upper()}")
-        shoutout_lines.append("")
-        for i, (rep, delta) in enumerate(top3_improvement):
-            cur = imp_cur_avg.get(rep, 0.0)
-            prev = imp_prior_avg.get(rep, 0.0)
-            txt = shoutouts_imp.get(rep, "")
-            shoutout_lines.append(
-                f"  {medals[i]}  {rep}  —  ${cur:,.0f}/wk now  vs  ${prev:,.0f}/wk last year  (+${delta:,.0f}/wk)"
-            )
-            if txt:
-                shoutout_lines.append(f"       {txt}")
-        shoutout_lines.append("")
-
-    # Table: use fixed-width columns (works in Outlook/Gmail with monospace paste)
-    # Determine dynamic column widths based on actual rep names
+    # Dynamic column widths based on longest rep name
     max_name = max((len(rep) for rep, _ in leaderboard), default=10)
-    name_w = max(max_name, 20)
-    col_w = (3, name_w, 13, 15, 15)
+    name_w = max(max_name, 22)
+    # Shoutout-section name width (longest across weekly + improvement)
+    shout_all = [r for r, _ in top3_weekly] + [r for r, _ in top3_improvement]
+    shout_name_w = max((len(r) for r in shout_all), default=18) if shout_all else 18
+    shout_name_w = max(shout_name_w, 18)
+
+    rank_w, wk_w, ytd_w, prev_w = 3, 13, 14, 14
     sep = "   "
-    rule = "─" * (sum(col_w) + len(sep) * 4)
+    col_total = rank_w + name_w + wk_w + ytd_w + prev_w + len(sep) * 4
+    heavy = "═" * col_total
+    light = "─" * col_total
+
+    def _cell(s: str, w: int, align: str = "right") -> str:
+        return s.rjust(w) if align == "right" else s.ljust(w)
 
     def _row(rank: str, name: str, wk: str, ytd: str, prior: str) -> str:
         return (
-            rank.rjust(col_w[0]) + sep
-            + name.ljust(col_w[1]) + sep
-            + wk.rjust(col_w[2]) + sep
-            + ytd.rjust(col_w[3]) + sep
-            + prior.rjust(col_w[4])
+            _cell(rank, rank_w) + sep
+            + _cell(name, name_w, "left") + sep
+            + _cell(wk, wk_w) + sep
+            + _cell(ytd, ytd_w) + sep
+            + _cell(prior, prev_w)
         )
 
-    table_lines: list[str] = [
+    # ---- shoutout sections -----------------------------------------------
+    medals_txt = ["1.", "2.", "3."]
+    plain_lines: list[str] = [
+        "WEEKLY TEAM LEADERBOARD",
+        f"  Week: {_fmt_date(wk_start)} to {_fmt_date(wk_end)}"
+        + (" (in progress)" if using_current_week else ""),
+        f"  Period: {period_label}",
+        heavy,
+    ]
+
+    if top3_weekly:
+        # mini-table header
+        wk_inner_w = max((len(f"${r:,.0f}") for _, r in top3_weekly), default=10)
+        wk_inner_w = max(wk_inner_w, 12)
+        plain_lines += [
+            "",
+            "TOP 3 THIS WEEK",
+            f"  {'':>{3}}  {'Rep':<{shout_name_w}}  {'Sales':>{wk_inner_w}}",
+            f"  {'─'*3}  {'─'*shout_name_w}  {'─'*wk_inner_w}",
+        ]
+        for i, (rep, rev) in enumerate(top3_weekly):
+            plain_lines.append(
+                f"  {medals_txt[i]:>3}  {rep:<{shout_name_w}}  ${rev:>{wk_inner_w-1},.0f}"
+            )
+        plain_lines.append("")
+        # Quotes below the mini-table
+        for rep, _ in top3_weekly:
+            txt = shoutouts_weekly.get(rep, "")
+            if txt:
+                # Wrap quote to ~80 chars with indent
+                q_indent = " " * (shout_name_w + 8)
+                words = txt.split()
+                line, lines = "", []
+                for w in words:
+                    if len(line) + len(w) + 1 > 76:
+                        lines.append(line)
+                        line = w
+                    else:
+                        line = (line + " " + w).strip()
+                if line:
+                    lines.append(line)
+                plain_lines.append(f"  {rep}:")
+                for ln in lines:
+                    plain_lines.append(f"      {ln}")
+        plain_lines.append("")
+
+    if top3_improvement:
+        # mini-table for improvement section with Now/Wk | Prev/Wk | +/-/Wk
+        ni_w, pi_w, di_w = 12, 12, 12
+        plain_lines += [
+            f"MOST IMPROVED — {imp_label.upper()}",
+            f"  {'':>3}  {'Rep':<{shout_name_w}}  {'Now/Wk':>{ni_w}}  {'Prev/Wk':>{pi_w}}  {'+/-/Wk':>{di_w}}",
+            f"  {'─'*3}  {'─'*shout_name_w}  {'─'*ni_w}  {'─'*pi_w}  {'─'*di_w}",
+        ]
+        for i, (rep, delta) in enumerate(top3_improvement):
+            cur = imp_cur_avg.get(rep, 0.0)
+            prev = imp_prior_avg.get(rep, 0.0)
+            sign = "+" if delta >= 0 else ""
+            plain_lines.append(
+                f"  {medals_txt[i]:>3}  {rep:<{shout_name_w}}"
+                f"  ${cur:>{ni_w-1},.0f}"
+                f"  ${prev:>{pi_w-1},.0f}"
+                f"  {sign}${abs(delta):>{di_w-2},.0f}"
+            )
+        plain_lines.append("")
+        for rep, _ in top3_improvement:
+            txt = shoutouts_imp.get(rep, "")
+            if txt:
+                words = txt.split()
+                line, lines = "", []
+                for w in words:
+                    if len(line) + len(w) + 1 > 76:
+                        lines.append(line)
+                        line = w
+                    else:
+                        line = (line + " " + w).strip()
+                if line:
+                    lines.append(line)
+                plain_lines.append(f"  {rep}:")
+                for ln in lines:
+                    plain_lines.append(f"      {ln}")
+        plain_lines.append("")
+
+    # ---- main standings table -------------------------------------------
+    plain_lines += [
+        heavy,
+        "FULL STANDINGS",
+        heavy,
         _row("#", "Rep", "This Week", "YTD Avg/Wk", "Prev YTD Avg"),
-        rule,
+        light,
     ]
     for i, (rep, _) in enumerate(leaderboard, 1):
         weekly = per_rep_weekly.get(rep, 0.0)
         ytd = per_rep_ytd_avg.get(rep, 0.0)
         prior = per_rep_prior_ytd_avg.get(rep, 0.0)
-        table_lines.append(_row(
+        plain_lines.append(_row(
             str(i),
             rep[:name_w],
             f"${weekly:,.0f}" if weekly > 0 else "—",
             f"${ytd:,.0f}",
             f"${prior:,.0f}" if prior > 0 else "—",
         ))
-    table_lines += [
-        rule,
+    plain_lines += [
+        light,
         _row("", "TOTAL",
              f"${total_weekly:,.0f}",
              f"${total_ytd_avg:,.0f}",
              f"${total_prior_ytd_avg:,.0f}" if total_prior_ytd_avg > 0 else "—"),
-    ]
-
-    # Final assembly — shoutouts FIRST, then table
-    top_rule = "═" * (sum(col_w) + len(sep) * 4)
-    plain_lines: list[str] = [
-        f"📊  WEEKLY TEAM LEADERBOARD",
-        f"Week: {_fmt_date(wk_start)} → {_fmt_date(wk_end)}"
-        + ("  (in progress)" if using_current_week else ""),
-        f"YTD period: {period_label}",
-        top_rule,
+        heavy,
         "",
-    ]
-    plain_lines += shoutout_lines
-    plain_lines.append("FULL STANDINGS")
-    plain_lines.append("")
-    plain_lines += table_lines
-    plain_lines += [
-        "",
-        "* Invoiced sales only (open orders excluded).",
+        "* Invoiced sales only — open orders excluded.",
     ]
 
     plain_text = "\n".join(plain_lines)

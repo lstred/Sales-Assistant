@@ -116,6 +116,10 @@ class BudgetConfig(BaseModel):
             8.34, 8.33, 8.33, 8.34, 8.33, 8.33,
         ]
     )
+    rep_cc_growth_pct_saved: dict[str, dict[str, float]] = Field(default_factory=dict)
+    """Persisted rep-level growth overrides from the last upload.
+    Outer key = rep_number (str), inner = cc_code → growth_pct.
+    Serialised as nested JSON so it survives app restarts."""
 
 
 class GlobalFiltersConfig(BaseModel):

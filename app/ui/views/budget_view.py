@@ -206,7 +206,6 @@ class _SettingsPanel(QWidget):
         self._cfg = cfg
         self._rep_cc_overrides: dict[tuple[str, str], float] = {}
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -387,6 +386,26 @@ class _SettingsPanel(QWidget):
         lay.addWidget(up_card)
         lay.addStretch()
 
+        # Load any previously-saved rep-CC overrides from config
+        self._load_saved_overrides()
+
+    def _load_saved_overrides(self) -> None:
+        """Restore rep-CC overrides persisted from a previous upload."""
+        saved = self._cfg.budget.rep_cc_growth_pct_saved
+        if not saved:
+            return
+        self._rep_cc_overrides = {
+            (rep, cc): pct
+            for rep, cc_map in saved.items()
+            for cc, pct in cc_map.items()
+        }
+        self._refresh_upload_preview()
+        n = len(self._rep_cc_overrides)
+        self._upload_status.setText(
+            f"{n} rep × CC override(s) restored from last session."
+        )
+        self._upload_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #16A34A;")
+
     # ------------------------------------------------------------ public
     def budget_year(self) -> int:
         return self.yr_spin.value()
@@ -479,6 +498,15 @@ class _SettingsPanel(QWidget):
                 "CC-level % used as fallback for any unspecified rep × CC pairs."
             )
             self._upload_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #16A34A;")
+            # Persist to config so overrides survive app restart
+            nested: dict[str, dict[str, float]] = {}
+            for (rep, cc), pct in overrides.items():
+                nested.setdefault(rep, {})[cc] = pct
+            self._cfg.budget.rep_cc_growth_pct_saved = nested
+            try:
+                save_config(self._cfg)
+            except Exception:
+                log.exception("Failed to persist rep-CC overrides to config")
             self.upload_applied.emit()  # tell BudgetView to recompute with new overrides
         else:
             self._upload_status.setText("Upload produced no usable rows — check the file.")
