@@ -70,7 +70,7 @@ class BudgetRow:
     vs_budget: float = 0.0          # ytd_actual − ytd_budget
 
 
-# ---------------------------------------------------------------- upload helper
+# ---------------------------------------------------------------- upload helpers
 
 def parse_rep_cc_upload(path: str) -> tuple[dict[tuple[str, str], float], list[str]]:
     """Parse a CSV or Excel file with rep-level growth overrides.
@@ -130,6 +130,146 @@ def parse_rep_cc_upload(path: str) -> tuple[dict[tuple[str, str], float], list[s
         result[(rep, cc)] = pct
 
     return result, errors
+
+
+def parse_rep_budget_upload(path: str) -> tuple[dict[str, float], list[str]]:
+    """Parse a CSV or Excel file that sets a total full-year budget per rep.
+
+    Expected columns (case-insensitive): ``salesman_number``, ``full_budget``.
+    Returns ``({rep_number: target_budget}, errors)``.
+    """
+    import os as _os
+    errors: list[str] = []
+    result: dict[str, float] = {}
+    try:
+        ext = _os.path.splitext(path)[1].lower()
+        if ext in (".xlsx", ".xls"):
+            df = pd.read_excel(path, dtype=str)
+        else:
+            df = pd.read_csv(path, dtype=str)
+    except Exception as exc:  # noqa: BLE001
+        return {}, [f"Could not open file: {exc}"]
+
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+    missing = [c for c in ("salesman_number", "full_budget") if c not in df.columns]
+    if missing:
+        return {}, [
+            f"Missing required column(s): {', '.join(missing)}. "
+            "File must have columns: salesman_number, full_budget"
+        ]
+
+    for i, row in df.iterrows():
+        raw_rep = row.get("salesman_number", "")
+        raw_budget = row.get("full_budget", "")
+        rep = "" if pd.isna(raw_rep) else str(raw_rep).strip()
+        budget_str = "" if pd.isna(raw_budget) else str(raw_budget).strip().replace("$", "").replace(",", "")
+        if not rep:
+            errors.append(f"Row {i + 2}: salesman_number is blank — skipped.")
+            continue
+        # Normalize rep number (strip leading zeros)
+        if rep.isdigit():
+            rep = str(int(rep))
+        try:
+            budget = float(budget_str)
+        except ValueError:
+            errors.append(f"Row {i + 2}: full_budget '{budget_str}' is not a number — skipped.")
+            continue
+        if budget < 0:
+            errors.append(f"Row {i + 2}: full_budget must be ≥ 0 — skipped.")
+            continue
+        result[rep] = budget
+
+    return result, errors
+
+
+def apply_rep_budget_targets(
+    rows_by_rep: list["BudgetRow"],
+    rows_by_cc: list["BudgetRow"],
+    rows_by_acct: list["BudgetRow"],
+    rep_budget_targets: dict[str, float],
+) -> None:
+    """Scale all three row lists so each rep's budget matches the uploaded target.
+
+    For each rep in ``rep_budget_targets``:
+      1. Sum current ``budget_full_year`` across all their rep rows → current_total.
+      2. scale = target / current_total.
+      3. Multiply ``budget_full_year``, ``monthly_budget``, and ``dollar_change``
+         by ``scale`` for every row belonging to that rep (in rep and account lists).
+      4. Rebuild CC rows by summing the scaled rep rows per CC (only CCs that have
+         at least one affected rep are updated, so unrelated CC budgets are untouched).
+
+    Modifies all three lists in-place.  No-op when ``rep_budget_targets`` is empty
+    or when a rep's current total budget is zero (nothing to scale).
+    """
+    if not rep_budget_targets:
+        return
+
+    def _norm(rep: str) -> str:
+        return str(int(rep)) if str(rep).isdigit() else str(rep)
+
+    # Normalise target keys
+    norm_targets: dict[str, float] = {_norm(k): float(v) for k, v in rep_budget_targets.items()}
+
+    # Compute current total per rep from rows_by_rep
+    current_total: dict[str, float] = {}
+    for row in rows_by_rep:
+        nk = _norm(row.rep_number)
+        if nk in norm_targets:
+            current_total[nk] = current_total.get(nk, 0.0) + row.budget_full_year
+
+    # Scaling factors (skip reps with 0 budget — nothing to scale)
+    scale: dict[str, float] = {
+        rep: norm_targets[rep] / current_total[rep]
+        for rep in norm_targets
+        if current_total.get(rep, 0.0) > 0
+    }
+    if not scale:
+        return
+
+    def _scale_row(row: "BudgetRow", s: float) -> None:
+        row.budget_full_year *= s
+        row.dollar_change = row.budget_full_year - row.prior_year_sales
+        row.monthly_budget = [m * s for m in row.monthly_budget]
+        if row.prior_year_sales > 0:
+            row.growth_pct = (row.budget_full_year / row.prior_year_sales - 1.0) * 100.0
+
+    # Scale rep rows
+    for row in rows_by_rep:
+        s = scale.get(_norm(row.rep_number))
+        if s is not None:
+            _scale_row(row, s)
+
+    # Scale account rows
+    for row in rows_by_acct:
+        s = scale.get(_norm(row.rep_number))
+        if s is not None:
+            _scale_row(row, s)
+
+    # Rebuild CC rows from scaled rep rows.
+    # Only update CCs that contain at least one rep with a scaling factor.
+    cc_budget_new: dict[str, float] = {}
+    cc_monthly_new: dict[str, list[float]] = {}
+    cc_has_scaled: set[str] = set()
+    for row in rows_by_rep:
+        if not row.rep_number:
+            continue
+        if _norm(row.rep_number) in scale:
+            cc_has_scaled.add(row.cc_code)
+        cc_budget_new[row.cc_code] = cc_budget_new.get(row.cc_code, 0.0) + row.budget_full_year
+        if row.cc_code not in cc_monthly_new:
+            cc_monthly_new[row.cc_code] = [0.0] * 12
+        for i, m in enumerate(row.monthly_budget):
+            cc_monthly_new[row.cc_code][i] += m
+
+    for cc_row in rows_by_cc:
+        if cc_row.cc_code not in cc_has_scaled:
+            continue
+        new_budget = cc_budget_new.get(cc_row.cc_code, cc_row.budget_full_year)
+        cc_row.budget_full_year = new_budget
+        cc_row.dollar_change = new_budget - cc_row.prior_year_sales
+        cc_row.monthly_budget = cc_monthly_new.get(cc_row.cc_code, cc_row.monthly_budget)
+        if cc_row.prior_year_sales > 0:
+            cc_row.growth_pct = (new_budget / cc_row.prior_year_sales - 1.0) * 100.0
 
 
 # ---------------------------------------------------------------- internal helpers

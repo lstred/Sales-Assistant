@@ -121,6 +121,12 @@ class BudgetConfig(BaseModel):
     Outer key = rep_number (str), inner = cc_code → growth_pct.
     Serialised as nested JSON so it survives app restarts."""
 
+    rep_budget_targets_saved: dict[str, float] = Field(default_factory=dict)
+    """Persisted per-rep total budget targets from the last upload.
+    Key = rep_number (str), value = target full-year budget ($).
+    When present, all per-CC and per-account budgets for the rep are scaled
+    proportionally so their sum matches this target."""
+
 
 class GlobalFiltersConfig(BaseModel):
     """App-wide default filters applied to every sales-driven view.

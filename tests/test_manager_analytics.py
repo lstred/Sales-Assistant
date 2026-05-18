@@ -187,3 +187,92 @@ def test_budget_cc_level_fallback_when_no_override() -> None:
     for rows in (rows_no_override, rows_with_empty):
         assert len(rows) == 1
         assert abs(rows[0].budget_full_year - 8_800.0) < 0.01   # 8k * 1.10
+
+
+def test_parse_rep_budget_upload_basic(tmp_path) -> None:
+    """parse_rep_budget_upload reads salesman_number + full_budget from CSV."""
+    from app.services.budget_service import parse_rep_budget_upload
+    csv_path = tmp_path / "budgets.csv"
+    csv_path.write_text("salesman_number,full_budget\n212,450000\n206,380000\n")
+    targets, errors = parse_rep_budget_upload(str(csv_path))
+    assert not errors
+    assert targets == {"212": 450_000.0, "206": 380_000.0}
+
+
+def test_parse_rep_budget_upload_normalises_rep_and_skips_bad(tmp_path) -> None:
+    """parse_rep_budget_upload strips leading zeros and skips invalid rows."""
+    from app.services.budget_service import parse_rep_budget_upload
+    csv_path = tmp_path / "budgets.csv"
+    csv_path.write_text(
+        "salesman_number,full_budget\n"
+        "042,300000\n"          # leading zero → normalised to "42"
+        ",bad\n"                 # blank rep → skipped with error
+        "99,notanumber\n"        # bad budget → skipped with error
+    )
+    targets, errors = parse_rep_budget_upload(str(csv_path))
+    assert targets == {"42": 300_000.0}
+    assert len(errors) == 2   # blank rep + bad number
+
+
+def test_apply_rep_budget_targets_scales_all_three_levels() -> None:
+    """apply_rep_budget_targets scales rep, account, and CC rows proportionally."""
+    import pandas as pd
+    from app.services.budget_service import (
+        BudgetRow,
+        apply_rep_budget_targets,
+    )
+    # Rep 1 has two CC rows totalling $20k budget
+    r_rep1_cc1 = BudgetRow(cc_code="010", rep_number="1", prior_year_sales=10_000,
+                            growth_pct=0.0, budget_full_year=10_000, dollar_change=0,
+                            monthly_budget=[10_000 / 12] * 12)
+    r_rep1_cc2 = BudgetRow(cc_code="011", rep_number="1", prior_year_sales=10_000,
+                            growth_pct=0.0, budget_full_year=10_000, dollar_change=0,
+                            monthly_budget=[10_000 / 12] * 12)
+    # Rep 2 has one CC row totalling $5k budget
+    r_rep2_cc1 = BudgetRow(cc_code="010", rep_number="2", prior_year_sales=5_000,
+                            growth_pct=0.0, budget_full_year=5_000, dollar_change=0,
+                            monthly_budget=[5_000 / 12] * 12)
+
+    # CC rows (sum of reps)
+    cc_010 = BudgetRow(cc_code="010", prior_year_sales=15_000,
+                       growth_pct=0.0, budget_full_year=15_000, dollar_change=0,
+                       monthly_budget=[15_000 / 12] * 12)
+    cc_011 = BudgetRow(cc_code="011", prior_year_sales=10_000,
+                       growth_pct=0.0, budget_full_year=10_000, dollar_change=0,
+                       monthly_budget=[10_000 / 12] * 12)
+
+    # Account row for rep 1
+    r_acct = BudgetRow(cc_code="010", rep_number="1", prior_year_sales=10_000,
+                       growth_pct=0.0, budget_full_year=10_000, dollar_change=0,
+                       monthly_budget=[10_000 / 12] * 12)
+
+    rows_by_rep = [r_rep1_cc1, r_rep1_cc2, r_rep2_cc1]
+    rows_by_cc = [cc_010, cc_011]
+    rows_by_acct = [r_acct]
+
+    # Target: rep 1 = $30k (scale ×1.5), rep 2 unchanged (no target)
+    apply_rep_budget_targets(rows_by_rep, rows_by_cc, rows_by_acct, {"1": 30_000.0})
+
+    # Rep rows for rep 1 should each be ×1.5
+    assert abs(r_rep1_cc1.budget_full_year - 15_000.0) < 0.01
+    assert abs(r_rep1_cc2.budget_full_year - 15_000.0) < 0.01
+    # Rep 2 unchanged
+    assert abs(r_rep2_cc1.budget_full_year - 5_000.0) < 0.01
+
+    # Account row for rep 1 should also be ×1.5
+    assert abs(r_acct.budget_full_year - 15_000.0) < 0.01
+
+    # CC 010 = rep1 (15k) + rep2 (5k) = 20k
+    assert abs(cc_010.budget_full_year - 20_000.0) < 0.01
+    # CC 011 = rep1 only (15k)
+    assert abs(cc_011.budget_full_year - 15_000.0) < 0.01
+
+
+def test_apply_rep_budget_targets_zero_current_is_noop() -> None:
+    """apply_rep_budget_targets is a no-op when current budget is zero (avoids div/0)."""
+    from app.services.budget_service import BudgetRow, apply_rep_budget_targets
+    row = BudgetRow(cc_code="010", rep_number="1", prior_year_sales=0,
+                    growth_pct=0.0, budget_full_year=0.0, dollar_change=0,
+                    monthly_budget=[0.0] * 12)
+    apply_rep_budget_targets([row], [], [], {"1": 50_000.0})
+    assert row.budget_full_year == 0.0  # unchanged — nothing to scale

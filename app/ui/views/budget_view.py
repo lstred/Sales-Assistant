@@ -43,9 +43,11 @@ from app.services.budget_service import (
     PERIOD_MONTH_NAMES,
     BudgetRow,
     add_ytd_actuals,
+    apply_rep_budget_targets,
     compute_budget_by_account,
     compute_budget_by_cc,
     compute_budget_by_rep,
+    parse_rep_budget_upload,
     parse_rep_cc_upload,
     rows_to_dataframe,
 )
@@ -199,12 +201,14 @@ class _SettingsPanel(QWidget):
 
     compute_requested = Signal()
     saved = Signal()
-    upload_applied = Signal()  # emitted when a rep-CC override file is successfully loaded
+    upload_applied = Signal()           # rep-CC growth override uploaded
+    budget_targets_applied = Signal()   # rep total budget targets uploaded
 
     def __init__(self, cfg: AppConfig, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._cfg = cfg
         self._rep_cc_overrides: dict[tuple[str, str], float] = {}
+        self._rep_budget_targets: dict[str, float] = {}
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -384,27 +388,100 @@ class _SettingsPanel(QWidget):
         up_lay.addWidget(self._upload_preview)
 
         lay.addWidget(up_card)
+
+        # --- Rep Total Budget upload card ---
+        tb_card = QFrame()
+        tb_card.setObjectName("card")
+        tb_lay = QVBoxLayout(tb_card)
+        tb_lay.setContentsMargins(12, 12, 12, 12)
+        tb_lay.setSpacing(8)
+        tb_title = QLabel("Rep Total Budget (Upload)")
+        tb_title.setStyleSheet("font-weight: 700; font-size: 13px;")
+        tb_lay.addWidget(tb_title)
+        tb_sub = QLabel(
+            "Upload a target full-year budget per sales rep. The system scales each rep's "
+            "per-CC and per-customer budgets proportionally so they sum to the uploaded total. "
+            "Applied after Compute, on top of any growth % or rep-CC overrides."
+        )
+        tb_sub.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
+        tb_sub.setWordWrap(True)
+        tb_lay.addWidget(tb_sub)
+
+        tb_spec = QLabel(
+            "<b>Required columns (exact names, case-insensitive):</b><br>"
+            "&nbsp;&nbsp;<b>salesman_number</b> — rep number (e.g. <tt>212</tt>)<br>"
+            "&nbsp;&nbsp;<b>full_budget</b> — target full-year dollar amount "
+            "(e.g. <tt>450000</tt> or <tt>$450,000</tt>)<br>"
+            "One row per rep. Leading zeros in rep numbers are optional. Extra columns are ignored."
+        )
+        tb_spec.setStyleSheet(
+            f"background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 6px; "
+            f"padding: 8px; font-size: 11px; color: {TEXT};"
+        )
+        tb_spec.setWordWrap(True)
+        tb_lay.addWidget(tb_spec)
+
+        tb_btn_row = QHBoxLayout()
+        tb_btn_row.setSpacing(6)
+        self._tb_upload_btn = QPushButton("⬆  Upload CSV / Excel")
+        self._tb_upload_btn.clicked.connect(self._upload_budget_targets)
+        tb_btn_row.addWidget(self._tb_upload_btn, 1)
+        self._tb_template_btn = QPushButton("⬇  Template")
+        self._tb_template_btn.clicked.connect(self._download_budget_template)
+        tb_btn_row.addWidget(self._tb_template_btn)
+        tb_lay.addLayout(tb_btn_row)
+
+        self._tb_clear_btn = QPushButton("✕  Clear Targets")
+        self._tb_clear_btn.setStyleSheet(f"color: #DC2626; font-size: 11px;")
+        self._tb_clear_btn.setVisible(False)
+        self._tb_clear_btn.clicked.connect(self._clear_budget_targets)
+        tb_lay.addWidget(self._tb_clear_btn)
+
+        self._tb_status = QLabel("No file loaded — growth % settings determine all budgets.")
+        self._tb_status.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
+        self._tb_status.setWordWrap(True)
+        tb_lay.addWidget(self._tb_status)
+
+        self._tb_preview = QTableWidget(0, 2)
+        self._tb_preview.setHorizontalHeaderLabels(["Rep #", "Target Budget"])
+        self._tb_preview.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._tb_preview.verticalHeader().setVisible(False)
+        self._tb_preview.setAlternatingRowColors(True)
+        self._tb_preview.setMaximumHeight(130)
+        self._tb_preview.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._tb_preview.setVisible(False)
+        tb_lay.addWidget(self._tb_preview)
+
+        lay.addWidget(tb_card)
         lay.addStretch()
 
-        # Load any previously-saved rep-CC overrides from config
+        # Load any previously-saved overrides from config
         self._load_saved_overrides()
 
     def _load_saved_overrides(self) -> None:
-        """Restore rep-CC overrides persisted from a previous upload."""
-        saved = self._cfg.budget.rep_cc_growth_pct_saved
-        if not saved:
-            return
-        self._rep_cc_overrides = {
-            (rep, cc): pct
-            for rep, cc_map in saved.items()
-            for cc, pct in cc_map.items()
-        }
-        self._refresh_upload_preview()
-        n = len(self._rep_cc_overrides)
-        self._upload_status.setText(
-            f"{n} rep × CC override(s) restored from last session."
-        )
-        self._upload_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #16A34A;")
+        """Restore rep-CC overrides and rep budget targets from config."""
+        saved_cc = self._cfg.budget.rep_cc_growth_pct_saved
+        if saved_cc:
+            self._rep_cc_overrides = {
+                (rep, cc): pct
+                for rep, cc_map in saved_cc.items()
+                for cc, pct in cc_map.items()
+            }
+            self._refresh_upload_preview()
+            n = len(self._rep_cc_overrides)
+            self._upload_status.setText(
+                f"{n} rep × CC override(s) restored from last session."
+            )
+            self._upload_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #16A34A;")
+
+        saved_tb = self._cfg.budget.rep_budget_targets_saved
+        if saved_tb:
+            self._rep_budget_targets = dict(saved_tb)
+            self._refresh_tb_preview()
+            n = len(self._rep_budget_targets)
+            self._tb_status.setText(f"{n} rep total budget target(s) restored from last session.")
+            self._tb_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #16A34A;")
+            self._tb_clear_btn.setVisible(True)
 
     # ------------------------------------------------------------ public
     def budget_year(self) -> int:
@@ -427,6 +504,10 @@ class _SettingsPanel(QWidget):
     def rep_cc_growth_pct(self) -> dict[tuple[str, str], float]:
         """Rep-CC override map from uploaded file (empty if no file loaded)."""
         return dict(self._rep_cc_overrides)
+
+    def rep_budget_targets(self) -> dict[str, float]:
+        """Per-rep total budget targets from uploaded file (empty if no file loaded)."""
+        return dict(self._rep_budget_targets)
 
     def seasonality_pct(self) -> list[float]:
         result = []
@@ -549,6 +630,95 @@ class _SettingsPanel(QWidget):
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Save failed", str(exc))
 
+    # ------------------------------------------------------------ rep budget targets
+
+    def _upload_budget_targets(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Rep Total Budget File",
+            str(Path.home()),
+            "Spreadsheets (*.csv *.xlsx *.xls)",
+        )
+        if not path:
+            return
+        targets, errors = parse_rep_budget_upload(path)
+        if errors:
+            detail = "\n".join(errors[:10])
+            if len(errors) > 10:
+                detail += f"\n… and {len(errors) - 10} more."
+            reply = QMessageBox.warning(
+                self, "Upload warnings",
+                f"{len(targets)} targets loaded with {len(errors)} warning(s):\n\n{detail}",
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            )
+            if reply == QMessageBox.StandardButton.Cancel:
+                return
+        if not targets and not errors:
+            QMessageBox.information(self, "Empty file", "No valid rows found in the file.")
+            return
+        self._rep_budget_targets = targets
+        self._refresh_tb_preview()
+        n = len(targets)
+        self._tb_status.setText(
+            f"{n} rep budget target(s) loaded from {os.path.basename(path)}. "
+            "Click Compute (or recompute will run automatically if data is loaded)."
+        )
+        self._tb_status.setStyleSheet("font-size: 11px; font-weight: 600; color: #16A34A;")
+        self._tb_clear_btn.setVisible(True)
+        # Persist to config
+        self._cfg.budget.rep_budget_targets_saved = dict(targets)
+        try:
+            save_config(self._cfg)
+        except Exception:
+            log.exception("Failed to persist rep budget targets")
+        self.budget_targets_applied.emit()
+
+    def _clear_budget_targets(self) -> None:
+        self._rep_budget_targets = {}
+        self._tb_preview.setRowCount(0)
+        self._tb_preview.setVisible(False)
+        self._tb_clear_btn.setVisible(False)
+        self._tb_status.setText("Targets cleared — growth % settings determine all budgets.")
+        self._tb_status.setStyleSheet(f"font-size: 11px; color: {TEXT_MUTED};")
+        self._cfg.budget.rep_budget_targets_saved = {}
+        try:
+            save_config(self._cfg)
+        except Exception:
+            log.exception("Failed to clear rep budget targets from config")
+        self.budget_targets_applied.emit()
+
+    def _download_budget_template(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Budget Target Template",
+            str(Path.home() / "rep_budget_template.csv"),
+            "CSV files (*.csv)",
+        )
+        if not path:
+            return
+        template = (
+            "salesman_number,full_budget\n"
+            "# Instructions:\n"
+            "#   salesman_number — rep number (e.g. 42 or 212; leading zeros optional)\n"
+            "#   full_budget     — total full-year budget in dollars\n"
+            "#                     ($, commas, and decimals are all accepted)\n"
+            "#   One row per rep. Remove these comment lines before uploading.\n"
+            "212,450000\n"
+            "206,380000\n"
+            "209,290000\n"
+        )
+        try:
+            Path(path).write_text(template)
+            self._tb_status.setText(f"Template saved: {os.path.basename(path)}")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "Save failed", str(exc))
+
+    def _refresh_tb_preview(self) -> None:
+        data = sorted(self._rep_budget_targets.items())
+        self._tb_preview.setRowCount(len(data))
+        for i, (rep, budget) in enumerate(data):
+            self._tb_preview.setItem(i, 0, _non_editable(rep, Qt.AlignmentFlag.AlignLeft))
+            self._tb_preview.setItem(i, 1, _non_editable(f"${budget:,.0f}"))
+        self._tb_preview.setVisible(bool(data))
+
     def _on_sea_item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() != 1:
             return
@@ -627,6 +797,7 @@ class BudgetView(QWidget):
         self._settings.compute_requested.connect(self._on_compute)
         self._settings.saved.connect(self._on_saved)
         self._settings.upload_applied.connect(self._on_upload_applied)
+        self._settings.budget_targets_applied.connect(self._on_budget_targets_applied)
         splitter.addWidget(self._settings)
 
         # Right: results panel
@@ -738,12 +909,23 @@ class BudgetView(QWidget):
         # Populate CC table from prior data
         cc_prior: dict[str, float] = {}
         if prior_df is not None and not prior_df.empty:
+            # Filter to valid 3-char product CCs (e.g. '010', '011') — exclude
+            # any 4-digit or otherwise non-standard codes like '0122'.
+            import re as _re
+            _valid_cc_re = _re.compile(r'^0\d{2}$')
+            prior_df = prior_df[
+                prior_df["cost_center"].astype(str).str.match(_valid_cc_re, na=False)
+            ].copy()
+            self._prior_df = prior_df  # keep filtered version for recompute
             grouped = prior_df.groupby("cost_center")["revenue"].sum()
             cc_prior = grouped.to_dict()
 
-        # All product CCs (starting with '0')
+        # All product CCs (exactly 3 chars, starting with '0')
         all_product_ccs = sorted(
-            {cc for cc in (list(cc_prior.keys()) + list(cc_names.keys())) if str(cc).startswith("0")}
+            {
+                cc for cc in (list(cc_prior.keys()) + list(cc_names.keys()))
+                if len(str(cc)) == 3 and str(cc).startswith("0")
+            }
         )
         cc_rows = [
             (cc, cc_names.get(cc, cc), float(cc_prior.get(cc, 0.0)))
@@ -774,7 +956,6 @@ class BudgetView(QWidget):
     def _on_upload_applied(self) -> None:
         """Re-run budget calculations using the newly loaded rep-CC overrides."""
         if self._prior_df is None:
-            # Data hasn't been loaded yet — the next Compute will pick up the overrides
             self._status_label.setText(
                 "Override file loaded. Click Compute to apply it to the forecast."
             )
@@ -783,6 +964,19 @@ class BudgetView(QWidget):
         n = len(self._settings.rep_cc_growth_pct())
         self._status_label.setText(
             f"Forecast recomputed with {n} rep × CC override(s) applied."
+        )
+
+    def _on_budget_targets_applied(self) -> None:
+        """Re-run budget calculations using the newly loaded rep total targets."""
+        if self._prior_df is None:
+            self._status_label.setText(
+                "Rep budget targets loaded. Click Compute to apply them to the forecast."
+            )
+            return
+        self._recompute()
+        n = len(self._settings.rep_budget_targets())
+        self._status_label.setText(
+            f"Forecast recomputed — {n} rep total budget target(s) applied."
         )
 
     def _switch_mode(self, mode: str) -> None:
@@ -810,6 +1004,17 @@ class BudgetView(QWidget):
             growth, seasonality, self._cc_names,
             rep_cc_growth_pct=rep_cc,
         )
+
+        # Apply rep total budget targets (scales rows so each rep's budget sums
+        # to the uploaded target across all three view levels).
+        rep_targets = self._settings.rep_budget_targets()
+        if rep_targets:
+            apply_rep_budget_targets(
+                self._rows_by_rep,
+                self._rows_by_cc,
+                self._rows_by_acct,
+                rep_targets,
+            )
 
         for rows, gby in (
             (self._rows_by_cc, "cc"),

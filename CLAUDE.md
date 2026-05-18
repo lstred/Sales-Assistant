@@ -287,6 +287,16 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
+- **2026-05-20 (latest)** — Budget view: 4-digit CC filter + rep total budget upload with proportional scaling:
+  - **4-digit CC codes eliminated**: `_on_loaded` in `budget_view.py` now filters `prior_df` to rows matching `^0\d{2}$` (exactly 3-char product CCs) before storing `self._prior_df`. The `all_product_ccs` set is also filtered with `len(str(cc)) == 3`. Codes like `0122` no longer appear in the CC growth table or downloads.
+  - **`parse_rep_budget_upload(path)`** added to `app/services/budget_service.py`: reads CSV/Excel with `salesman_number` + `full_budget` columns; normalizes rep numbers (strip leading zeros); handles `$`/`,` formatting in budget values; rejects negatives; returns `({rep_number: float}, errors)`.
+  - **`apply_rep_budget_targets(rows_by_rep, rows_by_cc, rows_by_acct, rep_budget_targets)`** added to `app/services/budget_service.py`: scales all three row lists in-place so each rep's budget totals match the uploaded target. Algorithm: sum current `budget_full_year` per rep → compute `scale = target / current` → multiply rep and account rows; rebuild CC rows by summing scaled rep rows per CC. No-op when target dict is empty or rep has zero current budget.
+  - **`BudgetConfig.rep_budget_targets_saved`** field added to `AppConfig`: persists uploaded targets across sessions (JSON-serializable `dict[str, float]`, key = rep_number).
+  - **"Rep Total Budget (Upload)" card** added to `_SettingsPanel` in `budget_view.py`: green spec box, Upload / Download Template / Clear buttons, preview table, status label. Targets persist to config on upload and are restored on app launch via `_load_saved_overrides()`.
+  - **`_recompute()` updated**: calls `apply_rep_budget_targets()` after computing base rows but before `add_ytd_actuals()` — so YTD vs-budget calculations use the scaled numbers.
+  - **`budget_targets_applied` signal** added to `_SettingsPanel`; connected to `_on_budget_targets_applied()` in `BudgetView` which auto-recomputes when targets are uploaded/cleared.
+  - **30/30 tests pass** (4 new: `test_parse_rep_budget_upload_basic`, `test_parse_rep_budget_upload_normalises_rep_and_skips_bad`, `test_apply_rep_budget_targets_scales_all_three_levels`, `test_apply_rep_budget_targets_zero_current_is_noop`).
+
 - **2026-05-19 (latest)** — Core display coverage made CC-specific; AI/footer conditional:
   - **Root cause**: `compute_rep_scorecards` flattened ALL configured core displays from ALL CCs into one `flat_core` set, so choosing CCs 031/032 (which have no core displays configured) still used CC 010's display codes and produced spurious coverage numbers and coaching text.
   - **`app/services/manager_analytics.py`**:
