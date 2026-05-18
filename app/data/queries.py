@@ -73,6 +73,7 @@ LEFT JOIN dbo.BILLTO AS bt
 WHERE   ISNULL(LTRIM(RTRIM(b.[BSACCT])), '') <> ''
   AND   ISNULL(LTRIM(RTRIM(b.[BSSLMN])), '') <> ''
   AND   ISNULL(LTRIM(RTRIM(b.[BSCODE])), '') <> ''
+  AND   ISNULL(LTRIM(RTRIM(b.[BSDEL])),  '') <> 'D'
 """
 
 # ------------------------------------------- invoiced sales (line-level detail)

@@ -1107,10 +1107,13 @@ class _AutoReplyWorker(_AiReplyWorker):
                 if self._conv.subject.startswith("Re:")
                 else f"Re: {self._conv.subject}"
             )
+            is_mgmt = self._is_management_sender()
+            html_body = _ai_text_to_html(draft, is_management=is_mgmt)
             res = client.send(
                 to_address=rep_email,
                 subject=subj,
                 body_text=draft,
+                body_html=html_body,
                 in_reply_to=last_inbound_id,
                 references=all_msg_ids,
             )
@@ -1128,6 +1131,7 @@ class _AutoReplyWorker(_AiReplyWorker):
                     to_address=rep_email,
                     subject=subj,
                     body_text=draft,
+                    body_html=html_body,
                     ai_reasoning="Auto-generated and sent by AI assistant.",
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1289,11 +1293,13 @@ class _ReplyComposeDialog(QDialog):
         outbound_ids = [m.message_id for m in self._messages if m.direction == "outbound" and m.message_id]
         references = " ".join(outbound_ids)
 
+        html_body = _ai_text_to_html(body)
         client = EmailClient(self._cfg.email)
         res = client.send(
             to_address=self._rep_email,
             subject=subj,
             body_text=body,
+            body_html=html_body,
             in_reply_to=self._last_msg_id,
             references=references,
         )
@@ -1313,12 +1319,200 @@ class _ReplyComposeDialog(QDialog):
                 to_address=self._rep_email,
                 subject=subj,
                 body_text=body,
+                body_html=html_body,
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("save_message error after reply: %s", exc)
 
         self.sent.emit()
         self.accept()
+
+
+# ================================================================ AI reply HTML formatter
+
+def _ai_text_to_html(raw: str, is_management: bool = False) -> str:  # noqa: C901
+    """Convert an AI plain-text reply (with optional ASCII tables) to a
+    styled HTML email matching the app's leaderboard aesthetic.
+
+    Tables are auto-detected by separator lines (runs of ``-`` / ``─``
+    chars separated by spaces). Currency / percentage cells are right-aligned;
+    name / description cells are left-aligned. A clean company header and
+    footer are wrapped around the body.
+    """
+    import html as _esc
+
+    # ── design tokens (matches leaderboard palette) ────────────────────────────
+    C_BG      = "#F8FAFC"
+    C_CARD    = "#FFFFFF"
+    C_HDR     = "#0F172A"
+    C_HDR_TXT = "#F1F5F9"
+    C_BORDER  = "#E2E8F0"
+    C_STRIPE  = "#F8FAFC"
+    C_TOTAL   = "#1E293B"
+    C_TTXT    = "#F1F5F9"
+    C_TEXT    = "#1E293B"
+    C_MUTED   = "#64748B"
+
+    _SEP_RE = re.compile(r'^[-─═╌ \u2500\u2501\u2550]{5,}$')
+    _NUM_RE = re.compile(r'^[\$\-+]?[\d,]+(\.\d+)?%?$')
+
+    def _is_sep(line: str) -> bool:
+        s = line.strip()
+        return bool(s) and bool(_SEP_RE.match(s)) and len(s) >= 5
+
+    def _is_numeric(s: str) -> bool:
+        return bool(_NUM_RE.match(s.strip()))
+
+    def _split_cols(line: str) -> list[str]:
+        # Split on 2+ consecutive spaces; preserve single words
+        return [c.strip() for c in re.split(r' {2,}', line.rstrip()) if c.strip()]
+
+    def _th(content: str, is_num: bool) -> str:
+        align = "right" if is_num else "left"
+        return (
+            f'<th style="padding:8px 14px;text-align:{align};color:{C_HDR_TXT};'
+            f'background:{C_HDR};font-weight:600;white-space:nowrap;'
+            f'font-size:12px;letter-spacing:.3px;">'
+            f'{_esc.escape(content)}</th>'
+        )
+
+    def _td(content: str, is_num: bool, bg: str, clr: str, bold: bool = False) -> str:
+        align = "right" if is_num else "left"
+        weight = "600" if bold else "400"
+        return (
+            f'<td style="padding:6px 14px;text-align:{align};color:{clr};'
+            f'background:{bg};font-weight:{weight};'
+            f'font-variant-numeric:tabular-nums;'
+            f'border-top:1px solid {C_BORDER};white-space:nowrap;">'
+            f'{_esc.escape(content)}</td>'
+        )
+
+    def _render_table_block(block: list[str]) -> str:
+        sep_idx = next((i for i, ln in enumerate(block) if _is_sep(ln)), None)
+        if sep_idx is None:
+            return _render_text_block(block)
+
+        header_lines = [ln for ln in block[:sep_idx] if ln.strip()]
+        data_lines   = [ln for ln in block[sep_idx + 1:] if ln.strip() and not _is_sep(ln)]
+        if not header_lines:
+            return _render_text_block(block)
+
+        header_cells = _split_cols(header_lines[-1])
+        n_cols = max(len(header_cells), 1)
+
+        # Infer numeric columns from the first few data rows
+        num_col: list[bool] = [False] * n_cols
+        for dl in data_lines[:6]:
+            for ci, c in enumerate(_split_cols(dl)[:n_cols]):
+                if _is_numeric(c):
+                    num_col[ci] = True
+
+        rows: list[str] = []
+
+        # Header row(s)
+        for hl in header_lines:
+            hcells = _split_cols(hl)
+            while len(hcells) < n_cols:
+                hcells.append("")
+            rows.append(
+                "<tr>"
+                + "".join(_th(c, num_col[i] if i < len(num_col) else False)
+                          for i, c in enumerate(hcells[:n_cols]))
+                + "</tr>"
+            )
+
+        # Data rows
+        for ri, dl in enumerate(data_lines):
+            cells = _split_cols(dl)
+            while len(cells) < n_cols:
+                cells.append("")
+            is_total = bool(cells and re.match(r'^total', cells[0], re.I))
+            bg   = C_TOTAL if is_total else (C_STRIPE if ri % 2 else C_CARD)
+            clr  = C_TTXT  if is_total else C_TEXT
+            rows.append(
+                "<tr>"
+                + "".join(_td(c, num_col[i] if i < len(num_col) else False, bg, clr, is_total)
+                          for i, c in enumerate(cells[:n_cols]))
+                + "</tr>"
+            )
+
+        return (
+            f'<table style="border-collapse:collapse;width:100%;margin:14px 0;'
+            f'font-size:13px;border:1px solid {C_BORDER};border-radius:4px;overflow:hidden;">'
+            + "".join(rows)
+            + "</table>"
+        )
+
+    def _render_text_block(block: list[str]) -> str:
+        parts: list[str] = []
+        for line in block:
+            s = line.strip()
+            if not s:
+                continue
+            # Section heading: ALL CAPS line or ends with ':'
+            is_heading = (
+                s.endswith(":")
+                or (s == s.upper() and len(s) > 4 and len(s) < 90
+                    and not re.search(r'\d{4}', s))
+            )
+            if is_heading:
+                parts.append(
+                    f'<p style="margin:18px 0 3px;font-size:11px;font-weight:700;'
+                    f'letter-spacing:.5px;text-transform:uppercase;color:{C_MUTED};">'
+                    f'{_esc.escape(s)}</p>'
+                )
+            else:
+                parts.append(
+                    f'<p style="margin:5px 0;font-size:14px;line-height:1.6;color:{C_TEXT};">'
+                    f'{_esc.escape(s)}</p>'
+                )
+        return "\n".join(parts)
+
+    # ── split raw text into blocks (blank-line delimited) ─────────────────────
+    lines = raw.split("\n")
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in lines:
+        if not line.strip():
+            if current:
+                blocks.append(current)
+                current = []
+        else:
+            current.append(line)
+    if current:
+        blocks.append(current)
+
+    # ── render each block ──────────────────────────────────────────────────────
+    body_parts: list[str] = []
+    for block in blocks:
+        if any(_is_sep(ln) for ln in block):
+            body_parts.append(_render_table_block(block))
+        else:
+            body_parts.append(_render_text_block(block))
+
+    body_html = "\n".join(body_parts)
+
+    label = "Full Company Data" if is_management else "Territory Data"
+    return (
+        f'<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
+        f'<body style="margin:0;padding:0;background:{C_BG};'
+        f'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI Variable\',\'Segoe UI\',sans-serif;">'
+        f'<div style="max-width:680px;margin:24px auto;">'
+        f'<div style="background:{C_CARD};border:1px solid {C_BORDER};border-radius:8px;'
+        f'overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.06);">'
+        f'<div style="background:{C_HDR};padding:12px 20px;display:flex;align-items:center;gap:12px;">'
+        f'<span style="color:{C_HDR_TXT};font-size:13px;font-weight:600;letter-spacing:.3px;">'
+        f'Sales Data Reply</span>'
+        f'<span style="color:#64748B;font-size:11px;margin-left:auto;">{label}</span>'
+        f'</div>'
+        f'<div style="padding:20px 24px 16px;">'
+        f'{body_html}'
+        f'</div>'
+        f'<div style="padding:10px 24px 14px;border-top:1px solid {C_BORDER};background:{C_BG};">'
+        f'<span style="font-size:11px;color:{C_MUTED};">'
+        f'Generated from live warehouse data · Reply with any follow-up question.'
+        f'</span></div></div></div></body></html>'
+    )
 
 
 # ================================================================ shared renderer
