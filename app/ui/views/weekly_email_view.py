@@ -2375,7 +2375,8 @@ def _build_rep_prompt(
         "• 'This period', 'the current period', 'previous period', 'prior period', "
         "'recent months', or 'recent period' — always write the exact date range "
         "(e.g. 'February–May 2026' or 'August 2025–May 2026')\n"
-        "• Numbers from the L3M block if it is flagged ⚠ OUTSIDE filter window"
+        "• Numbers from the L3M block if it is marked DATA NOT LOADED — any prior-3-month "
+        "surge or decline percentage is FORBIDDEN when that flag is present; use yoy_3mo only\n"
     )
     if scorecard.is_yoy_outlier:
         sys_msg += (
@@ -2448,14 +2449,20 @@ def _build_rep_prompt(
         f"{_l3m_e.replace(year=_l3m_e.year - 1).strftime('%b %d, %Y')}"
         if _l3m_s and _l3m_e else "prior year same 90 days"
     )
-    # Warn the AI when prior_3mo falls outside the user's filter window (unreliable).
+    # Warn the AI when prior_3mo window partially or fully predates the filter window.
+    # We detect ANY overlap problem: if prior_3mo_start < filter_start, the window
+    # begins before we have data loaded, making the comparison unreliable.
+    # In that case we suppress the dollar figure entirely so the AI cannot
+    # compute a spurious percentage (e.g. comparing 90 days vs 16 days of data).
     _p3m_note = ""
     if _p3m_s and start:
         _p3m_lbl = f"{_p3m_s.strftime('%b %d')}–{_p3m_e.strftime('%b %d, %Y')}" if _p3m_e else "prior 90 days"
-        if _p3m_e and _p3m_e < start:
+        if _p3m_s < start:
+            # Prior window starts before filter — suppress value, explain why
             _p3m_note = (
-                f"  prior_3mo ({_p3m_lbl})=${sc.prior_3mo_revenue:,.0f} "
-                f"[⚠ OUTSIDE filter window — treat as unreliable; use yoy_3mo instead]\n"
+                f"  prior_3mo ({_p3m_lbl}): DATA NOT LOADED — window predates the "
+                f"filter; do NOT estimate or infer a vs-prior-3mo comparison. "
+                f"Use yoy_3mo instead.\n"
             )
         else:
             _p3m_note = f"  prior_3mo ({_p3m_lbl})=${sc.prior_3mo_revenue:,.0f}, vs_prior_3mo={l3}\n"

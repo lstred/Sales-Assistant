@@ -55,9 +55,14 @@ log = logging.getLogger(__name__)
 # ================================================================ IMAP poll worker
 
 class _ImapPollWorker(QThread):
-    """Fetch unseen IMAP messages and match them to existing threads."""
+    """Fetch unseen IMAP messages and match them to existing threads.
 
-    found = Signal(int)
+    Emits ``new_conv_ids`` (list of conversation IDs that received a new
+    inbound message this poll cycle) so callers can trigger auto-reply.
+    """
+
+    found = Signal(int)           # total new messages saved
+    new_conv_ids = Signal(object) # list[int] of conv IDs with new messages
     error = Signal(str)
     done = Signal()
 
@@ -70,6 +75,7 @@ class _ImapPollWorker(QThread):
             client = EmailClient(self._cfg.email)
             replies = client.fetch_new_replies()
             saved = 0
+            new_ids: list[int] = []
             for reply in replies:
                 conv = find_conversation_for_reply(
                     reply["in_reply_to"],
@@ -89,7 +95,11 @@ class _ImapPollWorker(QThread):
                 )
                 if result is not None:
                     saved += 1
+                    if conv.id not in new_ids:
+                        new_ids.append(conv.id)
             self.found.emit(saved)
+            if new_ids:
+                self.new_conv_ids.emit(new_ids)
         except Exception as exc:  # noqa: BLE001
             log.exception("IMAP poll failed")
             self.error.emit(str(exc))
@@ -232,22 +242,21 @@ class _AiReplyWorker(QThread):
         sales_data = self._fetch_account_data(account_numbers)
 
         system_msg = (
-            "You are helping a sales manager reply to a rep's email response. "
-            "The rep replied to a data-rich coaching email that may have included a service offer "
-            "(e.g. 'Reply YES for a month-by-month breakdown'). "
-            "Read the full conversation history, identify exactly what the rep requested, "
-            "and write a professional, data-rich reply fulfilling that request.\n\n"
+            "You are an AI data assistant automatically responding to a sales rep's email reply "
+            "on behalf of the sales manager. The rep replied to a coaching email that may have "
+            "included a data service offer (e.g. 'Reply YES for a breakdown').\n\n"
             "Rules:\n"
             "- Address the rep by first name once, at the start.\n"
-            "- If month-by-month or account data was requested, present it as a clean bullet list or table.\n"
-            "- Cite specific account names and dollar figures from the data provided.\n"
-            "- Keep it 100–220 words. Write plain paragraphs only — no markdown, no asterisks.\n"
+            "- If the request is clear: fulfill it with specific data (tables, bullet lists, "
+            "account names + dollar figures). Keep it 100–220 words.\n"
+            "- If the request is AMBIGUOUS or you lack sufficient context to give a useful answer: "
+            "start your reply with exactly 'CLARIFICATION NEEDED:' then ask ONE concise question "
+            "to clarify what data or time range they want. Nothing else — just the question.\n"
+            "- Write plain paragraphs and simple ASCII tables only — no markdown, no asterisks.\n"
             "- Do NOT add a sign-off or signature.\n"
-            "- If appropriate, close with ONE offer of additional data the assistant can pull from "
-            "the warehouse (e.g. month-by-month breakdowns, account-level trends, GP% by product "
-            "line, display-vs-non-display comparison). Do NOT suggest scheduling calls, meetings, "
-            "check-ins, or any action that requires human coordination — only offer things the AI "
-            "data assistant can actually deliver.\n"
+            "- If fulfilling a data request, close with ONE offer of additional data the warehouse "
+            "can provide (breakdowns, account trends, GP% by product line). Do NOT suggest "
+            "scheduling calls, meetings, or check-ins — only data the AI can actually deliver.\n"
             "- Never invent numbers not present in the supplied data."
         )
 
@@ -272,6 +281,89 @@ class _AiReplyWorker(QThread):
             timeout_seconds=self._cfg.ai.request_timeout_seconds,
         )
         return result.text.strip()
+
+
+# ================================================================ auto-reply worker
+
+class _AutoReplyWorker(_AiReplyWorker):
+    """Generate an AI reply and send it automatically without a compose dialog.
+
+    Extends ``_AiReplyWorker`` and re-uses ``_generate()``. After generation
+    it sends via SMTP and persists the outbound message to SQLite.
+
+    Signals:
+        replied(str)           — rep name on successful send.
+        send_error(str, str)   — (rep_name, error_message) on failure.
+    """
+
+    replied = Signal(str)
+    send_error = Signal(str, str)
+
+    def run(self) -> None:  # type: ignore[override]
+        rep_name = self._conv.rep_name or self._conv.rep_id
+        try:
+            draft = self._generate()
+
+            rep_email = self._cfg.rep_emails.get(self._conv.rep_id, "")
+            if not rep_email:
+                raise ValueError(f"No email address on file for {rep_name}")
+
+            smtp_ok = bool(
+                self._cfg.email.smtp_host
+                and self._cfg.email.smtp_username
+                and self._cfg.email.enable_outbound_send
+            )
+            if not smtp_ok:
+                raise ValueError("SMTP not configured or outbound sending disabled")
+
+            # Build threading headers from conversation history.
+            last_inbound_id = next(
+                (m.message_id for m in reversed(self._messages)
+                 if m.direction == "inbound" and m.message_id),
+                "",
+            )
+            all_msg_ids = " ".join(
+                m.message_id for m in self._messages if m.message_id
+            )
+
+            client = EmailClient(self._cfg.email)
+            subj = (
+                self._conv.subject
+                if self._conv.subject.startswith("Re:")
+                else f"Re: {self._conv.subject}"
+            )
+            res = client.send(
+                to_address=rep_email,
+                subject=subj,
+                body_text=draft,
+                in_reply_to=last_inbound_id,
+                references=all_msg_ids,
+            )
+
+            if not res.ok:
+                raise RuntimeError(f"SMTP send failed: {res.error}")
+
+            try:
+                save_message(
+                    conversation_id=self._conv.id,
+                    direction="outbound",
+                    message_id=res.message_id,
+                    in_reply_to=last_inbound_id,
+                    from_address=self._cfg.email.smtp_from_address or "(manager)",
+                    to_address=rep_email,
+                    subject=subj,
+                    body_text=draft,
+                    ai_reasoning="Auto-generated and sent by AI assistant.",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("save_message after auto-reply: %s", exc)
+
+            self.replied.emit(rep_name)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Auto-reply failed for %s", rep_name)
+            self.send_error.emit(rep_name, str(exc))
+        finally:
+            self.done.emit()
 
 
 # ================================================================ compose dialog
@@ -504,6 +596,7 @@ class ConversationsView(QWidget):
         self._action_items: list[ActionItem] = []
         self._poll_workers: list[_ImapPollWorker] = []
         self._reply_workers: list[_AiReplyWorker] = []
+        self._auto_workers: list[_AutoReplyWorker] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -530,10 +623,33 @@ class ConversationsView(QWidget):
         root.addLayout(poll_row)
 
         imap_ok = bool(cfg.email.imap_host and cfg.email.imap_username)
+        smtp_ok = bool(cfg.email.smtp_host and cfg.email.smtp_username and cfg.email.enable_outbound_send)
+        ai_configured = bool(
+            getattr(cfg.ai, "provider", None) and getattr(cfg.ai, "api_username", None)
+        )
+        self._auto_reply_enabled = imap_ok and smtp_ok and ai_configured
+
         if not imap_ok:
             self.poll_btn.setEnabled(False)
             self.poll_btn.setToolTip("Configure IMAP in Settings → Email to enable automatic reply detection.")
             self.poll_status.setText("IMAP not configured — configure in Settings → Email.")
+        elif self._auto_reply_enabled:
+            self.poll_status.setText("Auto-reply active — checking every 5 min.")
+        else:
+            missing = []
+            if not smtp_ok:
+                missing.append("SMTP")
+            if not ai_configured:
+                missing.append("AI provider")
+            self.poll_status.setText(
+                f"Auto-reply disabled (configure {', '.join(missing)} to enable)."
+            )
+
+        # Background auto-poll timer (every 5 minutes when fully configured).
+        self._auto_poll_timer = QTimer(self)
+        self._auto_poll_timer.timeout.connect(self._auto_poll_cycle)
+        if self._auto_reply_enabled:
+            self._auto_poll_timer.start(5 * 60 * 1000)  # 5 minutes
 
         # ---- Tabs --------------------------------------------------------
         self.tabs = QTabWidget()
@@ -1008,21 +1124,101 @@ class ConversationsView(QWidget):
     # ================================================================ IMAP polling
 
     def _poll_imap(self) -> None:
+        """Manual poll triggered by the button."""
+        self._start_poll(auto=False)
+
+    def _auto_poll_cycle(self) -> None:
+        """Background timer — skip if a poll is already running."""
+        if self._poll_workers:
+            return
+        self._start_poll(auto=True)
+
+    def _start_poll(self, auto: bool = False) -> None:
         self.poll_btn.setEnabled(False)
-        self.poll_status.setText("Checking inbox…")
+        if not auto:
+            self.poll_status.setText("Checking inbox…")
         worker = _ImapPollWorker(self._cfg, parent=self)
         self._poll_workers.append(worker)
-        worker.found.connect(self._on_poll_found)
+        worker.found.connect(lambda n: self._on_poll_found(n, auto=auto))
+        worker.new_conv_ids.connect(self._on_new_conv_ids)
         worker.error.connect(self._on_poll_error)
         worker.done.connect(lambda: self._on_poll_done(worker))
         worker.start()
 
-    def _on_poll_found(self, count: int) -> None:
+    def _on_poll_found(self, count: int, *, auto: bool = False) -> None:
+        from datetime import datetime
+        ts = datetime.now().strftime("%H:%M")
         if count:
-            self.poll_status.setText(f"✓  {count} new repl{'y' if count == 1 else 'ies'} saved.")
+            suffix = "repl" + ("y" if count == 1 else "ies")
+            if self._auto_reply_enabled:
+                self.poll_status.setText(
+                    f"✓  {count} new {suffix} — auto-replying… (last checked {ts})"
+                )
+            else:
+                self.poll_status.setText(f"✓  {count} new {suffix} saved. Last checked: {ts}")
             self.refresh()
+        elif not auto:
+            self.poll_status.setText(f"✓  No new replies. Last checked: {ts}")
         else:
-            self.poll_status.setText("✓  No new replies found.")
+            # Quiet update: just refresh the timestamp
+            cur = self.poll_status.text()
+            if "Auto-reply active" in cur or "last checked" in cur.lower():
+                self.poll_status.setText(f"Auto-reply active — last checked {ts}")
+
+    def _on_new_conv_ids(self, conv_ids: object) -> None:
+        """Trigger auto-reply for every conversation that just received a new inbound message."""
+        if not self._auto_reply_enabled:
+            return
+        ids = list(conv_ids) if conv_ids else []
+        # Refresh conversation list so we have up-to-date Conversation objects.
+        try:
+            all_convs = list_conversations()
+        except Exception:
+            return
+        for conv_id in ids:
+            conv = next((c for c in all_convs if c.id == conv_id), None)
+            if conv is None:
+                continue
+            # Only auto-reply if the conversation needs a reply (latest message is inbound).
+            if not conv.needs_reply:
+                continue
+            try:
+                messages = list_messages(conv_id)
+            except Exception:
+                continue
+            if not messages:
+                continue
+            rep_email = self._cfg.rep_emails.get(conv.rep_id, "")
+            if not rep_email:
+                log.info("Auto-reply skipped for %s — no email on file", conv.rep_id)
+                continue
+            log.info("Auto-replying to conv %s (%s)", conv_id, conv.rep_name)
+            self._fire_auto_reply(conv, messages)
+
+    def _fire_auto_reply(self, conv: Conversation, messages: list[Message]) -> None:
+        worker = _AutoReplyWorker(self._cfg, conv, messages, self._get_db, parent=self)
+        self._auto_workers.append(worker)
+        worker.replied.connect(self._on_auto_replied)
+        worker.send_error.connect(self._on_auto_error)
+        worker.done.connect(lambda: self._on_auto_done(worker))
+        worker.start()
+
+    def _on_auto_replied(self, rep_name: str) -> None:
+        from datetime import datetime
+        ts = datetime.now().strftime("%H:%M")
+        self.poll_status.setText(f"✓  Auto-replied to {rep_name} at {ts}")
+        self.refresh()
+        log.info("Auto-reply sent to %s at %s", rep_name, ts)
+
+    def _on_auto_error(self, rep_name: str, msg: str) -> None:
+        self.poll_status.setText(f"⚠  Auto-reply to {rep_name} failed: {msg[:80]}")
+        log.warning("Auto-reply error for %s: %s", rep_name, msg)
+
+    def _on_auto_done(self, worker: _AutoReplyWorker) -> None:
+        try:
+            self._auto_workers.remove(worker)
+        except ValueError:
+            pass
 
     def _on_poll_error(self, msg: str) -> None:
         self.poll_status.setText(f"⚠  IMAP error: {msg}")
