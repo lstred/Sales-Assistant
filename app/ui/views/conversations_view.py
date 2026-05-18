@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+from email.utils import parseaddr as _parseaddr
 from typing import Callable
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
@@ -38,6 +39,7 @@ from app.storage.repos import (
     ActionItem,
     Conversation,
     Message,
+    create_conversation_for_inbound,
     find_conversation_for_reply,
     list_action_items,
     list_conversations,
@@ -50,6 +52,19 @@ from app.ui.theme import ACCENT, BORDER, DANGER, SURFACE, SURFACE_ALT, TEXT, TEX
 from app.ui.views._header import ViewHeader
 
 log = logging.getLogger(__name__)
+
+
+def _parse_email_address(raw: str) -> str:
+    """Extract the bare e-mail address from a raw From/Reply-To header value.
+
+    Handles both ``"Display Name <addr@host>"`` and bare ``"addr@host"`` forms.
+    Returns an empty string when parsing fails.
+    """
+    try:
+        _, addr = _parseaddr(raw)
+        return addr.strip().lower()
+    except Exception:
+        return ""
 
 
 # ================================================================ IMAP poll worker
@@ -76,13 +91,66 @@ class _ImapPollWorker(QThread):
             replies = client.fetch_new_replies()
             saved = 0
             new_ids: list[int] = []
+
+            # Build a whitelist set and a reverse email→rep_id map once per cycle.
+            whitelist: set[str] = {
+                e.strip().lower()
+                for e in (self._cfg.email.auto_reply_whitelist or [])
+                if e.strip()
+            }
+            # cfg.rep_emails: {salesman_number: email} — invert for lookups.
+            email_to_rep_id: dict[str, str] = {
+                v.strip().lower(): k
+                for k, v in (self._cfg.rep_emails or {}).items()
+                if v.strip()
+            }
+
             for reply in replies:
+                # ── 1. Try to match to an existing thread ────────────────────
                 conv = find_conversation_for_reply(
                     reply["in_reply_to"],
                     reply["references"],
                 )
+
                 if conv is None:
+                    # ── 2. Orphan email — check whitelist ────────────────────
+                    # This handles both direct/new emails AND replies to threads
+                    # the app doesn't know about yet (e.g. forwarded, or first
+                    # contact from a rep who has never received an AI email).
+                    from_email = _parse_email_address(reply["from_address"])
+                    if not from_email:
+                        continue
+                    if not whitelist or from_email not in whitelist:
+                        log.debug(
+                            "IMAP: skipping unmatched email from %s — not in whitelist",
+                            from_email,
+                        )
+                        continue
+                    # Map to a salesman_number if we can; fall back to the bare
+                    # email address so the conversation is still created.
+                    rep_id = email_to_rep_id.get(from_email, from_email)
+                    log.info(
+                        "IMAP: new inbound from whitelisted %s → rep_id=%s",
+                        from_email, rep_id,
+                    )
+                    conv = create_conversation_for_inbound(
+                        rep_id=rep_id,
+                        subject=reply["subject"],
+                        message_id=reply["message_id"],
+                        from_address=reply["from_address"],
+                        body_text=reply["body_text"],
+                        body_html=reply["body_html"],
+                        imap_uid=reply["imap_uid"],
+                    )
+                    if conv is None:
+                        continue
+                    # Message already persisted inside create_conversation_for_inbound.
+                    saved += 1
+                    if conv.id not in new_ids:
+                        new_ids.append(conv.id)
                     continue
+
+                # ── 3. Known thread — record the inbound ─────────────────────
                 result = record_inbound(
                     conversation_id=conv.id,
                     message_id=reply["message_id"],
@@ -97,6 +165,7 @@ class _ImapPollWorker(QThread):
                     saved += 1
                     if conv.id not in new_ids:
                         new_ids.append(conv.id)
+
             self.found.emit(saved)
             if new_ids:
                 self.new_conv_ids.emit(new_ids)
@@ -305,6 +374,17 @@ class _AutoReplyWorker(_AiReplyWorker):
             draft = self._generate()
 
             rep_email = self._cfg.rep_emails.get(self._conv.rep_id, "")
+            # For rep-initiated conversations the rep_id may BE the email address,
+            # or we can fall back to the From: of their last inbound message.
+            if not rep_email and "@" in self._conv.rep_id:
+                rep_email = self._conv.rep_id
+            if not rep_email:
+                last_inbound = next(
+                    (m for m in reversed(self._messages) if m.direction == "inbound"),
+                    None,
+                )
+                if last_inbound:
+                    rep_email = _parse_email_address(last_inbound.from_address)
             if not rep_email:
                 raise ValueError(f"No email address on file for {rep_name}")
 
@@ -637,7 +717,7 @@ class ConversationsView(QWidget):
             wl_count = len(self._cfg.email.auto_reply_whitelist or [])
             if wl_count:
                 self.poll_status.setText(
-                    f"Auto-reply active for {wl_count} whitelisted address(es) — checking every 5 min."
+                    f"Auto-reply active for {wl_count} whitelisted address(es) — checking every 2 min."
                 )
             else:
                 self.poll_status.setText(
@@ -654,11 +734,11 @@ class ConversationsView(QWidget):
                 f"Auto-reply disabled (configure {', '.join(missing)} to enable)."
             )
 
-        # Background auto-poll timer (every 5 minutes when fully configured).
+        # Background auto-poll timer (every 2 minutes when fully configured).
         self._auto_poll_timer = QTimer(self)
         self._auto_poll_timer.timeout.connect(self._auto_poll_cycle)
         if self._auto_reply_enabled:
-            self._auto_poll_timer.start(5 * 60 * 1000)  # 5 minutes
+            self._auto_poll_timer.start(2 * 60 * 1000)  # 2 minutes
 
         # ---- Tabs --------------------------------------------------------
         self.tabs = QTabWidget()
@@ -1198,6 +1278,9 @@ class ConversationsView(QWidget):
             if not messages:
                 continue
             rep_email = self._cfg.rep_emails.get(conv.rep_id, "")
+            # For rep-initiated conversations the rep_id may BE the email address.
+            if not rep_email and "@" in conv.rep_id:
+                rep_email = conv.rep_id
             if not rep_email:
                 log.info("Auto-reply skipped for %s — no email on file", conv.rep_id)
                 continue

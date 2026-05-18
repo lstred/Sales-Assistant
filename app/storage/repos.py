@@ -612,3 +612,79 @@ def record_inbound(
         body_html=body_html,
         imap_uid=imap_uid,
     )
+
+
+def create_conversation_for_inbound(
+    *,
+    rep_id: str,
+    rep_name: str = "",
+    subject: str,
+    message_id: str,
+    from_address: str,
+    body_text: str = "",
+    body_html: str = "",
+    imap_uid: str = "",
+) -> "Conversation | None":
+    """Create a new conversation seeded from a rep-originated inbound email.
+
+    Covers the case where a rep emails the manager's inbox directly (not as a
+    reply to an AI-originated thread).  Uses the inbound ``message_id`` as the
+    ``thread_key`` so any AI reply sent with ``In-Reply-To: <message_id>`` will
+    be matched back to this conversation on the next IMAP poll.
+
+    Deduplicates on ``message_id`` — if the message was already recorded,
+    returns the owning conversation without creating duplicates.
+    """
+    # Dedup: if this exact message was already processed, return its conversation.
+    if message_id:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT conversation_id FROM messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if row:
+                return get_conversation(int(row["conversation_id"]))
+
+    thread_key = message_id or f"inbound-{imap_uid}"
+    with get_conn() as conn:
+        # Ensure the rep row exists.  ON CONFLICT: preserve user-configured
+        # email / boss_email / tone — only update active flag and timestamp.
+        conn.execute(
+            """
+            INSERT INTO reps (salesman_number, name, active, updated_at)
+            VALUES (?, ?, 1, datetime('now'))
+            ON CONFLICT(salesman_number) DO UPDATE SET
+                active     = 1,
+                updated_at = datetime('now')
+            """,
+            (rep_id, rep_name or rep_id),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO conversations
+              (rep_id, cost_center, subject, topic, status, tone, thread_key)
+            VALUES (?, '', ?, 'rep_initiated', 'active', 0, ?)
+            """,
+            (rep_id, subject, thread_key),
+        )
+        row = conn.execute(
+            "SELECT id FROM conversations WHERE thread_key = ?",
+            (thread_key,),
+        ).fetchone()
+        if not row:
+            return None
+        conv_id = int(row["id"])
+
+    save_message(
+        conversation_id=conv_id,
+        direction="inbound",
+        message_id=message_id,
+        in_reply_to="",
+        from_address=from_address,
+        to_address="",
+        subject=subject,
+        body_text=body_text,
+        body_html=body_html,
+        imap_uid=imap_uid,
+    )
+    return get_conversation(conv_id)
