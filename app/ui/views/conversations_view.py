@@ -396,6 +396,42 @@ class _AiReplyWorker(QThread):
                 prev_s = f"${prev:,.0f}" if prev > 0 else "—"
                 lines.append(f"  {label:<34} ${rev:>11,.0f} {prev_s:>12} {yoy:>8}")
 
+            # ── Product × Account cross-tab ───────────────────────────────
+            # Lets the AI answer "show me Win Win by account" or similar product-
+            # specific questions without having to do a second warehouse round-trip.
+            lines.append("")
+            lines.append(
+                "PRODUCT × ACCOUNT BREAKDOWN "
+                "(top 5 accounts per top product — use this to answer product-specific questions):"
+            )
+            top_pc_codes = [str(r).strip() for r in pc_cur.head(8)["price_class"]]
+            pc_acct_grp = (
+                df_c[df_c["price_class"].astype(str).str.strip().isin(top_pc_codes)]
+                .groupby(["price_class", "account_number"], dropna=False)
+                .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
+                .reset_index()
+            )
+            for pc_code in top_pc_codes:
+                desc = pc_lookup.get(pc_code, pc_code)[:30]
+                sub = (
+                    pc_acct_grp[pc_acct_grp["price_class"].astype(str).str.strip() == pc_code]
+                    .sort_values("revenue", ascending=False)
+                    .head(5)
+                )
+                if sub.empty:
+                    continue
+                pc_total = sub["revenue"].sum()
+                lines.append(f"\n  {desc}  (${pc_total:,.0f} total across top accounts):")
+                for _, row in sub.iterrows():
+                    acct = str(row["account_number"]).strip()
+                    name = acct_name_map.get(acct, "")
+                    old = old_acct_map.get(acct, "")
+                    label = (f"{name} (#{old})" if name and old else name or f"Acct {acct}")[:34]
+                    rev = row["revenue"]
+                    gp = row["gp"]
+                    gp_pct = gp / rev * 100 if rev > 0 else 0.0
+                    lines.append(f"    {label:<34} ${rev:>10,.0f}  GP {gp_pct:.1f}%")
+
             return "\n".join(lines)
         except Exception as exc:  # noqa: BLE001
             log.warning("Rep data fetch failed: %s", exc)
@@ -501,6 +537,14 @@ class _AiReplyWorker(QThread):
             "- Use the WAREHOUSE DATA product names and account names verbatim. Do not rename them.\n"
             "- Always cite the exact date range the numbers cover (e.g. 'Feb 2, 2026 – May 18, 2026').\n"
             "- Address the rep by first name once, at the very start.\n"
+            "- If the rep asks about a SPECIFIC PRODUCT (e.g. 'Win Win', 'Carpet Residential'): "
+            "use the PRODUCT × ACCOUNT BREAKDOWN section to give a per-account table for that "
+            "product. Include the total revenue, GP%, and each account name with its dollar figure. "
+            "This is the most important section to use for product-specific questions.\n"
+            "- If the rep asks for data 'by rep' or 'for each rep': you only have data for THIS "
+            "rep's territory. State that in one short sentence, then immediately provide the best "
+            "available alternative — typically the PRODUCT × ACCOUNT BREAKDOWN for the product "
+            "they asked about. Never just refuse and offer nothing. Always deliver a table.\n"
             "- If the rep's request is clear and the data is present: respond with the specific "
             "table or figures from FRESH WAREHOUSE DATA. Keep it 100–220 words.\n"
             "- If the rep's request is AMBIGUOUS or the specific data they need is NOT in the "
@@ -509,8 +553,8 @@ class _AiReplyWorker(QThread):
             "symbols. Use dashes for table borders.\n"
             "- Do NOT add a sign-off, signature, or closing pleasantry.\n"
             "- Close with ONE offer of a follow-up data pull the warehouse can actually deliver "
-            "(e.g. a specific account breakdown, GP% trend, product-line detail). Never suggest "
-            "calls, meetings, or actions you cannot take as an AI data tool."
+            "(e.g. month-by-month trend for a specific account, GP% comparison, product-line "
+            "detail). Never suggest calls, meetings, or actions you cannot take as an AI data tool."
         )
 
         user_msg = (
