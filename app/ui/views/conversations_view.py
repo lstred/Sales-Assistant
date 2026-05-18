@@ -232,18 +232,191 @@ class _AiReplyWorker(QThread):
             parts.append(f"[{label}  {msg.sent_at[:16]}]\n{raw[:3000].strip()}")
         return "\n\n" + sep.join(parts)
 
-    def _fetch_account_data(self, account_numbers: list[str]) -> str:
-        """Monthly invoiced sales for the requested accounts."""
+    def _fetch_rep_data(self) -> str:
+        """Load this rep's full warehouse dashboard: FY YTD revenue, top products, top accounts.
+
+        Always included in the AI prompt so the model always has real data — even when
+        the rep's message contains no explicit account numbers.  Returns an empty string
+        on any error so callers never crash.
+        """
+        if not self._get_db:
+            return ""
+        try:
+            from datetime import date as _date
+            import pandas as pd
+            from app.data.loaders import (
+                load_invoiced_sales,
+                load_price_class_lookup,
+                load_rep_assignments,
+            )
+            from app.services.fiscal_calendar import fiscal_year_for, fy_start_date
+
+            db = self._get_db()
+            if db is None:
+                return ""
+
+            # Current FY YTD and prior FY same window
+            today = _date.today()
+            fy = fiscal_year_for(today)
+            fy_start = fy_start_date(fy)
+            cur_start, cur_end = fy_start, today
+            # Mirror window in prior FY (same offset from FY start)
+            days_offset = (today - fy_start).days
+            prior_fy_start = fy_start_date(fy - 1)
+            prior_start = prior_fy_start
+            prior_end = prior_fy_start + __import__("datetime").timedelta(days=days_offset)
+
+            # Resolve salesman_number from conv.rep_id
+            asgn = load_rep_assignments(db)
+            if asgn is None or asgn.empty:
+                return ""
+
+            rep_id = str(self._conv.rep_id).strip()
+            rep_rows = asgn[asgn["salesman_number"].astype(str).str.strip() == rep_id]
+
+            # If not found by number, try reverse email → rep_id map
+            if rep_rows.empty:
+                email_to_num = {
+                    v.strip().lower(): k
+                    for k, v in (self._cfg.rep_emails or {}).items()
+                    if v.strip()
+                }
+                num = email_to_num.get(rep_id.lower(), "")
+                if num:
+                    rep_rows = asgn[asgn["salesman_number"].astype(str).str.strip() == num]
+
+            if rep_rows.empty:
+                return ""
+
+            rep_name = str(rep_rows.iloc[0].get("salesman_name", rep_id)).strip()
+            rep_accounts: set[str] = set(rep_rows["account_number"].astype(str).str.strip())
+
+            # Account metadata maps
+            acct_name_map: dict[str, str] = {}
+            old_acct_map: dict[str, str] = {}
+            for _, r in rep_rows.iterrows():
+                acct = str(r["account_number"]).strip()
+                acct_name_map[acct] = str(r.get("account_name", "")).strip().lstrip("*")
+                old_acct_map[acct] = str(r.get("old_account_number", "")).strip()
+
+            # Load invoiced sales (product CCs only — prefix "0")
+            df_cur = load_invoiced_sales(db, cur_start, cur_end, code_prefix="0")
+            df_prior_full = load_invoiced_sales(db, prior_start, prior_end, code_prefix="0")
+
+            if df_cur is None or df_cur.empty:
+                return ""
+
+            df_c = df_cur[df_cur["account_number"].astype(str).str.strip().isin(rep_accounts)].copy()
+            df_p: pd.DataFrame
+            if df_prior_full is not None and not df_prior_full.empty:
+                df_p = df_prior_full[
+                    df_prior_full["account_number"].astype(str).str.strip().isin(rep_accounts)
+                ].copy()
+            else:
+                df_p = pd.DataFrame()
+
+            if df_c.empty:
+                return ""
+
+            pc_lookup = load_price_class_lookup(db)
+
+            # ── YTD totals ────────────────────────────────────────────────
+            ytd_rev: float = df_c["revenue"].sum()
+            prior_rev: float = df_p["revenue"].sum() if not df_p.empty else 0.0
+            yoy_str = (
+                f"{(ytd_rev - prior_rev) / prior_rev * 100:+.1f}% YoY"
+                if prior_rev > 0
+                else "no prior data"
+            )
+
+            lines: list[str] = [
+                f"WAREHOUSE DATA FOR {rep_name.upper()} — LIVE FROM DATABASE",
+                f"Period: {cur_start.strftime('%b %d, %Y')} → {cur_end.strftime('%b %d, %Y')}  (FY {fy} YTD)",
+                f"YTD Revenue:  ${ytd_rev:>12,.0f}",
+                f"Prior FY YTD: ${prior_rev:>12,.0f}  ({yoy_str})",
+                "",
+            ]
+
+            # ── Top products ──────────────────────────────────────────────
+            pc_cur = (
+                df_c.groupby("price_class", dropna=False)
+                .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
+                .reset_index()
+                .sort_values("revenue", ascending=False)
+                .head(15)
+            )
+            prior_pc: dict[str, float] = (
+                df_p.groupby("price_class")["revenue"].sum().to_dict()
+                if not df_p.empty
+                else {}
+            )
+
+            lines.append(f"TOP PRODUCTS BY REVENUE (FY {fy} YTD vs prior FY YTD):")
+            lines.append(f"  {'Product':<30} {'YTD $':>12} {'Prev YTD $':>12} {'YoY':>8} {'GP%':>6}")
+            lines.append(f"  {'-'*30} {'-'*12} {'-'*12} {'-'*8} {'-'*6}")
+            for _, row in pc_cur.iterrows():
+                pc = str(row["price_class"]).strip()
+                desc = pc_lookup.get(pc, pc)[:30]
+                rev = row["revenue"]
+                gp = row["gp"]
+                gp_pct = gp / rev * 100 if rev > 0 else 0.0
+                prev = prior_pc.get(pc, 0.0)
+                yoy = f"{(rev - prev) / prev * 100:+.1f}%" if prev > 0 else "new"
+                prev_s = f"${prev:,.0f}" if prev > 0 else "—"
+                lines.append(
+                    f"  {desc:<30} ${rev:>11,.0f} {prev_s:>12} {yoy:>8} {gp_pct:>5.1f}%"
+                )
+            lines.append("")
+
+            # ── Top accounts ──────────────────────────────────────────────
+            acct_cur = (
+                df_c.groupby("account_number", dropna=False)
+                .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
+                .reset_index()
+                .sort_values("revenue", ascending=False)
+                .head(20)
+            )
+            prior_acct: dict[str, float] = (
+                df_p.groupby("account_number")["revenue"].sum().to_dict()
+                if not df_p.empty
+                else {}
+            )
+
+            lines.append(f"TOP ACCOUNTS BY REVENUE (FY {fy} YTD):")
+            lines.append(f"  {'Account':<34} {'YTD $':>12} {'Prev YTD $':>12} {'YoY':>8}")
+            lines.append(f"  {'-'*34} {'-'*12} {'-'*12} {'-'*8}")
+            for _, row in acct_cur.iterrows():
+                acct = str(row["account_number"]).strip()
+                name = acct_name_map.get(acct, "")
+                old = old_acct_map.get(acct, "")
+                label = (f"{name} (#{old})" if name and old else name or f"Acct {acct}")[:34]
+                rev = row["revenue"]
+                prev = prior_acct.get(acct, 0.0)
+                yoy = f"{(rev - prev) / prev * 100:+.1f}%" if prev > 0 else "new"
+                prev_s = f"${prev:,.0f}" if prev > 0 else "—"
+                lines.append(f"  {label:<34} ${rev:>11,.0f} {prev_s:>12} {yoy:>8}")
+
+            return "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Rep data fetch failed: %s", exc)
+            return ""
+
+    def _fetch_account_detail(self, account_numbers: list[str]) -> str:
+        """Period-by-period invoiced sales for specific accounts mentioned in the thread.
+
+        Supplements the rep dashboard above with granular monthly detail when the
+        rep or manager explicitly referenced specific account numbers.
+        """
         if not account_numbers or not self._get_db:
             return ""
         try:
-            from datetime import date
+            from datetime import date as _date
             from app.data.loaders import load_invoiced_sales, load_rep_assignments
             db = self._get_db()
             if db is None:
                 return ""
-            end = date.today()
-            start = date(end.year - 1, 1, 1)
+            end = _date.today()
+            start = _date(end.year - 1, 1, 1)
             df = load_invoiced_sales(db, start, end)
             if df is None or df.empty:
                 return ""
@@ -251,12 +424,13 @@ class _AiReplyWorker(QThread):
             if df.empty:
                 return ""
 
-            # Account name lookup
             acct_names: dict[str, str] = {}
             try:
                 asgn = load_rep_assignments(db)
                 if "account_number" in asgn.columns and "account_name" in asgn.columns:
-                    for _, row in asgn[asgn["account_number"].astype(str).isin(account_numbers)].iterrows():
+                    for _, row in asgn[
+                        asgn["account_number"].astype(str).isin(account_numbers)
+                    ].iterrows():
                         acct_names[str(row["account_number"])] = str(row.get("account_name", ""))
             except Exception:  # noqa: BLE001
                 pass
@@ -273,7 +447,7 @@ class _AiReplyWorker(QThread):
                 .sort_values(["account_number", period_col])
             )
 
-            lines: list[str] = []
+            lines: list[str] = ["\nACCOUNT DETAIL (month-by-month):"]
             for acct_num, sub in grp.groupby("account_number"):
                 name = acct_names.get(str(acct_num), "")
                 label = f"{name} (#{acct_num})" if name else f"#{acct_num}"
@@ -289,7 +463,7 @@ class _AiReplyWorker(QThread):
                     )
             return "\n".join(lines)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Account data fetch failed: %s", exc)
+            log.warning("Account detail fetch failed: %s", exc)
             return ""
 
     def _generate(self) -> str:
@@ -304,29 +478,39 @@ class _AiReplyWorker(QThread):
             last = inbound[-1]
             last_body = last.body_text or (self._strip_html(last.body_html) if last.body_html else "")
 
+        # Always load the full rep dashboard from the warehouse.
+        rep_data = self._fetch_rep_data()
+
+        # Additionally fetch month-by-month detail for any accounts explicitly named.
         all_text = " ".join(
             (m.body_text or self._strip_html(m.body_html or "")) for m in self._messages
         )
         account_numbers = self._extract_account_numbers(all_text)
-        sales_data = self._fetch_account_data(account_numbers)
+        account_detail = self._fetch_account_detail(account_numbers)
+
+        warehouse_block = "\n\n".join(x for x in [rep_data, account_detail] if x)
 
         system_msg = (
-            "You are an AI data assistant automatically responding to a sales rep's email reply "
-            "on behalf of the sales manager. The rep replied to a coaching email that may have "
-            "included a data service offer (e.g. 'Reply YES for a breakdown').\n\n"
-            "Rules:\n"
-            "- Address the rep by first name once, at the start.\n"
-            "- If the request is clear: fulfill it with specific data (tables, bullet lists, "
-            "account names + dollar figures). Keep it 100–220 words.\n"
-            "- If the request is AMBIGUOUS or you lack sufficient context to give a useful answer: "
-            "start your reply with exactly 'CLARIFICATION NEEDED:' then ask ONE concise question "
-            "to clarify what data or time range they want. Nothing else — just the question.\n"
-            "- Write plain paragraphs and simple ASCII tables only — no markdown, no asterisks.\n"
-            "- Do NOT add a sign-off or signature.\n"
-            "- If fulfilling a data request, close with ONE offer of additional data the warehouse "
-            "can provide (breakdowns, account trends, GP% by product line). Do NOT suggest "
-            "scheduling calls, meetings, or check-ins — only data the AI can actually deliver.\n"
-            "- Never invent numbers not present in the supplied data."
+            "You are an AI data assistant automatically responding to a sales rep's email "
+            "on behalf of the sales manager. You have access to live warehouse data pulled "
+            "directly from the sales database — always use it.\n\n"
+            "CRITICAL RULES — violating any of these is a failure:\n"
+            "- NEVER invent, estimate, or fabricate any number. If a specific figure is not "
+            "in FRESH WAREHOUSE DATA, say exactly: 'I don\\'t have that breakdown in the "
+            "warehouse right now — I can pull [X] if you want.' Never guess.\n"
+            "- Use the WAREHOUSE DATA product names and account names verbatim. Do not rename them.\n"
+            "- Always cite the exact date range the numbers cover (e.g. 'Feb 2, 2026 – May 18, 2026').\n"
+            "- Address the rep by first name once, at the very start.\n"
+            "- If the rep's request is clear and the data is present: respond with the specific "
+            "table or figures from FRESH WAREHOUSE DATA. Keep it 100–220 words.\n"
+            "- If the rep's request is AMBIGUOUS or the specific data they need is NOT in the "
+            "warehouse block: start with exactly 'CLARIFICATION NEEDED:' and ask ONE question.\n"
+            "- Plain text and simple ASCII tables only — no markdown, no asterisks, no bullet "
+            "symbols. Use dashes for table borders.\n"
+            "- Do NOT add a sign-off, signature, or closing pleasantry.\n"
+            "- Close with ONE offer of a follow-up data pull the warehouse can actually deliver "
+            "(e.g. a specific account breakdown, GP% trend, product-line detail). Never suggest "
+            "calls, meetings, or actions you cannot take as an AI data tool."
         )
 
         user_msg = (
@@ -335,8 +519,14 @@ class _AiReplyWorker(QThread):
             f"CONVERSATION HISTORY:\n{self._history_text()}\n\n"
             f"REP'S LATEST MESSAGE:\n{last_body[:1500]}\n"
         )
-        if sales_data:
-            user_msg += f"\nFRESH WAREHOUSE DATA:\n{sales_data}\n"
+        if warehouse_block:
+            user_msg += f"\nFRESH WAREHOUSE DATA (use this — do not invent anything outside it):\n{warehouse_block}\n"
+        else:
+            user_msg += (
+                "\nWARNING: Warehouse data could not be loaded for this rep. "
+                "Do NOT invent any numbers. Tell the rep the data pull failed and "
+                "ask them to try again in a few minutes.\n"
+            )
         user_msg += "\nDraft the reply now:"
 
         result = provider.complete(
@@ -346,7 +536,7 @@ class _AiReplyWorker(QThread):
             ],
             model=self._cfg.ai.model,
             max_output_tokens=max(1024, self._cfg.ai.max_output_tokens),
-            temperature=0.35,
+            temperature=0.2,
             timeout_seconds=self._cfg.ai.request_timeout_seconds,
         )
         return result.text.strip()
