@@ -98,6 +98,13 @@ class _ImapPollWorker(QThread):
                 for e in (self._cfg.email.auto_reply_whitelist or [])
                 if e.strip()
             }
+            management_set: set[str] = {
+                e.strip().lower()
+                for e in (self._cfg.email.auto_reply_management_emails or [])
+                if e.strip()
+            }
+            # All eligible senders (reps + management) — combined for the orphan check.
+            all_eligible: set[str] = whitelist | management_set
             # cfg.rep_emails: {salesman_number: email} — invert for lookups.
             email_to_rep_id: dict[str, str] = {
                 v.strip().lower(): k
@@ -120,7 +127,7 @@ class _ImapPollWorker(QThread):
                     from_email = _parse_email_address(reply["from_address"])
                     if not from_email:
                         continue
-                    if not whitelist or from_email not in whitelist:
+                    if not all_eligible or from_email not in all_eligible:
                         log.debug(
                             "IMAP: skipping unmatched email from %s — not in whitelist",
                             from_email,
@@ -502,6 +509,173 @@ class _AiReplyWorker(QThread):
             log.warning("Account detail fetch failed: %s", exc)
             return ""
 
+    def _is_management_sender(self) -> bool:
+        """Return True when the email thread was initiated by a management sender.
+
+        Management senders are listed in ``cfg.email.auto_reply_management_emails``.
+        We check (in order): the conversation ``rep_id`` (when it is an email), and
+        then the From: address of every inbound message in the thread.
+        """
+        mgmt: set[str] = {
+            e.strip().lower()
+            for e in (self._cfg.email.auto_reply_management_emails or [])
+            if e.strip()
+        }
+        if not mgmt:
+            return False
+        if "@" in self._conv.rep_id and self._conv.rep_id.lower() in mgmt:
+            return True
+        for msg in self._messages:
+            if msg.direction == "inbound":
+                addr = _parse_email_address(msg.from_address or "").lower()
+                if addr and addr in mgmt:
+                    return True
+        return False
+
+    def _fetch_management_data(self) -> str:
+        """Load company-wide warehouse dashboard for a management query.
+
+        Unlike ``_fetch_rep_data`` which scopes to a single rep's accounts, this
+        loads ALL invoiced sales across ALL reps and territories so the manager can
+        ask cross-rep questions (e.g. "which rep sells the most Win Win?").
+        Returns an empty string on any error so callers never crash.
+        """
+        if not self._get_db:
+            return ""
+        try:
+            import datetime as _dt
+            import pandas as pd
+            from app.data.loaders import (
+                load_invoiced_sales,
+                load_price_class_lookup,
+                load_rep_assignments,
+            )
+            from app.services.fiscal_calendar import fiscal_year_for, fy_start_date
+
+            db = self._get_db()
+            if db is None:
+                return ""
+
+            today = _dt.date.today()
+            fy = fiscal_year_for(today)
+            fy_start = fy_start_date(fy)
+            cur_start, cur_end = fy_start, today
+            days_offset = (today - fy_start).days
+            prior_fy_start = fy_start_date(fy - 1)
+            prior_start = prior_fy_start
+            prior_end = prior_fy_start + _dt.timedelta(days=days_offset)
+
+            df_c = load_invoiced_sales(db, cur_start, cur_end, code_prefix="0")
+            df_p_full = load_invoiced_sales(db, prior_start, prior_end, code_prefix="0")
+
+            if df_c is None or df_c.empty:
+                return ""
+            df_p = df_p_full if (df_p_full is not None and not df_p_full.empty) else pd.DataFrame()
+
+            pc_lookup = load_price_class_lookup(db)
+
+            ytd_rev: float = df_c["revenue"].sum()
+            prior_rev: float = df_p["revenue"].sum() if not df_p.empty else 0.0
+            yoy_str = (
+                f"{(ytd_rev - prior_rev) / prior_rev * 100:+.1f}% YoY"
+                if prior_rev > 0 else "no prior data"
+            )
+
+            lines: list[str] = [
+                "COMPANY-WIDE WAREHOUSE DATA — ALL REPS / ALL TERRITORIES",
+                f"Period: {cur_start.strftime('%b %d, %Y')} → {cur_end.strftime('%b %d, %Y')}  (FY {fy} YTD)",
+                f"Total Company Revenue: ${ytd_rev:>12,.0f}",
+                f"Prior FY YTD:          ${prior_rev:>12,.0f}  ({yoy_str})",
+                "",
+            ]
+
+            # ── Sales by rep ──────────────────────────────────────────────
+            rep_cur = (
+                df_c.groupby("salesperson_desc", dropna=False)
+                .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
+                .reset_index()
+                .sort_values("revenue", ascending=False)
+                .head(30)
+            )
+            prior_rep_map: dict[str, float] = (
+                df_p.groupby("salesperson_desc")["revenue"].sum().to_dict()
+                if not df_p.empty else {}
+            )
+
+            lines.append(f"SALES BY REP (FY {fy} YTD vs prior FY YTD):")
+            lines.append(f"  {'Rep Name':<28} {'YTD $':>12} {'Prev YTD $':>12} {'YoY':>8} {'GP%':>6}")
+            lines.append(f"  {'-'*28} {'-'*12} {'-'*12} {'-'*8} {'-'*6}")
+            for _, row in rep_cur.iterrows():
+                rep_n = str(row["salesperson_desc"]).strip() or "(unassigned)"
+                rev = row["revenue"]
+                gp = row["gp"]
+                gp_pct = gp / rev * 100 if rev > 0 else 0.0
+                prev = prior_rep_map.get(rep_n, 0.0)
+                yoy = f"{(rev - prev) / prev * 100:+.1f}%" if prev > 0 else "new"
+                prev_s = f"${prev:,.0f}" if prev > 0 else "—"
+                lines.append(f"  {rep_n:<28} ${rev:>11,.0f} {prev_s:>12} {yoy:>8} {gp_pct:>5.1f}%")
+            lines.append("")
+
+            # ── Top products company-wide ─────────────────────────────────
+            pc_cur = (
+                df_c.groupby("price_class", dropna=False)
+                .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
+                .reset_index()
+                .sort_values("revenue", ascending=False)
+                .head(15)
+            )
+            prior_pc: dict[str, float] = (
+                df_p.groupby("price_class")["revenue"].sum().to_dict()
+                if not df_p.empty else {}
+            )
+
+            lines.append(f"TOP PRODUCTS COMPANY-WIDE (FY {fy} YTD):")
+            lines.append(f"  {'Product':<30} {'YTD $':>12} {'Prev YTD $':>12} {'YoY':>8} {'GP%':>6}")
+            lines.append(f"  {'-'*30} {'-'*12} {'-'*12} {'-'*8} {'-'*6}")
+            for _, row in pc_cur.iterrows():
+                pc = str(row["price_class"]).strip()
+                desc = pc_lookup.get(pc, pc)[:30]
+                rev = row["revenue"]
+                gp = row["gp"]
+                gp_pct = gp / rev * 100 if rev > 0 else 0.0
+                prev = prior_pc.get(pc, 0.0)
+                yoy = f"{(rev - prev) / prev * 100:+.1f}%" if prev > 0 else "new"
+                prev_s = f"${prev:,.0f}" if prev > 0 else "—"
+                lines.append(f"  {desc:<30} ${rev:>11,.0f} {prev_s:>12} {yoy:>8} {gp_pct:>5.1f}%")
+            lines.append("")
+
+            # ── Product × Rep cross-tab ───────────────────────────────────
+            lines.append("PRODUCT × REP BREAKDOWN (top 5 reps per top product):")
+            top_pc_codes = [str(r).strip() for r in pc_cur.head(8)["price_class"]]
+            pc_rep_grp = (
+                df_c[df_c["price_class"].astype(str).str.strip().isin(top_pc_codes)]
+                .groupby(["price_class", "salesperson_desc"], dropna=False)
+                .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
+                .reset_index()
+            )
+            for pc_code in top_pc_codes:
+                desc = pc_lookup.get(pc_code, pc_code)[:30]
+                sub = (
+                    pc_rep_grp[pc_rep_grp["price_class"].astype(str).str.strip() == pc_code]
+                    .sort_values("revenue", ascending=False)
+                    .head(5)
+                )
+                if sub.empty:
+                    continue
+                pc_total = sub["revenue"].sum()
+                lines.append(f"\n  {desc}  (${pc_total:,.0f} total across top reps):")
+                for _, row in sub.iterrows():
+                    rep_n = str(row["salesperson_desc"]).strip() or "(unassigned)"
+                    rev = row["revenue"]
+                    gp = row["gp"]
+                    gp_pct = gp / rev * 100 if rev > 0 else 0.0
+                    lines.append(f"    {rep_n:<28} ${rev:>10,.0f}  GP {gp_pct:.1f}%")
+
+            return "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Management data fetch failed: %s", exc)
+            return ""
+
     def _generate(self) -> str:
         from app.ai.base import ChatMessage
         from app.ai.factory import build_provider
@@ -515,60 +689,93 @@ class _AiReplyWorker(QThread):
             last_body = last.body_text or (self._strip_html(last.body_html) if last.body_html else "")
 
         # Always load the full rep dashboard from the warehouse.
-        rep_data = self._fetch_rep_data()
+        is_mgmt = self._is_management_sender()
 
-        # Additionally fetch month-by-month detail for any accounts explicitly named.
-        all_text = " ".join(
-            (m.body_text or self._strip_html(m.body_html or "")) for m in self._messages
-        )
-        account_numbers = self._extract_account_numbers(all_text)
-        account_detail = self._fetch_account_detail(account_numbers)
+        if is_mgmt:
+            # Management sender — load company-wide data across all reps.
+            warehouse_data = self._fetch_management_data()
+            all_text = " ".join(
+                (m.body_text or self._strip_html(m.body_html or "")) for m in self._messages
+            )
+            account_numbers = self._extract_account_numbers(all_text)
+            account_detail = self._fetch_account_detail(account_numbers)
+            warehouse_block = "\n\n".join(x for x in [warehouse_data, account_detail] if x)
+        else:
+            # Rep sender — scope to this rep's territory only.
+            rep_data = self._fetch_rep_data()
+            all_text = " ".join(
+                (m.body_text or self._strip_html(m.body_html or "")) for m in self._messages
+            )
+            account_numbers = self._extract_account_numbers(all_text)
+            account_detail = self._fetch_account_detail(account_numbers)
+            warehouse_block = "\n\n".join(x for x in [rep_data, account_detail] if x)
 
-        warehouse_block = "\n\n".join(x for x in [rep_data, account_detail] if x)
+        if is_mgmt:
+            system_msg = (
+                "You are an AI data assistant automatically responding to a MANAGER's email query. "
+                "You have full access to COMPANY-WIDE warehouse data across ALL reps and territories. "
+                "Always use the live data provided — never invent anything.\n\n"
+                "CRITICAL RULES — violating any of these is a failure:\n"
+                "- NEVER invent, estimate, or fabricate any number. Use only figures from "
+                "FRESH WAREHOUSE DATA. If a figure is missing, say so explicitly.\n"
+                "- Always cite the exact date range the numbers cover.\n"
+                "- You CAN and SHOULD compare reps by name — that is appropriate for a manager query.\n"
+                "- If asked about a SPECIFIC PRODUCT (e.g. 'Win Win'): use PRODUCT × REP BREAKDOWN "
+                "to show per-rep sales for that product with each rep's revenue and GP%.\n"
+                "- If asked about a SPECIFIC REP: pull their row from SALES BY REP and provide details.\n"
+                "- Respond directly with specific tables or figures. Up to 300 words.\n"
+                "- If the request is AMBIGUOUS or the data needed is NOT in the warehouse block: "
+                "start with exactly 'CLARIFICATION NEEDED:' and ask ONE question.\n"
+                "- Plain text and simple ASCII tables only — no markdown, no asterisks.\n"
+                "- Do NOT add a sign-off or closing pleasantry.\n"
+                "- Close with ONE offer of a specific follow-up data pull."
+            )
+        else:
+            system_msg = (
+                "You are an AI data assistant automatically responding to a sales rep's email "
+                "on behalf of the sales manager. You have access to live warehouse data pulled "
+                "directly from the sales database — always use it.\n\n"
+                "CRITICAL RULES — violating any of these is a failure:\n"
+                "- NEVER invent, estimate, or fabricate any number. If a specific figure is not "
+                "in FRESH WAREHOUSE DATA, say exactly: 'I don\\'t have that breakdown in the "
+                "warehouse right now — I can pull [X] if you want.' Never guess.\n"
+                "- Use the WAREHOUSE DATA product names and account names verbatim. Do not rename them.\n"
+                "- Always cite the exact date range the numbers cover (e.g. 'Feb 2, 2026 – May 18, 2026').\n"
+                "- Address the rep by first name once, at the very start.\n"
+                "- If the rep asks about a SPECIFIC PRODUCT (e.g. 'Win Win', 'Carpet Residential'): "
+                "use the PRODUCT × ACCOUNT BREAKDOWN section to give a per-account table for that "
+                "product. Include the total revenue, GP%, and each account name with its dollar figure. "
+                "This is the most important section to use for product-specific questions.\n"
+                "- If the rep asks for data 'by rep' or 'for each rep': you only have data for THIS "
+                "rep's territory. State that in one short sentence, then immediately provide the best "
+                "available alternative — typically the PRODUCT × ACCOUNT BREAKDOWN for the product "
+                "they asked about. Never just refuse and offer nothing. Always deliver a table.\n"
+                "- If the rep's request is clear and the data is present: respond with the specific "
+                "table or figures from FRESH WAREHOUSE DATA. Keep it 100–220 words.\n"
+                "- If the rep's request is AMBIGUOUS or the specific data they need is NOT in the "
+                "warehouse block: start with exactly 'CLARIFICATION NEEDED:' and ask ONE question.\n"
+                "- Plain text and simple ASCII tables only — no markdown, no asterisks, no bullet "
+                "symbols. Use dashes for table borders.\n"
+                "- Do NOT add a sign-off, signature, or closing pleasantry.\n"
+                "- Close with ONE offer of a follow-up data pull the warehouse can actually deliver "
+                "(e.g. month-by-month trend for a specific account, GP% comparison, product-line "
+                "detail). Never suggest calls, meetings, or actions you cannot take as an AI data tool."
+            )
 
-        system_msg = (
-            "You are an AI data assistant automatically responding to a sales rep's email "
-            "on behalf of the sales manager. You have access to live warehouse data pulled "
-            "directly from the sales database — always use it.\n\n"
-            "CRITICAL RULES — violating any of these is a failure:\n"
-            "- NEVER invent, estimate, or fabricate any number. If a specific figure is not "
-            "in FRESH WAREHOUSE DATA, say exactly: 'I don\\'t have that breakdown in the "
-            "warehouse right now — I can pull [X] if you want.' Never guess.\n"
-            "- Use the WAREHOUSE DATA product names and account names verbatim. Do not rename them.\n"
-            "- Always cite the exact date range the numbers cover (e.g. 'Feb 2, 2026 – May 18, 2026').\n"
-            "- Address the rep by first name once, at the very start.\n"
-            "- If the rep asks about a SPECIFIC PRODUCT (e.g. 'Win Win', 'Carpet Residential'): "
-            "use the PRODUCT × ACCOUNT BREAKDOWN section to give a per-account table for that "
-            "product. Include the total revenue, GP%, and each account name with its dollar figure. "
-            "This is the most important section to use for product-specific questions.\n"
-            "- If the rep asks for data 'by rep' or 'for each rep': you only have data for THIS "
-            "rep's territory. State that in one short sentence, then immediately provide the best "
-            "available alternative — typically the PRODUCT × ACCOUNT BREAKDOWN for the product "
-            "they asked about. Never just refuse and offer nothing. Always deliver a table.\n"
-            "- If the rep's request is clear and the data is present: respond with the specific "
-            "table or figures from FRESH WAREHOUSE DATA. Keep it 100–220 words.\n"
-            "- If the rep's request is AMBIGUOUS or the specific data they need is NOT in the "
-            "warehouse block: start with exactly 'CLARIFICATION NEEDED:' and ask ONE question.\n"
-            "- Plain text and simple ASCII tables only — no markdown, no asterisks, no bullet "
-            "symbols. Use dashes for table borders.\n"
-            "- Do NOT add a sign-off, signature, or closing pleasantry.\n"
-            "- Close with ONE offer of a follow-up data pull the warehouse can actually deliver "
-            "(e.g. month-by-month trend for a specific account, GP% comparison, product-line "
-            "detail). Never suggest calls, meetings, or actions you cannot take as an AI data tool."
-        )
-
+        sender_label = "MANAGER QUERY" if is_mgmt else f"Rep: {self._conv.rep_name or self._conv.rep_id}"
         user_msg = (
-            f"Rep: {self._conv.rep_name or self._conv.rep_id}\n"
+            f"{sender_label}\n"
             f"Subject: {self._conv.subject}\n\n"
             f"CONVERSATION HISTORY:\n{self._history_text()}\n\n"
-            f"REP'S LATEST MESSAGE:\n{last_body[:1500]}\n"
+            f"LATEST MESSAGE:\n{last_body[:1500]}\n"
         )
         if warehouse_block:
-            user_msg += f"\nFRESH WAREHOUSE DATA (use this — do not invent anything outside it):\n{warehouse_block}\n"
+            data_label = "COMPANY-WIDE WAREHOUSE DATA" if is_mgmt else "FRESH WAREHOUSE DATA (rep's territory)"
+            user_msg += f"\n{data_label} (use this — do not invent anything outside it):\n{warehouse_block}\n"
         else:
             user_msg += (
-                "\nWARNING: Warehouse data could not be loaded for this rep. "
-                "Do NOT invent any numbers. Tell the rep the data pull failed and "
+                "\nWARNING: Warehouse data could not be loaded. "
+                "Do NOT invent any numbers. Report the data pull failed and "
                 "ask them to try again in a few minutes.\n"
             )
         user_msg += "\nDraft the reply now:"
@@ -949,9 +1156,16 @@ class ConversationsView(QWidget):
             self.poll_status.setText("IMAP not configured — configure in Settings → Email.")
         elif self._auto_reply_enabled:
             wl_count = len(self._cfg.email.auto_reply_whitelist or [])
-            if wl_count:
+            mgmt_count = len(self._cfg.email.auto_reply_management_emails or [])
+            total_count = wl_count + mgmt_count
+            if total_count:
+                parts = []
+                if wl_count:
+                    parts.append(f"{wl_count} rep(s)")
+                if mgmt_count:
+                    parts.append(f"{mgmt_count} management")
                 self.poll_status.setText(
-                    f"Auto-reply active for {wl_count} whitelisted address(es) — checking every 2 min."
+                    f"Auto-reply active for {', '.join(parts)} — checking every 2 min."
                 )
             else:
                 self.poll_status.setText(
@@ -1519,21 +1733,27 @@ class ConversationsView(QWidget):
                 log.info("Auto-reply skipped for %s — no email on file", conv.rep_id)
                 continue
             # ── Whitelist gate ───────────────────────────────────────────
-            # Only addresses explicitly whitelisted receive auto-replies.
-            # An empty whitelist means auto-reply is inactive for everyone.
+            # Only addresses explicitly whitelisted (rep or management) receive auto-replies.
+            # An empty whitelist AND empty management list means auto-reply is inactive.
             whitelist = {
                 e.strip().lower()
                 for e in (self._cfg.email.auto_reply_whitelist or [])
                 if e.strip()
             }
-            if not whitelist:
+            management_set = {
+                e.strip().lower()
+                for e in (self._cfg.email.auto_reply_management_emails or [])
+                if e.strip()
+            }
+            all_eligible = whitelist | management_set
+            if not all_eligible:
                 log.info(
                     "Auto-reply skipped for %s — whitelist is empty (add addresses "
                     "in Email Settings → Auto-Reply tab)",
                     rep_email,
                 )
                 continue
-            if rep_email.lower() not in whitelist:
+            if rep_email.lower() not in all_eligible:
                 log.info(
                     "Auto-reply skipped for %s — address not in whitelist", rep_email
                 )

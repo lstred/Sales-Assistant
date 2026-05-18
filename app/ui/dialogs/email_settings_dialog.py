@@ -237,16 +237,17 @@ class EmailSettingsDialog(QDialog):
     # ─────────────────────────────────────────── smart defaults
 
     def _build_whitelist_tab(self) -> QWidget:
-        """Tab: Auto-Reply Whitelist — per-address pass-through control."""
+        """Tab: Auto-Reply — rep whitelist + management addresses."""
         w = QWidget()
         vl = QVBoxLayout(w)
         vl.setContentsMargins(16, 14, 16, 14)
         vl.setSpacing(10)
 
+        # ── Section header ───────────────────────────────────────────────
         desc = QLabel(
-            "<b>Auto-Reply Whitelist</b><br>"
-            "Only inbound emails from these addresses are automatically answered "
-            "by the AI without your approval.&nbsp; "
+            "<b>Auto-Reply — Sales Reps</b><br>"
+            "Only inbound emails from these rep addresses are automatically answered "
+            "by the AI without your approval. "
             "All other senders require you to click <i>Draft AI Reply</i> manually.<br>"
             "<span style='color:#6B7280'>An empty list disables auto-reply for everyone.</span>"
         )
@@ -254,7 +255,7 @@ class EmailSettingsDialog(QDialog):
         desc.setStyleSheet("font-size: 12px; line-height: 1.5;")
         vl.addWidget(desc)
 
-        # ── list ────────────────────────────────────────────────────────
+        # ── Rep list ────────────────────────────────────────────────────
         self.whitelist_widget = QListWidget()
         self.whitelist_widget.setAlternatingRowColors(True)
         self.whitelist_widget.setStyleSheet(
@@ -298,6 +299,63 @@ class EmailSettingsDialog(QDialog):
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
         vl.addWidget(hint)
+
+        # ── Divider ──────────────────────────────────────────────────────
+        from PySide6.QtWidgets import QFrame
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setStyleSheet("color: #E2E8F0; margin-top: 6px; margin-bottom: 2px;")
+        vl.addWidget(divider)
+
+        # ── Management section ───────────────────────────────────────────
+        mgmt_desc = QLabel(
+            "<b>Management — Full Data Access</b><br>"
+            "Emails from these addresses automatically receive a reply with "
+            "<b>company-wide data for all reps and territories</b> — not filtered to a single rep. "
+            "Useful for executives or the manager themselves emailing in a question.<br>"
+            "<span style='color:#6B7280'>"
+            "These addresses are also whitelisted for auto-reply (no need to add them above)."
+            "</span>"
+        )
+        mgmt_desc.setWordWrap(True)
+        mgmt_desc.setStyleSheet("font-size: 12px; line-height: 1.5;")
+        vl.addWidget(mgmt_desc)
+
+        self.management_widget = QListWidget()
+        self.management_widget.setAlternatingRowColors(True)
+        self.management_widget.setStyleSheet(
+            "QListWidget { border: 1px solid #D1FAE5; border-radius: 6px; "
+            "  font-size: 13px; padding: 4px; background: #F0FDF4; }"
+            "QListWidget::item { padding: 5px 8px; border-radius: 4px; }"
+            "QListWidget::item:selected { background: #D1FAE5; color: #065F46; }"
+        )
+        self.management_widget.setMinimumHeight(100)
+        for addr in (self._cfg.auto_reply_management_emails or []):
+            self.management_widget.addItem(addr.strip())
+        vl.addWidget(self.management_widget, 1)
+
+        mgmt_row = QHBoxLayout()
+        mgmt_row.setSpacing(8)
+        self._mgmt_input = QLineEdit()
+        self._mgmt_input.setPlaceholderText("manager@company.com")
+        self._mgmt_input.setStyleSheet(
+            "QLineEdit { border: 1px solid #D1FAE5; border-radius: 6px; "
+            "  padding: 6px 10px; font-size: 13px; background: #F0FDF4; }"
+            "QLineEdit:focus { border-color: #10B981; }"
+        )
+        self._mgmt_input.returnPressed.connect(self._add_management_entry)
+        btn_mgmt_add = QPushButton("Add Management")
+        btn_mgmt_add.setFixedWidth(140)
+        btn_mgmt_add.setProperty("primary", True)
+        btn_mgmt_add.clicked.connect(self._add_management_entry)
+        btn_mgmt_remove = QPushButton("Remove selected")
+        btn_mgmt_remove.setFixedWidth(130)
+        btn_mgmt_remove.clicked.connect(self._remove_management_entry)
+        mgmt_row.addWidget(self._mgmt_input, 1)
+        mgmt_row.addWidget(btn_mgmt_add)
+        mgmt_row.addWidget(btn_mgmt_remove)
+        vl.addLayout(mgmt_row)
+
         return w
 
     def _add_whitelist_entry(self) -> None:
@@ -325,6 +383,30 @@ class EmailSettingsDialog(QDialog):
             if self.whitelist_widget.item(i).text().strip()
         ]
 
+    def _add_management_entry(self) -> None:
+        addr = self._mgmt_input.text().strip().lower()
+        if not addr:
+            return
+        existing = [self.management_widget.item(i).text().lower()
+                    for i in range(self.management_widget.count())]
+        if addr in existing:
+            self._mgmt_input.clear()
+            return
+        self.management_widget.addItem(addr)
+        self._mgmt_input.clear()
+        self.management_widget.scrollToBottom()
+
+    def _remove_management_entry(self) -> None:
+        for item in self.management_widget.selectedItems():
+            self.management_widget.takeItem(self.management_widget.row(item))
+
+    def _collect_management_emails(self) -> list[str]:
+        return [
+            self.management_widget.item(i).text().strip()
+            for i in range(self.management_widget.count())
+            if self.management_widget.item(i).text().strip()
+        ]
+
     def _on_smtp_port_changed(self, port: int) -> None:
         """Auto-toggle STARTTLS based on well-known port numbers."""
         if port == 587:
@@ -350,6 +432,7 @@ class EmailSettingsDialog(QDialog):
             enable_outbound_send=self.enable_outbound.isChecked(),
             redirect_all_to=self.redirect_all_to.text().strip(),
             auto_reply_whitelist=self._collect_whitelist(),
+            auto_reply_management_emails=self._collect_management_emails(),
         )
 
     def commit_secrets(self) -> None:

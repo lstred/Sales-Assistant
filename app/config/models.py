@@ -63,6 +63,10 @@ class EmailConfig(BaseModel):
     # Everyone else requires the manager to manually click "Draft AI Reply".
     # An EMPTY list means auto-reply is inactive for everyone.
     auto_reply_whitelist: list[str] = Field(default_factory=list)
+    # Management senders receive auto-reply with FULL company-wide data (all reps).
+    # Add manager / executive email addresses here.  These are also implicitly
+    # whitelisted for auto-reply — they do NOT need to be in auto_reply_whitelist.
+    auto_reply_management_emails: list[str] = Field(default_factory=list)
 
 
 class AIConfig(BaseModel):
