@@ -637,13 +637,18 @@ class _AiReplyWorker(QThread):
         Returns a structured plain-text block for the AI prompt covering
         the entire open-order pipeline.  Management view shows all reps;
         rep view scopes to the rep's BILLSLMN-assigned accounts.
+
+        NOTE: loads ALL cost-center prefixes (product + sample) so the grand
+        total in the prompt matches the actual warehouse total.  Callers
+        should never pass a cc_prefix filter here.
         """
         if not self._get_db:
             return ""
         try:
-            from datetime import date as _date, timedelta as _td
+            from datetime import date as _date
             import pandas as pd
             from app.data.loaders import (
+                load_cost_centers,
                 load_open_orders,
                 load_price_class_lookup,
                 load_rep_assignments,
@@ -653,18 +658,32 @@ class _AiReplyWorker(QThread):
             if db is None:
                 return ""
 
-            # Load all open orders (product CCs only)
-            df = load_open_orders(db, code_prefix="0")
+            # Load ALL open orders — no code_prefix filter so the grand total
+            # matches the real warehouse total (product CCs + sample CCs).
+            df = load_open_orders(db)
             if df is None or df.empty:
                 return ""
 
-            # Load helper lookups
+            # ── Lookup tables ─────────────────────────────────────────────
             pc_lookup = load_price_class_lookup(db)
-            asgn = load_rep_assignments(db)
 
+            # Cost-center name lookup: code → human-readable name
+            cc_name_map: dict[str, str] = {}
+            try:
+                cc_df = load_cost_centers(db)
+                if cc_df is not None and not cc_df.empty:
+                    for _, r in cc_df.iterrows():
+                        code = str(r.get("cost_center", "")).strip()
+                        name = str(r.get("cost_center_name", "")).strip()
+                        if code and name:
+                            cc_name_map[code] = name
+            except Exception:  # noqa: BLE001
+                pass
+
+            asgn = load_rep_assignments(db)
             acct_name_map: dict[str, str] = {}
             old_acct_map: dict[str, str] = {}
-            acct_rep_map: dict[str, str] = {}  # account_number → rep name
+            acct_rep_map: dict[str, str] = {}
             if asgn is not None and not asgn.empty:
                 for _, r in asgn.iterrows():
                     acct = str(r["account_number"]).strip()
@@ -673,7 +692,7 @@ class _AiReplyWorker(QThread):
                         old_acct_map[acct] = str(r.get("old_account_number", "")).strip()
                         acct_rep_map[acct] = str(r.get("salesman_name", "")).strip()
 
-            # Scope to rep's accounts when in rep mode
+            # ── Scope to rep's accounts when in rep mode ──────────────────
             if not is_management:
                 rep_id = str(self._conv.rep_id).strip()
                 rep_accounts: set[str] | None = None
@@ -742,7 +761,7 @@ class _AiReplyWorker(QThread):
             lines: list[str] = [
                 f"OPEN ORDERS / FUTURE SHIPMENTS — {scope_label} (uninvoiced, not yet counted as sales)",
                 f"  As of: {today.strftime('%b %d, %Y')}",
-                f"  Total open pipeline: ${grand_total:,.0f}",
+                f"  Total open pipeline: ${grand_total:,.0f}  ← USE THIS AS THE GRAND TOTAL",
                 "",
                 f"  {'Bucket':<28} {'Open $':>12}  {'Lines':>6}",
                 f"  {'-'*28} {'-'*12}  {'-'*6}",
@@ -754,7 +773,30 @@ class _AiReplyWorker(QThread):
                 .reindex([b for b in _BUCKET_ORDER if b in df["_bucket"].values])
             )
             for bkt, brow in bucket_summary.iterrows():
-                lines.append(f"  {str(bkt):<28} ${brow['open_revenue']:>11,.0f}  {int(brow['count']):>6}")
+                lines.append(
+                    f"  {str(bkt):<28} ${brow['open_revenue']:>11,.0f}  {int(brow['count']):>6}"
+                )
+
+            # ── Company-wide BY COST CENTER summary (always shown) ────────
+            lines.append("")
+            lines.append("BY COST CENTER — total open pipeline:")
+            lines.append(f"  {'Cost Center':<36} {'Open $':>12}  {'Lines':>6}")
+            lines.append(f"  {'-'*36} {'-'*12}  {'-'*6}")
+            cc_grp = (
+                df.groupby("cost_center", dropna=False)
+                .agg(open_revenue=("open_revenue", "sum"), count=("open_revenue", "count"))
+                .reset_index()
+                .sort_values("open_revenue", ascending=False)
+            )
+            cc_total: float = 0.0
+            for _, row in cc_grp.iterrows():
+                cc = str(row["cost_center"]).strip()
+                name = cc_name_map.get(cc, cc)[:36]
+                rev = row["open_revenue"]
+                cnt = int(row["count"])
+                cc_total += rev
+                lines.append(f"  {name:<36} ${rev:>11,.0f}  {cnt:>6}")
+            lines.append(f"  {'TOTAL':<36} ${cc_total:>11,.0f}")
 
             lines.append("")
 
@@ -781,6 +823,18 @@ class _AiReplyWorker(QThread):
                     lines.append(f"  {'-'*30} {'-'*12}")
                     for rep_n, rev in rep_grp.items():
                         lines.append(f"  {str(rep_n):<30} ${rev:>11,.0f}")
+
+                    # Cost-center breakdown per bucket
+                    cc_bkt = (
+                        sub.groupby("cost_center", dropna=False)["open_revenue"]
+                        .sum()
+                        .sort_values(ascending=False)
+                    )
+                    lines.append(f"  {'Cost Center':<36} {'Open $':>10}")
+                    lines.append(f"  {'-'*36} {'-'*10}")
+                    for cc, rev in cc_bkt.items():
+                        name = cc_name_map.get(str(cc).strip(), str(cc).strip())[:36]
+                        lines.append(f"  {name:<36} ${rev:>9,.0f}")
                 else:
                     # Account-level breakdown (rep view)
                     acct_grp = (
@@ -1086,6 +1140,68 @@ class _AiReplyWorker(QThread):
             log.warning("Management data fetch failed: %s", exc)
             return ""
 
+    def _validate_draft(self, draft: str, warehouse_block: str) -> str:
+        """Second AI pass: fact-check every number in the draft against source data.
+
+        Runs a fresh AI call at temperature 0.0 instructed only to verify and
+        correct — not to add new content.  Falls back to the original draft on
+        any error so the auto-reply flow never blocks.
+        """
+        if not draft.strip() or not warehouse_block.strip():
+            return draft
+        try:
+            from app.ai.base import ChatMessage
+            from app.ai.factory import build_provider
+
+            provider = build_provider(self._cfg.ai)
+            system_msg = (
+                "You are a FACT-CHECKER for an AI sales data assistant.\n"
+                "Your ONLY job is to verify that every number (dollar amounts, "
+                "percentages, order counts) in the DRAFT EMAIL can be directly "
+                "traced to the SOURCE DATA block.\n\n"
+                "VERIFICATION PROCESS:\n"
+                "1. Extract every number from the draft.\n"
+                "2. Find each one in the source data — exact match OR provable sum "
+                "of visible rows.\n"
+                "3. If a number CANNOT be verified: it is FABRICATED. Remove or "
+                "correct it using only what the source data shows.\n"
+                "4. If an entire section is fabricated (e.g. a cost-center table "
+                "with no matching data): replace it with what the data ACTUALLY "
+                "shows, or state the breakdown was not available.\n\n"
+                "OUTPUT RULES — STRICTLY FOLLOW:\n"
+                "- If the draft is 100% accurate: return it VERBATIM, unchanged.\n"
+                "- If corrections are needed: return ONLY the corrected text — no "
+                "commentary, no 'CORRECTED:' labels, no explanations.\n"
+                "- Do NOT invent any number not present in the source data.\n"
+                "- Preserve the tone, structure, and formatting of the original.\n"
+                "- The GRAND TOTAL in the source data is authoritative — never "
+                "contradict it."
+            )
+            # Trim source data to fit safely — first 7 000 chars covers the
+            # open-orders + invoiced-sales summary (the hallucination-prone parts).
+            source_excerpt = warehouse_block[:7000]
+            user_msg = (
+                f"DRAFT EMAIL TO VERIFY:\n{draft}\n\n"
+                f"SOURCE DATA (ground truth — all valid numbers come from here):\n"
+                f"{source_excerpt}\n\n"
+                "Return the verified/corrected draft now:"
+            )
+            result = provider.complete(
+                [
+                    ChatMessage(role="system", content=system_msg),
+                    ChatMessage(role="user", content=user_msg),
+                ],
+                model=self._cfg.ai.model,
+                max_output_tokens=max(1024, self._cfg.ai.max_output_tokens),
+                temperature=0.0,
+                timeout_seconds=self._cfg.ai.request_timeout_seconds,
+            )
+            validated = (result.text or "").strip()
+            return validated if validated else draft
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Draft validation failed — using original: %s", exc)
+            return draft
+
     def _generate(self) -> str:
         from app.ai.base import ChatMessage
         from app.ai.factory import build_provider
@@ -1250,7 +1366,12 @@ class _AiReplyWorker(QThread):
             temperature=0.2,
             timeout_seconds=self._cfg.ai.request_timeout_seconds,
         )
-        return result.text.strip()
+        draft = result.text.strip()
+        # Run a second AI pass to fact-check every number against the source
+        # data before the reply is sent — prevents hallucinated figures.
+        if warehouse_block:
+            draft = self._validate_draft(draft, warehouse_block)
+        return draft
 
 
 # ================================================================ auto-reply worker
