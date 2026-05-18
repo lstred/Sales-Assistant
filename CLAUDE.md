@@ -170,6 +170,12 @@ Assistant:
 - **Revenue:** `ENTENDED_PRICE_NO_FUNDS` (yes the typo is permanent).
   GP: `LINE_GPD_WITHOUT_FUNDS`. GPP: `LINE_GPP_WITH_FUNDS`.
 - **Dates:** `ORDER_ENTRY_DATE_YYYYMMDD` (numeric YYYYMMDD — parse in Python).
+- **Future / uninvoiced shipments:** `ORDER_SHIP_DATE` (numeric YYYYMMDD) in
+  `dbo._ORDERS`. Filter `INVOICE# = 0` (not yet invoiced) AND
+  `ACCOUNT#I > 1` (exclude warehouse POs) to get orders that have
+  shipped or are scheduled to ship but haven't been invoiced yet.
+  Use `ORDER_SHIP_DATE` for date-range queries about upcoming/pending
+  deliveries ("what's shipping next week?", "orders due by end of month").
 
 ### 5b. Old-system / pre-go-live data (≤ 2025-08-04, summarized)
 
@@ -307,6 +313,14 @@ read those plus this file's earlier sections for full context.
     - `_scorecard_footer_html`: core-display `<li>` is only rendered when `sc.core_display_configured` is `True`; otherwise the line is omitted entirely.
     - `_build_rep_prompt` user_msg: `accounts_with_core_displays` and `core_display_coverage_pct` lines are only included when `sc.core_display_configured`. Sys_msg coaching insight examples and GOOD EXAMPLES bullet for core displays are also gated on `scorecard.core_display_configured`.
   - **26/26 tests pass.**
+
+- **2026-05-18 (latest)** — Auto-reply whitelist (per-address pass-through control):
+  - **`EmailConfig.auto_reply_whitelist: list[str]`** added to `app/config/models.py`. An empty list means auto-reply is **inactive for everyone** — you must explicitly add an email address before any rep gets an auto-reply. Persisted to `config.json`.
+  - **Email Settings → Auto-Reply tab** added to `EmailSettingsDialog`: polished `QListWidget` of whitelisted addresses (alternating rows, rounded border, blue selection), inline `QLineEdit` + Add / Remove Selected buttons, Return-key shortcut on the input field, automatic lowercase normalization, deduplication guard, and a descriptive hint about checking the From: header. `_collect()` now includes `auto_reply_whitelist=self._collect_whitelist()` so the list is saved alongside SMTP/IMAP settings.
+  - **`_on_new_conv_ids` in `conversations_view.py`** now builds a case-insensitive whitelist set from `self._cfg.email.auto_reply_whitelist` and skips `_fire_auto_reply` for any rep whose email is not in the set. Log messages distinguish between "whitelist is empty" and "address not in whitelist" for easy debugging.
+  - **Status bar message** updated: when IMAP + SMTP + AI are all configured but whitelist is empty, shows "Auto-reply paused — add rep email addresses in Email Settings → Auto-Reply tab to activate." When addresses are present, shows "Auto-reply active for N whitelisted address(es) — checking every 5 min."
+  - **`ORDER_SHIP_DATE` documented**: `dbo._ORDERS.ORDER_SHIP_DATE` (numeric YYYYMMDD) is the ship date for uninvoiced/future orders. Filter `INVOICE# = 0 AND ACCOUNT#I > 1` to query pending shipments by date range. Added to CLAUDE.md section 5a.
+  - **30/30 tests pass.**
 
 - **2026-05-18 (latest)** — L3M partial-window fix + auto-reply in Conversations:
   - **L3M prior-window detection tightened**: The previous fix only flagged `prior_3mo` data when `prior_3mo_end < filter_start` (the entire window is before the filter). In practice the prior window often starts before the filter but ends inside it — e.g. filter starts Feb 1 and prior_3mo covers Nov 17–Feb 16, giving only 16 days of overlap out of 91. This caused AI to cite "+523% surge" by comparing ~90 days vs ~16 days. Fix: condition changed to `if _p3m_s < start:` (prior_3mo **start** before filter_start), which correctly catches partial overlaps. The dollar figure is now completely suppressed (replaced with `DATA NOT LOADED — window predates the filter; use yoy_3mo instead`) so the AI cannot compute a percentage. NEVER WRITE prohibition tightened: flag is now `DATA NOT LOADED`, not `⚠ OUTSIDE filter window`.

@@ -58,6 +58,11 @@ class EmailConfig(BaseModel):
     # If non-empty, every send goes to this address INSTEAD OF the rep
     # (great for early dry-runs).
     redirect_all_to: str = ""
+    # Auto-reply pass-through whitelist.  Only inbound emails whose
+    # from-address is in this list will be auto-replied to by the AI.
+    # Everyone else requires the manager to manually click "Draft AI Reply".
+    # An EMPTY list means auto-reply is inactive for everyone.
+    auto_reply_whitelist: list[str] = Field(default_factory=list)
 
 
 class AIConfig(BaseModel):

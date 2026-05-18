@@ -634,7 +634,16 @@ class ConversationsView(QWidget):
             self.poll_btn.setToolTip("Configure IMAP in Settings → Email to enable automatic reply detection.")
             self.poll_status.setText("IMAP not configured — configure in Settings → Email.")
         elif self._auto_reply_enabled:
-            self.poll_status.setText("Auto-reply active — checking every 5 min.")
+            wl_count = len(self._cfg.email.auto_reply_whitelist or [])
+            if wl_count:
+                self.poll_status.setText(
+                    f"Auto-reply active for {wl_count} whitelisted address(es) — checking every 5 min."
+                )
+            else:
+                self.poll_status.setText(
+                    "Auto-reply paused — add rep email addresses in "
+                    "Email Settings → Auto-Reply tab to activate."
+                )
         else:
             missing = []
             if not smtp_ok:
@@ -1191,6 +1200,26 @@ class ConversationsView(QWidget):
             rep_email = self._cfg.rep_emails.get(conv.rep_id, "")
             if not rep_email:
                 log.info("Auto-reply skipped for %s — no email on file", conv.rep_id)
+                continue
+            # ── Whitelist gate ───────────────────────────────────────────
+            # Only addresses explicitly whitelisted receive auto-replies.
+            # An empty whitelist means auto-reply is inactive for everyone.
+            whitelist = {
+                e.strip().lower()
+                for e in (self._cfg.email.auto_reply_whitelist or [])
+                if e.strip()
+            }
+            if not whitelist:
+                log.info(
+                    "Auto-reply skipped for %s — whitelist is empty (add addresses "
+                    "in Email Settings → Auto-Reply tab)",
+                    rep_email,
+                )
+                continue
+            if rep_email.lower() not in whitelist:
+                log.info(
+                    "Auto-reply skipped for %s — address not in whitelist", rep_email
+                )
                 continue
             log.info("Auto-replying to conv %s (%s)", conv_id, conv.rep_name)
             self._fire_auto_reply(conv, messages)

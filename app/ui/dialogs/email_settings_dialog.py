@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -67,11 +68,12 @@ class EmailSettingsDialog(QDialog):
         intro.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 12px;")
         root.addWidget(intro)
 
-        # ── SMTP / IMAP tabs ──────────────────────────────────────────────
+        # ── SMTP / IMAP / whitelist tabs ───────────────────────────────────
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
         tabs.addTab(self._build_smtp_tab(), "  Outbound (SMTP)  ")
         tabs.addTab(self._build_imap_tab(), "  Inbound (IMAP)  ")
+        tabs.addTab(self._build_whitelist_tab(), "  Auto-Reply  ")
         root.addWidget(tabs, 1)
 
         # ── Safety (always visible — only 2 rows) ────────────────────────
@@ -234,6 +236,95 @@ class EmailSettingsDialog(QDialog):
 
     # ─────────────────────────────────────────── smart defaults
 
+    def _build_whitelist_tab(self) -> QWidget:
+        """Tab: Auto-Reply Whitelist — per-address pass-through control."""
+        w = QWidget()
+        vl = QVBoxLayout(w)
+        vl.setContentsMargins(16, 14, 16, 14)
+        vl.setSpacing(10)
+
+        desc = QLabel(
+            "<b>Auto-Reply Whitelist</b><br>"
+            "Only inbound emails from these addresses are automatically answered "
+            "by the AI without your approval.&nbsp; "
+            "All other senders require you to click <i>Draft AI Reply</i> manually.<br>"
+            "<span style='color:#6B7280'>An empty list disables auto-reply for everyone.</span>"
+        )
+        desc.setWordWrap(True)
+        desc.setStyleSheet("font-size: 12px; line-height: 1.5;")
+        vl.addWidget(desc)
+
+        # ── list ────────────────────────────────────────────────────────
+        self.whitelist_widget = QListWidget()
+        self.whitelist_widget.setAlternatingRowColors(True)
+        self.whitelist_widget.setStyleSheet(
+            "QListWidget { border: 1px solid #E2E8F0; border-radius: 6px; "
+            "  font-size: 13px; padding: 4px; }"
+            "QListWidget::item { padding: 5px 8px; border-radius: 4px; }"
+            "QListWidget::item:selected { background: #EFF6FF; color: #1D4ED8; }"
+        )
+        self.whitelist_widget.setMinimumHeight(140)
+        for addr in (self._cfg.auto_reply_whitelist or []):
+            self.whitelist_widget.addItem(addr.strip())
+        vl.addWidget(self.whitelist_widget, 1)
+
+        # ── add row ─────────────────────────────────────────────────────
+        add_row = QHBoxLayout()
+        add_row.setSpacing(8)
+        self._whitelist_input = QLineEdit()
+        self._whitelist_input.setPlaceholderText("rep@company.com")
+        self._whitelist_input.setStyleSheet(
+            "QLineEdit { border: 1px solid #D1D5DB; border-radius: 6px; "
+            "  padding: 6px 10px; font-size: 13px; }"
+            "QLineEdit:focus { border-color: #3B82F6; }"
+        )
+        self._whitelist_input.returnPressed.connect(self._add_whitelist_entry)
+        btn_add = QPushButton("Add")
+        btn_add.setFixedWidth(72)
+        btn_add.setProperty("primary", True)
+        btn_add.clicked.connect(self._add_whitelist_entry)
+        btn_remove = QPushButton("Remove selected")
+        btn_remove.setFixedWidth(130)
+        btn_remove.clicked.connect(self._remove_whitelist_entry)
+        add_row.addWidget(self._whitelist_input, 1)
+        add_row.addWidget(btn_add)
+        add_row.addWidget(btn_remove)
+        vl.addLayout(add_row)
+
+        hint = QLabel(
+            "Tip: this is the <i>From:</i> address the rep's mail client sends from — "
+            "check a received email header if unsure."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px;")
+        vl.addWidget(hint)
+        return w
+
+    def _add_whitelist_entry(self) -> None:
+        addr = self._whitelist_input.text().strip().lower()
+        if not addr:
+            return
+        # Deduplicate — check existing items
+        existing = [self.whitelist_widget.item(i).text().lower()
+                    for i in range(self.whitelist_widget.count())]
+        if addr in existing:
+            self._whitelist_input.clear()
+            return
+        self.whitelist_widget.addItem(addr)
+        self._whitelist_input.clear()
+        self.whitelist_widget.scrollToBottom()
+
+    def _remove_whitelist_entry(self) -> None:
+        for item in self.whitelist_widget.selectedItems():
+            self.whitelist_widget.takeItem(self.whitelist_widget.row(item))
+
+    def _collect_whitelist(self) -> list[str]:
+        return [
+            self.whitelist_widget.item(i).text().strip()
+            for i in range(self.whitelist_widget.count())
+            if self.whitelist_widget.item(i).text().strip()
+        ]
+
     def _on_smtp_port_changed(self, port: int) -> None:
         """Auto-toggle STARTTLS based on well-known port numbers."""
         if port == 587:
@@ -258,6 +349,7 @@ class EmailSettingsDialog(QDialog):
             imap_mailbox=self.imap_mailbox.text().strip() or "INBOX",
             enable_outbound_send=self.enable_outbound.isChecked(),
             redirect_all_to=self.redirect_all_to.text().strip(),
+            auto_reply_whitelist=self._collect_whitelist(),
         )
 
     def commit_secrets(self) -> None:
