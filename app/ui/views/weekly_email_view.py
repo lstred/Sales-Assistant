@@ -608,9 +608,39 @@ class WeeklyEmailView(QWidget):
                 self._price_class_lookup = load_price_class_lookup(self._get_db())
             except Exception as exc:  # noqa: BLE001
                 log.warning("price class lookup failed: %s", exc)
+
+        # Build the SALESMAN whitelist so departed reps (e.g. reps who left but
+        # still have a stray BILLSLMN entry) are excluded from scorecards and
+        # per-rep email drafts, just as they are from the leaderboard.
+        _sc_whitelist: set[str] = set()
+        if self._assignments_df is not None and not self._assignments_df.empty:
+            _sc_whitelist = {
+                str(n).strip().upper()
+                for n in self._assignments_df["salesman_name"].dropna()
+                if str(n).strip()
+            }
+
+        def _sc_rep_is_active(rk: str) -> bool:
+            rk = rk.strip()
+            if rk.lower() in _EXCLUDED_REPS:
+                return False
+            if _sc_whitelist:
+                return rk.upper() in _sc_whitelist
+            return bool(rk)
+
+        sc_df = (
+            self._df[self._df["rep_key"].apply(_sc_rep_is_active)].copy()
+            if _sc_whitelist else self._df
+        )
+        sc_prior = (
+            self._prior_df[self._prior_df["rep_key"].apply(_sc_rep_is_active)].copy()
+            if (self._prior_df is not None and not self._prior_df.empty and _sc_whitelist)
+            else self._prior_df
+        )
+
         self._scorecards = compute_rep_scorecards(
-            self._df,
-            prior_df=self._prior_df,
+            sc_df,
+            prior_df=sc_prior,
             assignments_df=self._assignments_df,
             displays_df=self._displays_df,
             samples_df=self._samples_df,
@@ -836,9 +866,29 @@ class WeeklyEmailView(QWidget):
         # All reps that appear in any column — exclude where both YTD avgs ≤ 0
         # and strip reps with blank names or excluded entries (e.g. HOUSE ACCOUNT).
         all_reps = set(per_rep_weekly) | set(per_rep_ytd_avg) | set(per_rep_prior_ytd_avg)
+
+        # Build a whitelist from the current SALESMAN table (via assignments_df which
+        # joins BILLSLMN → SALESMAN).  Any rep whose salesperson_desc does NOT appear
+        # in the active SALESMAN roster is excluded — this removes departed reps who
+        # still have stray BILLSLMN entries (e.g. Steve Olink with 1 remaining account).
+        _salesman_whitelist: set[str] = set()
+        if self._assignments_df is not None and not self._assignments_df.empty:
+            _salesman_whitelist = {
+                str(n).strip().upper()
+                for n in self._assignments_df["salesman_name"].dropna()
+                if str(n).strip()
+            }
+
+        def _rep_is_active(rep: str) -> bool:
+            if rep.strip().lower() in _EXCLUDED_REPS:
+                return False
+            if _salesman_whitelist:
+                return rep.strip().upper() in _salesman_whitelist
+            return bool(rep.strip())
+
         active_reps = {
             rep for rep in all_reps
-            if rep.strip().lower() not in _EXCLUDED_REPS
+            if _rep_is_active(rep)
             and (per_rep_ytd_avg.get(rep, 0.0) > 0 or per_rep_prior_ytd_avg.get(rep, 0.0) > 0)
         }
 

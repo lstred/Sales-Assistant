@@ -671,12 +671,38 @@ class _AiReplyWorker(QThread):
                 load_invoiced_sales,
                 load_price_class_lookup,
                 load_rep_assignments,
+                load_reps,
             )
             from app.services.fiscal_calendar import fiscal_year_for, fy_start_date
+
+            # Names that should never appear in management reports even if present in data.
+            _EXCL = frozenset({"", "house account", "(legacy / pre-aug 2025)"})
 
             db = self._get_db()
             if db is None:
                 return ""
+
+            # Build whitelist of current active salespeople from dbo.SALESMAN.
+            # Only reps whose name appears in the current SALESMAN table are shown
+            # in any per-rep breakdown — this excludes former employees whose
+            # accounts in BILLSLMN have not yet been reassigned.
+            active_reps_df = load_reps(db)
+            active_rep_names: set[str] = set()
+            if active_reps_df is not None and not active_reps_df.empty:
+                active_rep_names = {
+                    str(n).strip().upper()
+                    for n in active_reps_df["name"]
+                    if str(n).strip()
+                }
+
+            def _is_valid_rep(name: str) -> bool:
+                n = name.strip()
+                if n.lower() in _EXCL:
+                    return False
+                # If we have an active roster, enforce it; otherwise allow all.
+                if active_rep_names:
+                    return n.upper() in active_rep_names
+                return bool(n)
 
             today = _dt.date.today()
             fy = fiscal_year_for(today)
@@ -693,6 +719,19 @@ class _AiReplyWorker(QThread):
             if df_c is None or df_c.empty:
                 return ""
             df_p = df_p_full if (df_p_full is not None and not df_p_full.empty) else pd.DataFrame()
+
+            # Apply active-rep whitelist: remove rows attributed to former/excluded reps
+            # so they never surface in any per-rep breakdown.
+            df_c = df_c[
+                df_c["salesperson_desc"].fillna("").astype(str).str.strip().apply(_is_valid_rep)
+            ].copy()
+            if not df_p.empty:
+                df_p = df_p[
+                    df_p["salesperson_desc"].fillna("").astype(str).str.strip().apply(_is_valid_rep)
+                ].copy()
+
+            if df_c.empty:
+                return ""
 
             pc_lookup = load_price_class_lookup(db)
 
