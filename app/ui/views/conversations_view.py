@@ -631,6 +631,196 @@ class _AiReplyWorker(QThread):
             log.warning("Account detail fetch failed: %s", exc)
             return ""
 
+    def _fetch_open_orders_data(self, is_management: bool) -> str:  # noqa: C901
+        """Load open (un-invoiced) orders and bucket them by expected ship date.
+
+        Returns a structured plain-text block for the AI prompt covering
+        the entire open-order pipeline.  Management view shows all reps;
+        rep view scopes to the rep's BILLSLMN-assigned accounts.
+        """
+        if not self._get_db:
+            return ""
+        try:
+            from datetime import date as _date, timedelta as _td
+            import pandas as pd
+            from app.data.loaders import (
+                load_open_orders,
+                load_price_class_lookup,
+                load_rep_assignments,
+            )
+
+            db = self._get_db()
+            if db is None:
+                return ""
+
+            # Load all open orders (product CCs only)
+            df = load_open_orders(db, code_prefix="0")
+            if df is None or df.empty:
+                return ""
+
+            # Load helper lookups
+            pc_lookup = load_price_class_lookup(db)
+            asgn = load_rep_assignments(db)
+
+            acct_name_map: dict[str, str] = {}
+            old_acct_map: dict[str, str] = {}
+            acct_rep_map: dict[str, str] = {}  # account_number → rep name
+            if asgn is not None and not asgn.empty:
+                for _, r in asgn.iterrows():
+                    acct = str(r["account_number"]).strip()
+                    if acct not in acct_name_map:
+                        acct_name_map[acct] = str(r.get("account_name", "")).strip().lstrip("*")
+                        old_acct_map[acct] = str(r.get("old_account_number", "")).strip()
+                        acct_rep_map[acct] = str(r.get("salesman_name", "")).strip()
+
+            # Scope to rep's accounts when in rep mode
+            if not is_management:
+                rep_id = str(self._conv.rep_id).strip()
+                rep_accounts: set[str] | None = None
+                if asgn is not None and not asgn.empty:
+                    rep_rows = asgn[asgn["salesman_number"].astype(str).str.strip() == rep_id]
+                    if rep_rows.empty:
+                        email_to_num = {
+                            v.strip().lower(): k
+                            for k, v in (self._cfg.rep_emails or {}).items()
+                            if v.strip()
+                        }
+                        num = email_to_num.get(rep_id.lower(), "")
+                        if num:
+                            rep_rows = asgn[asgn["salesman_number"].astype(str).str.strip() == num]
+                    if not rep_rows.empty:
+                        rep_accounts = set(rep_rows["account_number"].astype(str).str.strip())
+                if rep_accounts:
+                    df = df[df["account_number"].astype(str).str.strip().isin(rep_accounts)].copy()
+                if df.empty:
+                    return ""
+
+            # ── Parse ship dates and assign buckets ───────────────────────
+            today = _date.today()
+
+            def _parse_ship(val) -> _date | None:
+                try:
+                    v = int(val)
+                    if v <= 10000:
+                        return None
+                    return _date(v // 10000, (v // 100) % 100, v % 100)
+                except Exception:
+                    return None
+
+            df["_ship_date"] = df["order_ship_yyyymmdd"].apply(_parse_ship)
+
+            _BUCKET_ORDER = [
+                "Overdue",
+                "Next 7 days",
+                "8–30 days",
+                "31–90 days",
+                "90+ days",
+                "No ship date",
+            ]
+
+            def _bucket(d: _date | None) -> str:
+                if d is None:
+                    return "No ship date"
+                if d < today:
+                    return "Overdue"
+                delta = (d - today).days
+                if delta <= 7:
+                    return "Next 7 days"
+                if delta <= 30:
+                    return "8–30 days"
+                if delta <= 90:
+                    return "31–90 days"
+                return "90+ days"
+
+            df["_bucket"] = df["_ship_date"].apply(_bucket)
+
+            grand_total: float = df["open_revenue"].sum()
+            if grand_total == 0:
+                return ""
+
+            scope_label = "COMPANY-WIDE" if is_management else "REP TERRITORY"
+            lines: list[str] = [
+                f"OPEN ORDERS / FUTURE SHIPMENTS — {scope_label} (uninvoiced, not yet counted as sales)",
+                f"  As of: {today.strftime('%b %d, %Y')}",
+                f"  Total open pipeline: ${grand_total:,.0f}",
+                "",
+                f"  {'Bucket':<28} {'Open $':>12}  {'Lines':>6}",
+                f"  {'-'*28} {'-'*12}  {'-'*6}",
+            ]
+
+            bucket_summary = (
+                df.groupby("_bucket", dropna=False)
+                .agg(open_revenue=("open_revenue", "sum"), count=("open_revenue", "count"))
+                .reindex([b for b in _BUCKET_ORDER if b in df["_bucket"].values])
+            )
+            for bkt, brow in bucket_summary.iterrows():
+                lines.append(f"  {str(bkt):<28} ${brow['open_revenue']:>11,.0f}  {int(brow['count']):>6}")
+
+            lines.append("")
+
+            # ── Per-bucket detail ─────────────────────────────────────────
+            for bkt in _BUCKET_ORDER:
+                sub = df[df["_bucket"] == bkt].copy()
+                if sub.empty:
+                    continue
+                bkt_total: float = sub["open_revenue"].sum()
+                lines.append(f"{bkt}  (${bkt_total:,.0f}):")
+
+                if is_management:
+                    # Rep-level breakdown
+                    sub["_rep"] = sub["account_number"].astype(str).str.strip().map(
+                        lambda a: acct_rep_map.get(a, "—")
+                    )
+                    rep_grp = (
+                        sub.groupby("_rep", dropna=False)["open_revenue"]
+                        .sum()
+                        .sort_values(ascending=False)
+                        .head(20)
+                    )
+                    lines.append(f"  {'Rep':<30} {'Open $':>12}")
+                    lines.append(f"  {'-'*30} {'-'*12}")
+                    for rep_n, rev in rep_grp.items():
+                        lines.append(f"  {str(rep_n):<30} ${rev:>11,.0f}")
+                else:
+                    # Account-level breakdown (rep view)
+                    acct_grp = (
+                        sub.groupby("account_number", dropna=False)["open_revenue"]
+                        .sum()
+                        .sort_values(ascending=False)
+                        .head(15)
+                    )
+                    lines.append(f"  {'Account':<36} {'Open $':>10}")
+                    lines.append(f"  {'-'*36} {'-'*10}")
+                    for acct, rev in acct_grp.items():
+                        acct_s = str(acct).strip()
+                        name = acct_name_map.get(acct_s, "")
+                        old = old_acct_map.get(acct_s, "")
+                        label = (
+                            f"{name} (#{old})" if name and old
+                            else name or f"Acct {acct_s}"
+                        )[:36]
+                        lines.append(f"  {label:<36} ${rev:>9,.0f}")
+
+                # Product breakdown (both modes, top 8)
+                pc_grp = (
+                    sub.groupby("price_class", dropna=False)["open_revenue"]
+                    .sum()
+                    .sort_values(ascending=False)
+                    .head(8)
+                )
+                if not pc_grp.empty:
+                    lines.append(f"  {'Product':<36} {'Open $':>10}")
+                    lines.append(f"  {'-'*36} {'-'*10}")
+                    for pc, rev in pc_grp.items():
+                        desc = pc_lookup.get(str(pc).strip(), str(pc).strip())[:36]
+                        lines.append(f"  {desc:<36} ${rev:>9,.0f}")
+                lines.append("")
+
+            return "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Open orders data fetch failed: %s", exc)
+            return ""
+
     def _is_management_sender(self) -> bool:
         """Return True when the email thread was initiated by a management sender.
 
@@ -919,7 +1109,8 @@ class _AiReplyWorker(QThread):
             )
             account_numbers = self._extract_account_numbers(all_text)
             account_detail = self._fetch_account_detail(account_numbers)
-            warehouse_block = "\n\n".join(x for x in [warehouse_data, account_detail] if x)
+            open_orders = self._fetch_open_orders_data(is_management=True)
+            warehouse_block = "\n\n".join(x for x in [warehouse_data, account_detail, open_orders] if x)
         else:
             # Rep sender — scope to this rep's territory only.
             rep_data = self._fetch_rep_data()
@@ -928,7 +1119,8 @@ class _AiReplyWorker(QThread):
             )
             account_numbers = self._extract_account_numbers(all_text)
             account_detail = self._fetch_account_detail(account_numbers)
-            warehouse_block = "\n\n".join(x for x in [rep_data, account_detail] if x)
+            open_orders = self._fetch_open_orders_data(is_management=False)
+            warehouse_block = "\n\n".join(x for x in [rep_data, account_detail, open_orders] if x)
 
         if is_mgmt:
             system_msg = (
@@ -965,6 +1157,13 @@ class _AiReplyWorker(QThread):
                 "multiple matches, or requests for data the warehouse cannot provide at all.\n"
                 "- Always cite the exact date range covered (e.g. 'Feb 1, 2026 – May 20, 2026 (FY 2027 YTD)').\n"
                 "- You CAN and SHOULD compare reps by name — that is appropriate for manager queries.\n\n"
+
+                "OPEN ORDERS / FUTURE SHIPMENTS:\n"
+                "- The data block includes an 'OPEN ORDERS / FUTURE SHIPMENTS' section with live pipeline data.\n"
+                "- These are UN-INVOICED orders — not yet counted as sales. Show them clearly labeled as pipeline.\n"
+                "- Buckets: Overdue (past ship date, not invoiced), Next 7 days, 8–30 days, 31–90 days, 90+ days.\n"
+                "- Use this to answer questions about pending orders, upcoming shipments, backlog by rep/product,\n"
+                "  what's shipping this week or month, or what's overdue.\n\n"
 
                 "PROFESSIONAL FORMATTING RULES:\n"
                 "- Lead with the direct answer (the table or figure). Context after, not before.\n"
@@ -1006,6 +1205,13 @@ class _AiReplyWorker(QThread):
                 "Say so in one sentence, then immediately deliver the product × account table instead.\n"
                 "- Always cite the exact date range (e.g. 'Feb 1 – May 20, 2026 FY YTD').\n"
                 "- Address the rep by first name once, at the start.\n\n"
+
+                "OPEN ORDERS / FUTURE SHIPMENTS:\n"
+                "- The data block includes an 'OPEN ORDERS / FUTURE SHIPMENTS' section with live pipeline.\n"
+                "- These are UN-INVOICED orders — pipeline, not sales revenue yet. Label them accordingly.\n"
+                "- Buckets: Overdue, Next 7 days, 8–30 days, 31–90 days, 90+ days.\n"
+                "- If the rep asks 'what's shipping this week', 'do I have any open orders', 'what's my backlog',\n"
+                "  or anything about pending / upcoming / future orders — answer from this section.\n\n"
 
                 "PROFESSIONAL FORMATTING RULES:\n"
                 "- Lead with the direct answer (table or figure), then 1-2 sentences of context.\n"

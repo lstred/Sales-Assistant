@@ -119,8 +119,10 @@ WHERE   TRY_CONVERT(int, o.[ACCOUNT#I]) > 1
 # salesman credit until the invoice posts.
 OPEN_ORDERS_LINES = """
 SELECT  TRY_CONVERT(int, o.[ORDER_ENTRY_DATE_YYYYMMDD])     AS order_entry_yyyymmdd,
+        TRY_CONVERT(int, o.[ORDER_SHIP_DATE])                AS order_ship_yyyymmdd,
         LTRIM(RTRIM(o.[ACCOUNT#I]))                          AS account_number,
         LTRIM(RTRIM(i.[ICCTR]))                              AS cost_center,
+        LTRIM(RTRIM(i.[IPRCCD]))                             AS price_class,
         LTRIM(RTRIM(o.[SALESPERSON_DESC]))                   AS salesperson_desc,
         TRY_CONVERT(int, o.[ORDER#])                         AS order_number,
         TRY_CONVERT(int, o.[LINE#I])                         AS line_number,
