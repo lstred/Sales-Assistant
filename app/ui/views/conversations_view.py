@@ -230,6 +230,70 @@ class _AiReplyWorker(QThread):
         """Pull bare 4-6 digit account IDs (e.g. #40636)."""
         return list(dict.fromkeys(re.findall(r"#?(\d{4,6})", text)))
 
+    @staticmethod
+    def _extract_query_keywords(messages: list) -> list[str]:
+        """Extract candidate product/entity keywords from inbound message text.
+
+        Returns a deduplicated list of content words (3+ chars, non-stopword) that
+        could be product names, account names, or other domain entities the AI should
+        look up.  Used to pre-compute QUERY-MATCHED sections in warehouse data blocks.
+        """
+        all_text = " ".join(
+            (m.body_text or "")
+            for m in messages
+            if m.direction == "inbound"
+        )
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', all_text.lower())
+        _STOP = {
+            "the", "and", "for", "are", "but", "not", "you", "all", "can",
+            "had", "her", "was", "one", "our", "out", "day", "get", "has",
+            "him", "his", "how", "its", "may", "new", "now", "old", "see",
+            "two", "way", "who", "did", "does", "this", "that", "with",
+            "have", "from", "they", "will", "been", "more", "when", "each",
+            "just", "like", "also", "than", "then", "into", "your", "what",
+            "some", "time", "very", "most", "over", "send", "please",
+            "total", "sales", "ytd", "reps", "year", "data", "would",
+            "could", "should", "hello", "thanks", "thank", "regards",
+            "dear", "best", "hope", "help", "need", "want", "know", "show",
+            "give", "tell", "make", "look", "come", "good", "much", "many",
+            "well", "back", "down", "only", "said", "same", "take", "still",
+            "here", "even", "such", "long", "name", "first", "being",
+            "those", "never", "under", "while", "where", "after", "other",
+            "between", "about", "above", "every", "before", "since",
+            "without", "further", "always", "again", "there", "through",
+            "product", "products", "price", "amount", "number", "account",
+            "fiscal", "report", "email", "reply", "period", "month",
+            "quarter", "week", "annual", "manager", "please", "sent",
+            "let", "updated", "daily", "lukas", "stred", "rep", "per",
+            "sale", "each", "class", "line", "gross", "profit", "revenue",
+            "breakdown", "detail", "summary", "numbers", "figures",
+        }
+        seen: set[str] = set()
+        result: list[str] = []
+        for w in words:
+            if w not in _STOP and w not in seen:
+                seen.add(w)
+                result.append(w)
+        return result[:40]
+
+    @staticmethod
+    def _find_matched_products(
+        pc_all_codes: list[str],
+        pc_lookup: dict[str, str],
+        keywords: list[str],
+    ) -> list[str]:
+        """Return price class codes whose description matches any keyword (case-insensitive substring).
+
+        Results are ordered by how many keywords matched (most-specific first).
+        """
+        scores: dict[str, int] = {}
+        for code in pc_all_codes:
+            desc = pc_lookup.get(code, code).lower()
+            hits = sum(1 for kw in keywords if kw in desc)
+            if hits:
+                scores[code] = hits
+        return sorted(scores, key=lambda c: -scores[c])
+
     def _history_text(self) -> str:
         sep = "-" * 60 + "\n"
         parts = []
@@ -344,35 +408,95 @@ class _AiReplyWorker(QThread):
                 "",
             ]
 
-            # ── Top products ──────────────────────────────────────────────
-            pc_cur = (
+            # ── All products (for full catalog + keyword matching) ────────
+            pc_all = (
                 df_c.groupby("price_class", dropna=False)
                 .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
                 .reset_index()
                 .sort_values("revenue", ascending=False)
-                .head(15)
             )
             prior_pc: dict[str, float] = (
                 df_p.groupby("price_class")["revenue"].sum().to_dict()
-                if not df_p.empty
-                else {}
+                if not df_p.empty else {}
             )
+            all_pc_codes = [str(r).strip() for r in pc_all["price_class"]]
 
+            # ── Query-matched products (pre-computed for this conversation) ─
+            keywords = self._extract_query_keywords(self._messages)
+            matched_codes = self._find_matched_products(all_pc_codes, pc_lookup, keywords)
+            if matched_codes:
+                # Full account breakdown for every matched product
+                pc_acct_all = (
+                    df_c[df_c["price_class"].astype(str).str.strip().isin(matched_codes)]
+                    .groupby(["price_class", "account_number"], dropna=False)
+                    .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
+                    .reset_index()
+                )
+                lines.append(
+                    "QUERY-MATCHED PRODUCTS — results pre-computed from your question\n"
+                    "(USE THIS SECTION FIRST to answer product-specific questions):"
+                )
+                for pc_code in matched_codes:
+                    desc = pc_lookup.get(pc_code, pc_code)
+                    sub = (
+                        pc_acct_all[pc_acct_all["price_class"].astype(str).str.strip() == pc_code]
+                        .sort_values("revenue", ascending=False)
+                    )
+                    pc_row = pc_all[pc_all["price_class"].astype(str).str.strip() == pc_code]
+                    pc_ytd = pc_row["revenue"].sum() if not pc_row.empty else 0.0
+                    pc_gp = pc_row["gp"].sum() if not pc_row.empty else 0.0
+                    pc_gp_pct = pc_gp / pc_ytd * 100 if pc_ytd > 0 else 0.0
+                    pc_prior = prior_pc.get(pc_code, 0.0)
+                    pc_yoy = f"{(pc_ytd - pc_prior) / pc_prior * 100:+.1f}% YoY" if pc_prior > 0 else "no prior data"
+                    lines.append(
+                        f"\n  {desc}\n"
+                        f"  FY {fy} YTD: ${pc_ytd:,.0f}  |  Prior FY YTD: ${pc_prior:,.0f}  |  {pc_yoy}  |  GP: {pc_gp_pct:.1f}%"
+                    )
+                    if not sub.empty:
+                        lines.append(f"  {'Account':<34} {'YTD $':>11} {'GP%':>6}")
+                        lines.append(f"  {'-'*34} {'-'*11} {'-'*6}")
+                        for _, row in sub.iterrows():
+                            acct = str(row["account_number"]).strip()
+                            name = acct_name_map.get(acct, "")
+                            old = old_acct_map.get(acct, "")
+                            label = (f"{name} (#{old})" if name and old else name or f"Acct {acct}")[:34]
+                            rev = row["revenue"]
+                            gp = row["gp"]
+                            gp_pct = gp / rev * 100 if rev > 0 else 0.0
+                            lines.append(f"  {label:<34} ${rev:>10,.0f} {gp_pct:>5.1f}%")
+                lines.append("")
+
+            # ── Top 15 products ───────────────────────────────────────────
+            pc_cur_top = pc_all.head(15)
             lines.append(f"TOP PRODUCTS BY REVENUE (FY {fy} YTD vs prior FY YTD):")
-            lines.append(f"  {'Product':<30} {'YTD $':>12} {'Prev YTD $':>12} {'YoY':>8} {'GP%':>6}")
-            lines.append(f"  {'-'*30} {'-'*12} {'-'*12} {'-'*8} {'-'*6}")
-            for _, row in pc_cur.iterrows():
+            lines.append(f"  {'Product':<32} {'YTD $':>12} {'Prev YTD $':>12} {'YoY':>8} {'GP%':>6}")
+            lines.append(f"  {'-'*32} {'-'*12} {'-'*12} {'-'*8} {'-'*6}")
+            for _, row in pc_cur_top.iterrows():
                 pc = str(row["price_class"]).strip()
-                desc = pc_lookup.get(pc, pc)[:30]
+                desc = pc_lookup.get(pc, pc)[:32]
                 rev = row["revenue"]
                 gp = row["gp"]
                 gp_pct = gp / rev * 100 if rev > 0 else 0.0
                 prev = prior_pc.get(pc, 0.0)
                 yoy = f"{(rev - prev) / prev * 100:+.1f}%" if prev > 0 else "new"
                 prev_s = f"${prev:,.0f}" if prev > 0 else "—"
-                lines.append(
-                    f"  {desc:<30} ${rev:>11,.0f} {prev_s:>12} {yoy:>8} {gp_pct:>5.1f}%"
-                )
+                lines.append(f"  {desc:<32} ${rev:>11,.0f} {prev_s:>12} {yoy:>8} {gp_pct:>5.1f}%")
+            lines.append("")
+
+            # ── Complete product catalog (all products with revenue) ───────
+            lines.append(
+                "COMPLETE PRODUCT CATALOG — all products with FY YTD revenue "
+                "(search here for any product name not in the top 15 above):"
+            )
+            lines.append(f"  {'Product Description':<38} {'YTD $':>12} {'GP%':>6}")
+            lines.append(f"  {'-'*38} {'-'*12} {'-'*6}")
+            for _, row in pc_all.iterrows():
+                pc = str(row["price_class"]).strip()
+                desc = pc_lookup.get(pc, pc)[:38]
+                rev = row["revenue"]
+                gp = row["gp"]
+                gp_pct = gp / rev * 100 if rev > 0 else 0.0
+                lines.append(f"  {desc:<38} ${rev:>11,.0f} {gp_pct:>5.1f}%")
             lines.append("")
 
             # ── Top accounts ──────────────────────────────────────────────
@@ -403,15 +527,13 @@ class _AiReplyWorker(QThread):
                 prev_s = f"${prev:,.0f}" if prev > 0 else "—"
                 lines.append(f"  {label:<34} ${rev:>11,.0f} {prev_s:>12} {yoy:>8}")
 
-            # ── Product × Account cross-tab ───────────────────────────────
-            # Lets the AI answer "show me Win Win by account" or similar product-
-            # specific questions without having to do a second warehouse round-trip.
+            # ── Product × Account cross-tab (top 20 products) ─────────────
             lines.append("")
             lines.append(
-                "PRODUCT × ACCOUNT BREAKDOWN "
-                "(top 5 accounts per top product — use this to answer product-specific questions):"
+                "PRODUCT × ACCOUNT BREAKDOWN — top 5 accounts per top 20 products\n"
+                "(for product-specific questions not covered by QUERY-MATCHED PRODUCTS above):"
             )
-            top_pc_codes = [str(r).strip() for r in pc_cur.head(8)["price_class"]]
+            top_pc_codes = all_pc_codes[:20]
             pc_acct_grp = (
                 df_c[df_c["price_class"].astype(str).str.strip().isin(top_pc_codes)]
                 .groupby(["price_class", "account_number"], dropna=False)
@@ -419,7 +541,7 @@ class _AiReplyWorker(QThread):
                 .reset_index()
             )
             for pc_code in top_pc_codes:
-                desc = pc_lookup.get(pc_code, pc_code)[:30]
+                desc = pc_lookup.get(pc_code, pc_code)[:32]
                 sub = (
                     pc_acct_grp[pc_acct_grp["price_class"].astype(str).str.strip() == pc_code]
                     .sort_values("revenue", ascending=False)
@@ -428,7 +550,7 @@ class _AiReplyWorker(QThread):
                 if sub.empty:
                     continue
                 pc_total = sub["revenue"].sum()
-                lines.append(f"\n  {desc}  (${pc_total:,.0f} total across top accounts):")
+                lines.append(f"\n  {desc}  (${pc_total:,.0f} total):")
                 for _, row in sub.iterrows():
                     acct = str(row["account_number"]).strip()
                     name = acct_name_map.get(acct, "")
@@ -589,6 +711,60 @@ class _AiReplyWorker(QThread):
                 "",
             ]
 
+            # ── All products (for catalog + keyword matching) ─────────────
+            pc_all = (
+                df_c.groupby("price_class", dropna=False)
+                .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
+                .reset_index()
+                .sort_values("revenue", ascending=False)
+            )
+            prior_pc: dict[str, float] = (
+                df_p.groupby("price_class")["revenue"].sum().to_dict()
+                if not df_p.empty else {}
+            )
+            all_pc_codes = [str(r).strip() for r in pc_all["price_class"]]
+
+            # ── Query-matched products (pre-computed for this conversation) ─
+            keywords = self._extract_query_keywords(self._messages)
+            matched_codes = self._find_matched_products(all_pc_codes, pc_lookup, keywords)
+            if matched_codes:
+                pc_rep_all = (
+                    df_c[df_c["price_class"].astype(str).str.strip().isin(matched_codes)]
+                    .groupby(["price_class", "salesperson_desc"], dropna=False)
+                    .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
+                    .reset_index()
+                )
+                lines.append(
+                    "QUERY-MATCHED PRODUCTS — results pre-computed from your question\n"
+                    "(USE THIS SECTION FIRST to answer product-specific questions):"
+                )
+                for pc_code in matched_codes:
+                    desc = pc_lookup.get(pc_code, pc_code)
+                    sub = (
+                        pc_rep_all[pc_rep_all["price_class"].astype(str).str.strip() == pc_code]
+                        .sort_values("revenue", ascending=False)
+                    )
+                    pc_row = pc_all[pc_all["price_class"].astype(str).str.strip() == pc_code]
+                    pc_ytd = pc_row["revenue"].sum() if not pc_row.empty else 0.0
+                    pc_gp = pc_row["gp"].sum() if not pc_row.empty else 0.0
+                    pc_gp_pct = pc_gp / pc_ytd * 100 if pc_ytd > 0 else 0.0
+                    pc_prior = prior_pc.get(pc_code, 0.0)
+                    pc_yoy = f"{(pc_ytd - pc_prior) / pc_prior * 100:+.1f}% YoY" if pc_prior > 0 else "no prior data"
+                    lines.append(
+                        f"\n  {desc}\n"
+                        f"  FY {fy} YTD: ${pc_ytd:,.0f}  |  Prior FY YTD: ${pc_prior:,.0f}  |  {pc_yoy}  |  GP: {pc_gp_pct:.1f}%"
+                    )
+                    if not sub.empty:
+                        lines.append(f"  {'Rep Name':<28} {'YTD $':>11} {'GP%':>6}")
+                        lines.append(f"  {'-'*28} {'-'*11} {'-'*6}")
+                        for _, row in sub.iterrows():
+                            rep_n = str(row["salesperson_desc"]).strip() or "(unassigned)"
+                            rev = row["revenue"]
+                            gp = row["gp"]
+                            gp_pct = gp / rev * 100 if rev > 0 else 0.0
+                            lines.append(f"  {rep_n:<28} ${rev:>10,.0f} {gp_pct:>5.1f}%")
+                lines.append("")
+
             # ── Sales by rep ──────────────────────────────────────────────
             rep_cur = (
                 df_c.groupby("salesperson_desc", dropna=False)
@@ -616,37 +792,42 @@ class _AiReplyWorker(QThread):
                 lines.append(f"  {rep_n:<28} ${rev:>11,.0f} {prev_s:>12} {yoy:>8} {gp_pct:>5.1f}%")
             lines.append("")
 
-            # ── Top products company-wide ─────────────────────────────────
-            pc_cur = (
-                df_c.groupby("price_class", dropna=False)
-                .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
-                .reset_index()
-                .sort_values("revenue", ascending=False)
-                .head(15)
-            )
-            prior_pc: dict[str, float] = (
-                df_p.groupby("price_class")["revenue"].sum().to_dict()
-                if not df_p.empty else {}
-            )
-
+            # ── Top 15 products company-wide ──────────────────────────────
+            pc_cur_top = pc_all.head(15)
             lines.append(f"TOP PRODUCTS COMPANY-WIDE (FY {fy} YTD):")
-            lines.append(f"  {'Product':<30} {'YTD $':>12} {'Prev YTD $':>12} {'YoY':>8} {'GP%':>6}")
-            lines.append(f"  {'-'*30} {'-'*12} {'-'*12} {'-'*8} {'-'*6}")
-            for _, row in pc_cur.iterrows():
+            lines.append(f"  {'Product':<32} {'YTD $':>12} {'Prev YTD $':>12} {'YoY':>8} {'GP%':>6}")
+            lines.append(f"  {'-'*32} {'-'*12} {'-'*12} {'-'*8} {'-'*6}")
+            for _, row in pc_cur_top.iterrows():
                 pc = str(row["price_class"]).strip()
-                desc = pc_lookup.get(pc, pc)[:30]
+                desc = pc_lookup.get(pc, pc)[:32]
                 rev = row["revenue"]
                 gp = row["gp"]
                 gp_pct = gp / rev * 100 if rev > 0 else 0.0
                 prev = prior_pc.get(pc, 0.0)
                 yoy = f"{(rev - prev) / prev * 100:+.1f}%" if prev > 0 else "new"
                 prev_s = f"${prev:,.0f}" if prev > 0 else "—"
-                lines.append(f"  {desc:<30} ${rev:>11,.0f} {prev_s:>12} {yoy:>8} {gp_pct:>5.1f}%")
+                lines.append(f"  {desc:<32} ${rev:>11,.0f} {prev_s:>12} {yoy:>8} {gp_pct:>5.1f}%")
             lines.append("")
 
-            # ── Product × Rep cross-tab ───────────────────────────────────
-            lines.append("PRODUCT × REP BREAKDOWN (top 5 reps per top product):")
-            top_pc_codes = [str(r).strip() for r in pc_cur.head(8)["price_class"]]
+            # ── Complete product catalog (all products with revenue) ───────
+            lines.append(
+                "COMPLETE PRODUCT CATALOG — all products with FY YTD revenue "
+                "(search here for any product not in the top 15 above):"
+            )
+            lines.append(f"  {'Product Description':<38} {'YTD $':>12} {'GP%':>6}")
+            lines.append(f"  {'-'*38} {'-'*12} {'-'*6}")
+            for _, row in pc_all.iterrows():
+                pc = str(row["price_class"]).strip()
+                desc = pc_lookup.get(pc, pc)[:38]
+                rev = row["revenue"]
+                gp = row["gp"]
+                gp_pct = gp / rev * 100 if rev > 0 else 0.0
+                lines.append(f"  {desc:<38} ${rev:>11,.0f} {gp_pct:>5.1f}%")
+            lines.append("")
+
+            # ── Product × Rep cross-tab (top 20 products) ─────────────────
+            lines.append("PRODUCT × REP BREAKDOWN — top 5 reps per top 20 products:")
+            top_pc_codes = all_pc_codes[:20]
             pc_rep_grp = (
                 df_c[df_c["price_class"].astype(str).str.strip().isin(top_pc_codes)]
                 .groupby(["price_class", "salesperson_desc"], dropna=False)
@@ -654,7 +835,7 @@ class _AiReplyWorker(QThread):
                 .reset_index()
             )
             for pc_code in top_pc_codes:
-                desc = pc_lookup.get(pc_code, pc_code)[:30]
+                desc = pc_lookup.get(pc_code, pc_code)[:32]
                 sub = (
                     pc_rep_grp[pc_rep_grp["price_class"].astype(str).str.strip() == pc_code]
                     .sort_values("revenue", ascending=False)
@@ -663,7 +844,7 @@ class _AiReplyWorker(QThread):
                 if sub.empty:
                     continue
                 pc_total = sub["revenue"].sum()
-                lines.append(f"\n  {desc}  (${pc_total:,.0f} total across top reps):")
+                lines.append(f"\n  {desc}  (${pc_total:,.0f} total):")
                 for _, row in sub.iterrows():
                     rep_n = str(row["salesperson_desc"]).strip() or "(unassigned)"
                     rev = row["revenue"]
@@ -712,54 +893,88 @@ class _AiReplyWorker(QThread):
 
         if is_mgmt:
             system_msg = (
-                "You are an AI data assistant automatically responding to a MANAGER's email query. "
-                "You have full access to COMPANY-WIDE warehouse data across ALL reps and territories. "
-                "Always use the live data provided — never invent anything.\n\n"
-                "CRITICAL RULES — violating any of these is a failure:\n"
-                "- NEVER invent, estimate, or fabricate any number. Use only figures from "
-                "FRESH WAREHOUSE DATA. If a figure is missing, say so explicitly.\n"
-                "- Always cite the exact date range the numbers cover.\n"
-                "- You CAN and SHOULD compare reps by name — that is appropriate for a manager query.\n"
-                "- If asked about a SPECIFIC PRODUCT (e.g. 'Win Win'): use PRODUCT × REP BREAKDOWN "
-                "to show per-rep sales for that product with each rep's revenue and GP%.\n"
-                "- If asked about a SPECIFIC REP: pull their row from SALES BY REP and provide details.\n"
-                "- Respond directly with specific tables or figures. Up to 300 words.\n"
-                "- If the request is AMBIGUOUS or the data needed is NOT in the warehouse block: "
-                "start with exactly 'CLARIFICATION NEEDED:' and ask ONE question.\n"
-                "- Plain text and simple ASCII tables only — no markdown, no asterisks.\n"
+                "You are an AI data assistant automatically responding to a MANAGER's email query.\n"
+                "You have full access to COMPANY-WIDE warehouse data across ALL reps and territories.\n"
+                "ALWAYS use the live data provided — NEVER invent or estimate any number.\n\n"
+
+                "TERMINOLOGY — understand what common terms mean in this business:\n"
+                "- 'Product' or 'product line': a PRICE CLASS (e.g. 'WIN WIN BROADLOOM COMMERCIAL'). "
+                "Each unique product in the database has a description in the PRODUCT CATALOG.\n"
+                "- 'Win Win': matches any product description containing 'win win'. "
+                "Always search by partial name — users never use exact database descriptions.\n"
+                "- 'Rep' or 'salesperson': a sales representative listed in SALES BY REP.\n"
+                "- 'Account' or 'customer': a flooring dealer. Old account numbers like #1234 are what reps know.\n"
+                "- 'YTD': fiscal year to date (fiscal year starts Feb 1).\n"
+                "- 'CC': cost center / product category (e.g. 'Carpet Residential').\n"
+                "- 'GP' = gross profit dollars. 'GP%' = gross profit percentage.\n\n"
+
+                "HOW TO FIND PRODUCTS — follow this order every time:\n"
+                "1. Check QUERY-MATCHED PRODUCTS first — this section is pre-computed from the "
+                "exact conversation text. It already contains the correct data. USE IT.\n"
+                "2. If QUERY-MATCHED PRODUCTS has no data for the question, scan COMPLETE PRODUCT "
+                "CATALOG using case-insensitive substring matching (e.g. 'win win' matches "
+                "'WIN WIN BROADLOOM', 'WIN WIN COMMERCIAL BROADLOOM', 'WIN WIN RESIDENTIAL', etc.).\n"
+                "3. If multiple product descriptions match (e.g. residential AND commercial variants), "
+                "show ALL of them in one table AND provide a combined total.\n"
+                "4. Only AFTER searching both sections above should you report a product as not found.\n\n"
+
+                "ABSOLUTE RULES — violating any of these is a failure:\n"
+                "- NEVER invent, estimate, or fabricate any number. Every figure must come from the warehouse block.\n"
+                "- NEVER say 'CLARIFICATION NEEDED' for a product name lookup. Product names can always "
+                "be matched by partial name from the COMPLETE PRODUCT CATALOG. Reserve "
+                "'CLARIFICATION NEEDED' ONLY for genuinely ambiguous date ranges, rep names with "
+                "multiple matches, or requests for data the warehouse cannot provide at all.\n"
+                "- Always cite the exact date range covered (e.g. 'Feb 1, 2026 – May 20, 2026 (FY 2027 YTD)').\n"
+                "- You CAN and SHOULD compare reps by name — that is appropriate for manager queries.\n\n"
+
+                "PROFESSIONAL FORMATTING RULES:\n"
+                "- Lead with the direct answer (the table or figure). Context after, not before.\n"
+                "- Use ASCII tables with a header row, dash separator, and aligned data columns.\n"
+                "- Left-align names/descriptions, right-align all currency and percentage columns.\n"
+                "- Include a TOTAL row when showing a multi-row breakdown.\n"
+                "- 300 words maximum. If the answer is a table, the table IS the response.\n"
+                "- Plain text only — no markdown, no asterisks, no bullet symbols.\n"
                 "- Do NOT add a sign-off or closing pleasantry.\n"
-                "- Close with ONE offer of a specific follow-up data pull."
+                "- End with ONE specific follow-up offer the warehouse can actually deliver."
             )
         else:
             system_msg = (
                 "You are an AI data assistant automatically responding to a sales rep's email "
-                "on behalf of the sales manager. You have access to live warehouse data pulled "
-                "directly from the sales database — always use it.\n\n"
-                "CRITICAL RULES — violating any of these is a failure:\n"
-                "- NEVER invent, estimate, or fabricate any number. If a specific figure is not "
-                "in FRESH WAREHOUSE DATA, say exactly: 'I don\\'t have that breakdown in the "
-                "warehouse right now — I can pull [X] if you want.' Never guess.\n"
-                "- Use the WAREHOUSE DATA product names and account names verbatim. Do not rename them.\n"
-                "- Always cite the exact date range the numbers cover (e.g. 'Feb 2, 2026 – May 18, 2026').\n"
-                "- Address the rep by first name once, at the very start.\n"
-                "- If the rep asks about a SPECIFIC PRODUCT (e.g. 'Win Win', 'Carpet Residential'): "
-                "use the PRODUCT × ACCOUNT BREAKDOWN section to give a per-account table for that "
-                "product. Include the total revenue, GP%, and each account name with its dollar figure. "
-                "This is the most important section to use for product-specific questions.\n"
-                "- If the rep asks for data 'by rep' or 'for each rep': you only have data for THIS "
-                "rep's territory. State that in one short sentence, then immediately provide the best "
-                "available alternative — typically the PRODUCT × ACCOUNT BREAKDOWN for the product "
-                "they asked about. Never just refuse and offer nothing. Always deliver a table.\n"
-                "- If the rep's request is clear and the data is present: respond with the specific "
-                "table or figures from FRESH WAREHOUSE DATA. Keep it 100–220 words.\n"
-                "- If the rep's request is AMBIGUOUS or the specific data they need is NOT in the "
-                "warehouse block: start with exactly 'CLARIFICATION NEEDED:' and ask ONE question.\n"
-                "- Plain text and simple ASCII tables only — no markdown, no asterisks, no bullet "
-                "symbols. Use dashes for table borders.\n"
-                "- Do NOT add a sign-off, signature, or closing pleasantry.\n"
-                "- Close with ONE offer of a follow-up data pull the warehouse can actually deliver "
-                "(e.g. month-by-month trend for a specific account, GP% comparison, product-line "
-                "detail). Never suggest calls, meetings, or actions you cannot take as an AI data tool."
+                "on behalf of the sales manager. You have live warehouse data pulled directly from "
+                "the sales database — always use it. NEVER invent any number.\n\n"
+
+                "TERMINOLOGY — understand what common terms mean in this business:\n"
+                "- 'Product' or 'product line': a PRICE CLASS with a description (e.g. 'WIN WIN BROADLOOM').\n"
+                "- Reps use informal product names. 'Win Win' matches any product description containing "
+                "'win win'. Always do case-insensitive partial matching.\n"
+                "- 'Account' or 'customer': a flooring dealer. Old account numbers like #1234 are standard.\n"
+                "- 'YTD': fiscal year to date (fiscal year starts Feb 1).\n"
+                "- 'GP' = gross profit dollars. 'GP%' = gross profit percentage.\n\n"
+
+                "HOW TO FIND PRODUCTS — follow this order every time:\n"
+                "1. Check QUERY-MATCHED PRODUCTS first — pre-computed from this conversation. USE IT.\n"
+                "2. If not there, scan COMPLETE PRODUCT CATALOG with case-insensitive substring matching.\n"
+                "3. If multiple variants match, show ALL with a combined total.\n"
+                "4. For product-by-account questions: use QUERY-MATCHED PRODUCTS or "
+                "PRODUCT × ACCOUNT BREAKDOWN — whichever has the data.\n\n"
+
+                "ABSOLUTE RULES — violating any of these is a failure:\n"
+                "- NEVER invent, estimate, or fabricate any number.\n"
+                "- NEVER say 'CLARIFICATION NEEDED' for a product name. Always search partial names "
+                "from COMPLETE PRODUCT CATALOG. Reserve 'CLARIFICATION NEEDED' ONLY for genuinely "
+                "ambiguous requests where data cannot be found even with partial matching.\n"
+                "- If the rep asks for data 'by rep' for all reps: you have this rep's territory only. "
+                "Say so in one sentence, then immediately deliver the product × account table instead.\n"
+                "- Always cite the exact date range (e.g. 'Feb 1 – May 20, 2026 FY YTD').\n"
+                "- Address the rep by first name once, at the start.\n\n"
+
+                "PROFESSIONAL FORMATTING RULES:\n"
+                "- Lead with the direct answer (table or figure), then 1-2 sentences of context.\n"
+                "- ASCII tables: header row, dash separator line, aligned columns. "
+                "Left-align names, right-align numbers. Include totals row where relevant.\n"
+                "- 100–220 words maximum. Plain text only — no markdown, no asterisks.\n"
+                "- Do NOT add a sign-off or closing pleasantry.\n"
+                "- End with ONE specific follow-up offer the warehouse can actually deliver."
             )
 
         sender_label = "MANAGER QUERY" if is_mgmt else f"Rep: {self._conv.rep_name or self._conv.rep_id}"
