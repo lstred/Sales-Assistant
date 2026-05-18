@@ -65,6 +65,10 @@ class RepScorecard:
     prior_3mo_revenue: float = 0.0          # the 3 months immediately before
     last_3mo_vs_prior_3mo_pct: float | None = None
     last_3mo_yoy_pct: float | None = None   # vs same 3 months last year
+    last_3mo_start: date | None = None      # actual start date of the L3M window
+    last_3mo_end: date | None = None        # actual end date of the L3M window
+    prior_3mo_start: date | None = None     # start of the preceding 3mo window
+    prior_3mo_end: date | None = None       # end of the preceding 3mo window
     top_growing_accounts: list[dict] = field(default_factory=list)
     top_declining_accounts: list[dict] = field(default_factory=list)
     stale_accounts: list[dict] = field(default_factory=list)  # had sales last yr, zero now
@@ -532,6 +536,10 @@ def compute_rep_scorecards(
             prior_3mo_revenue=p3,
             last_3mo_vs_prior_3mo_pct=_yoy_pct(l3, p3),
             last_3mo_yoy_pct=_yoy_pct(l3, y3),
+            last_3mo_start=last_3mo_start,
+            last_3mo_end=last_3mo_end,
+            prior_3mo_start=prior_3mo_start,
+            prior_3mo_end=prior_3mo_end,
             top_growing_accounts=_records_for_email(growing, account_info=account_info),
             top_declining_accounts=_records_for_email(declining, account_info=account_info),
             stale_accounts=_records_for_email(stale, prior_only=True, account_info=account_info),

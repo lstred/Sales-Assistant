@@ -766,12 +766,21 @@ class WeeklyEmailView(QWidget):
         if d is None:
             return
         sc = self._scorecards.get(rep_key)
+        fb_start, fb_end = self.filter_bar.date_range()
+        chart_html = _generate_trend_chart_html(
+            self._df,
+            self._prior_df,
+            rep_key,
+            fb_start,
+            fb_end,
+        )
         d["body_html"] = _wrap_ai_body(
             text or "(empty AI response)",
             scorecard=sc,
             period_overview=self._period_overview,
             week_lines=d.get("week_lines"),
             cc_label=d.get("cc_label", ""),
+            chart_html=chart_html,
         )
         for i in range(self.list.count()):
             it = self.list.item(i)
@@ -1250,6 +1259,227 @@ def _render_loading_html(rep_name: str) -> str:
     )
 
 
+def _generate_trend_chart_html(
+    df: "pd.DataFrame",
+    prior_df: "pd.DataFrame | None",
+    rep_key: str,
+    fb_start: date,
+    fb_end: date,
+) -> str:
+    """Generate a base64-encoded PNG trend chart embedded as an HTML <img> tag.
+
+    Shows two cumulative-YTD lines (vs prior year):
+    - All reps combined (territory benchmark)
+    - This rep specifically
+
+    If prior year data is unavailable, shows raw weekly revenue instead.
+    Returns ``""`` on any error so callers can safely ignore failures.
+    """
+    try:
+        import io
+        import base64
+        import re as _re
+        import matplotlib
+        matplotlib.use("Agg")  # non-interactive backend, safe for threads
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+        import matplotlib.dates as mdates
+        import numpy as np
+        import pandas as pd
+
+        if df is None or df.empty or "invoice_date" not in df.columns:
+            return ""
+
+        # --- prep current-year data ---
+        d = df.copy()
+        d["invoice_date"] = pd.to_datetime(d["invoice_date"], errors="coerce")
+        d = d.dropna(subset=["invoice_date"])
+        d = d[
+            (d["invoice_date"] >= pd.Timestamp(fb_start))
+            & (d["invoice_date"] <= pd.Timestamp(fb_end))
+        ]
+        if d.empty:
+            return ""
+
+        # Round each invoice to its Sunday (week-start) bucket.
+        d["week"] = d["invoice_date"].dt.to_period("W-SAT").dt.start_time
+
+        all_weekly = d.groupby("week")["revenue"].sum().sort_index()
+        rep_mask = (d.get("rep_key", pd.Series(dtype=str)) == rep_key)
+        rep_weekly = d[rep_mask].groupby("week")["revenue"].sum().sort_index()
+
+        weeks = sorted(set(all_weekly.index) | set(rep_weekly.index))
+        if not weeks:
+            return ""
+
+        all_vals = np.array([all_weekly.get(w, 0.0) for w in weeks])
+        rep_vals = np.array([rep_weekly.get(w, 0.0) for w in weeks])
+
+        # --- try prior-year data for YoY % lines ---
+        has_prior = prior_df is not None and not prior_df.empty
+        all_pct: list[float] = []
+        rep_pct: list[float] = []
+
+        if has_prior:
+            try:
+                p = prior_df.copy()
+                p["invoice_date"] = pd.to_datetime(p["invoice_date"], errors="coerce")
+                p = p.dropna(subset=["invoice_date"])
+                # Shift prior dates forward 364 days (52 weeks) to align fiscal weeks.
+                p["week"] = (p["invoice_date"] + pd.Timedelta(days=364)).dt.to_period(
+                    "W-SAT"
+                ).dt.start_time
+                prior_all_w = p.groupby("week")["revenue"].sum()
+                prior_rep_w = (
+                    p[p.get("rep_key", pd.Series(dtype=str)) == rep_key]
+                    .groupby("week")["revenue"].sum()
+                )
+                pa = np.array([prior_all_w.get(w, 0.0) for w in weeks])
+                pr = np.array([prior_rep_w.get(w, 0.0) for w in weeks])
+                # Cumulative sums → cumulative YoY %
+                all_cum = np.cumsum(all_vals)
+                all_p_cum = np.cumsum(pa)
+                rep_cum = np.cumsum(rep_vals)
+                rep_p_cum = np.cumsum(pr)
+                all_pct = [
+                    (c / p - 1) * 100 if p > 0 else 0.0
+                    for c, p in zip(all_cum, all_p_cum)
+                ]
+                rep_pct = [
+                    (c / p - 1) * 100 if p > 0 else 0.0
+                    for c, p in zip(rep_cum, rep_p_cum)
+                ]
+            except Exception:
+                has_prior = False
+
+        # --- figure ---
+        fig, ax = plt.subplots(figsize=(7.2, 2.9), dpi=110)
+        fig.patch.set_facecolor("white")
+        ax.set_facecolor("#F8FAFC")
+
+        x_dates = [pd.Timestamp(w) for w in weeks]
+
+        if has_prior and all_pct:
+            # YoY cumulative % lines
+            ax.axhline(0, color="#94A3B8", linestyle="--", linewidth=0.9, zorder=1)
+            # Shade rep area
+            ax.fill_between(
+                x_dates,
+                rep_pct,
+                [0] * len(rep_pct),
+                where=[v > 0 for v in rep_pct],
+                alpha=0.07,
+                color="#1D4ED8",
+                zorder=2,
+            )
+            ax.fill_between(
+                x_dates,
+                rep_pct,
+                [0] * len(rep_pct),
+                where=[v <= 0 for v in rep_pct],
+                alpha=0.07,
+                color="#DC2626",
+                zorder=2,
+            )
+            ax.plot(
+                x_dates,
+                all_pct,
+                color="#94A3B8",
+                linewidth=1.6,
+                linestyle="--",
+                label="All reps (YTD %)",
+                zorder=3,
+            )
+            ax.plot(
+                x_dates,
+                rep_pct,
+                color="#1D4ED8",
+                linewidth=2.2,
+                marker="o",
+                markersize=3.5,
+                label=f"{rep_key.title()} (YTD %)",
+                zorder=4,
+            )
+            ax.yaxis.set_major_formatter(
+                mticker.FuncFormatter(lambda v, _: f"{v:+.0f}%")
+            )
+            ax.set_ylabel("Cumulative YoY %", fontsize=8, color="#475569")
+            title = f"YTD Revenue vs Prior Year — {rep_key.title()}"
+        else:
+            # No prior year — show raw weekly revenue bars
+            bar_w = max(1, len(weeks) - 1)
+            ax.bar(
+                x_dates,
+                all_vals / 1000,
+                color="#E2E8F0",
+                label="All reps ($K)",
+                alpha=0.7,
+                zorder=2,
+                width=pd.Timedelta(days=5),
+            )
+            ax.plot(
+                x_dates,
+                rep_vals / 1000,
+                color="#1D4ED8",
+                linewidth=2.2,
+                marker="o",
+                markersize=3.5,
+                label=f"{rep_key.title()} ($K)",
+                zorder=3,
+            )
+            ax.yaxis.set_major_formatter(
+                mticker.FuncFormatter(lambda v, _: f"${v:,.0f}K")
+            )
+            ax.set_ylabel("Weekly Revenue ($K)", fontsize=8, color="#475569")
+            title = f"Weekly Revenue Trend — {rep_key.title()}"
+
+        # X-axis: monthly date labels
+        ax.xaxis.set_major_locator(mdates.MonthLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b '%y"))
+        ax.xaxis.set_minor_locator(mdates.WeekdayLocator(byweekday=6))
+        plt.setp(ax.get_xticklabels(), fontsize=7.5, rotation=30, ha="right")
+
+        ax.set_title(title, fontsize=9, fontweight="bold", color="#0F172A", pad=8)
+        ax.tick_params(axis="y", labelsize=8, colors="#475569")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color("#E2E8F0")
+        ax.spines["bottom"].set_color("#E2E8F0")
+        ax.grid(axis="y", color="#E2E8F0", linewidth=0.5, zorder=0)
+        ax.set_xlim(
+            pd.Timestamp(fb_start) - pd.Timedelta(days=3),
+            pd.Timestamp(fb_end) + pd.Timedelta(days=3),
+        )
+
+        legend = ax.legend(
+            fontsize=8,
+            framealpha=0.95,
+            loc="upper left",
+            edgecolor="#E2E8F0",
+            facecolor="white",
+        )
+        legend.get_frame().set_linewidth(0.8)
+
+        plt.tight_layout(pad=0.6)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=110)
+        plt.close(fig)
+        buf.seek(0)
+        b64 = base64.b64encode(buf.read()).decode()
+
+        return (
+            "<div style='margin:14px 0 4px 0;text-align:center;'>"
+            f"<img src='data:image/png;base64,{b64}' "
+            "style='max-width:100%;border-radius:6px;border:1px solid #E2E8F0;"
+            "box-shadow:0 1px 3px rgba(0,0,0,.06);' />"
+            "</div>"
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Trend chart generation failed: %s", exc)
+        return ""
+
+
 def _wrap_ai_body(
     text: str,
     *,
@@ -1257,6 +1487,7 @@ def _wrap_ai_body(
     period_overview: PeriodOverview | None,
     week_lines: dict | None,
     cc_label: str = "",
+    chart_html: str = "",
 ) -> str:
     body_html = "".join(
         f"<p>{line.replace('<', '&lt;').replace('>', '&gt;')}</p>"
@@ -1300,13 +1531,17 @@ def _wrap_ai_body(
     footer = ""
     if scorecard is not None:
         footer = _scorecard_footer_html(scorecard)
-    return cc_html + overview_html + week_html + body_html + footer
+    return cc_html + overview_html + week_html + body_html + chart_html + footer
 
 
 def _scorecard_footer_html(sc: RepScorecard) -> str:
     yoy = "n/a" if sc.yoy_pct is None else f"{sc.yoy_pct:+.1f}%"
     peers = "n/a" if sc.vs_peers_pct is None else f"{sc.vs_peers_pct:+.1f} pts vs peer avg"
-    last3 = "n/a" if sc.last_3mo_vs_prior_3mo_pct is None else f"{sc.last_3mo_vs_prior_3mo_pct:+.1f}%"
+    last3_yoy = "n/a" if sc.last_3mo_yoy_pct is None else f"{sc.last_3mo_yoy_pct:+.1f}%"
+    l3m_lbl = (
+        f"{sc.last_3mo_start.strftime('%b %d')}–{sc.last_3mo_end.strftime('%b %d, %Y')}"
+        if sc.last_3mo_start and sc.last_3mo_end else "last 90 days"
+    )
     coverage = f"{sc.core_display_coverage_pct:.0f}%"
     samples = f"{sc.samples_per_account:.2f}/account"
     growing = ", ".join(format_account_label(a) for a in sc.top_growing_accounts[:3]) or "\u2014"
@@ -1327,7 +1562,7 @@ def _scorecard_footer_html(sc: RepScorecard) -> str:
         f"<ul style='margin:6px 0;padding-left:20px;'>"
         f"<li>Revenue: <b>${sc.revenue:,.0f}</b> \u00b7 GP {sc.gpp_pct:.1f}%</li>"
         f"<li>YoY: <b>{yoy}</b> \u00b7 {peers}</li>"
-        f"<li>Last 3 months vs prior 3: <b>{last3}</b></li>"
+        f"<li>90-day momentum ({l3m_lbl}) vs prior year: <b>{last3_yoy}</b></li>"
         f"<li>Active accounts: <b>{sc.active_accounts}/{sc.total_accounts}</b> "
         f"({sc.active_account_pct:.0f}%)</li>"
         f"{core_display_li}"
@@ -2136,7 +2371,11 @@ def _build_rep_prompt(
         "• 'Sales were up 3.2%.' — describe the business implication, not just the number\n"
         "• Vague observations that any rep on any team could receive\n"
         "• Percentages without accompanying dollar context\n"
-        "• Generic advice unconnected to this rep's specific data"
+        "• Generic advice unconnected to this rep's specific data\n"
+        "• 'This period', 'the current period', 'previous period', 'prior period', "
+        "'recent months', or 'recent period' — always write the exact date range "
+        "(e.g. 'February–May 2026' or 'August 2025–May 2026')\n"
+        "• Numbers from the L3M block if it is flagged ⚠ OUTSIDE filter window"
     )
     if scorecard.is_yoy_outlier:
         sys_msg += (
@@ -2182,11 +2421,11 @@ def _build_rep_prompt(
         for a in sc.top_declining_accounts
     ) or "  (none)"
     stale_lines = "\n".join(
-        f"  - {format_account_label(a)}: was ${a['prior']:,.0f} ({prior_start_label}–{prior_end_label}), $0 this period"
+        f"  - {format_account_label(a)}: was ${a['prior']:,.0f} ({prior_start_label}–{prior_end_label}), $0 ({start_label}–{end_label})"
         for a in sc.stale_accounts
     ) or "  (none)"
     new_lines = "\n".join(
-        f"  - {format_account_label(a)}: ${a['current']:,.0f} this period (was $0)"
+        f"  - {format_account_label(a)}: ${a['current']:,.0f} ({start_label}–{end_label}), was $0 ({prior_start_label}–{prior_end_label})"
         for a in sc.new_accounts
     ) or "  (none)"
 
@@ -2194,6 +2433,32 @@ def _build_rep_prompt(
         f"  - {p['desc'] or p['price_class']}: ${p['revenue']:,.0f}, GP%={p['gp_pct']:.1f}%"
         for p in sc.price_class_top
     ) or "  (none)"
+
+    # Build explicit L3M labels so the AI can cite actual dates, not vague "recent".
+    _l3m_s = sc.last_3mo_start
+    _l3m_e = sc.last_3mo_end
+    _p3m_s = sc.prior_3mo_start
+    _p3m_e = sc.prior_3mo_end
+    _l3m_lbl = (
+        f"{_l3m_s.strftime('%b %d')}–{_l3m_e.strftime('%b %d, %Y')}"
+        if _l3m_s and _l3m_e else "last 90 days"
+    )
+    _yoy_lbl = (
+        f"{_l3m_s.replace(year=_l3m_s.year - 1).strftime('%b %d')}–"
+        f"{_l3m_e.replace(year=_l3m_e.year - 1).strftime('%b %d, %Y')}"
+        if _l3m_s and _l3m_e else "prior year same 90 days"
+    )
+    # Warn the AI when prior_3mo falls outside the user's filter window (unreliable).
+    _p3m_note = ""
+    if _p3m_s and start:
+        _p3m_lbl = f"{_p3m_s.strftime('%b %d')}–{_p3m_e.strftime('%b %d, %Y')}" if _p3m_e else "prior 90 days"
+        if _p3m_e and _p3m_e < start:
+            _p3m_note = (
+                f"  prior_3mo ({_p3m_lbl})=${sc.prior_3mo_revenue:,.0f} "
+                f"[⚠ OUTSIDE filter window — treat as unreliable; use yoy_3mo instead]\n"
+            )
+        else:
+            _p3m_note = f"  prior_3mo ({_p3m_lbl})=${sc.prior_3mo_revenue:,.0f}, vs_prior_3mo={l3}\n"
 
     week_block = ""
     if week_lines:
@@ -2233,8 +2498,9 @@ def _build_rep_prompt(
             else ""
         )
         + f"  sample_lines={sc.sample_lines}, samples_per_account={sc.samples_per_account:.2f}\n"
-        f"  last_3mo=${sc.last_3mo_revenue:,.0f}, prior_3mo=${sc.prior_3mo_revenue:,.0f}, "
-        f"vs_prior_3mo={l3}, yoy_3mo={l3y}\n\n"
+        f"  last_3mo ({_l3m_lbl})=${sc.last_3mo_revenue:,.0f}\n"
+        + _p3m_note
+        + f"  yoy_3mo ({_yoy_lbl})={l3y} [use this as the momentum indicator]\n\n"
         f"TOP PRODUCTS BY REVENUE (what this rep is actually selling):\n{pc_lines}\n\n"
         f"TOP GROWING ACCOUNTS ({start_label}–{end_label} vs {prior_start_label}–{prior_end_label}):\n{growing_lines}\n\n"
         f"TOP DECLINING ACCOUNTS ({start_label}–{end_label} vs {prior_start_label}–{prior_end_label}):\n{declining_lines}\n\n"

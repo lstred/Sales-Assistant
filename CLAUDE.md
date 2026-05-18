@@ -308,7 +308,17 @@ read those plus this file's earlier sections for full context.
     - `_build_rep_prompt` user_msg: `accounts_with_core_displays` and `core_display_coverage_pct` lines are only included when `sc.core_display_configured`. Sys_msg coaching insight examples and GOOD EXAMPLES bullet for core displays are also gated on `scorecard.core_display_configured`.
   - **26/26 tests pass.**
 
-- **2026-05-18 (latest)** — AI Reply in Conversations view; Needs Review tab redesign; orphaned code removed; `timeout_seconds` → `request_timeout_seconds` fix; reply save/badge/scheduling fixes:
+- **2026-05-18 (latest)** — L3M bug fix, explicit dates, per-rep trend chart:
+  - **Root cause fixed: spurious "453% L3M surge"** — `prior_3mo_by_rep` was sliced from the current-year `sales` DataFrame, but when the default fiscal YTD filter covers Feb–May the "prior 3 months" window (Nov–Feb) falls entirely outside that range, returning $0 for every rep. The 453% figure was noise (any revenue vs $0). Fix: added `last_3mo_start`, `last_3mo_end`, `prior_3mo_start`, `prior_3mo_end` fields to `RepScorecard`; the user_msg L3M block now labels each window with exact dates and flags the prior_3mo with `⚠ OUTSIDE filter window — treat as unreliable; use yoy_3mo instead` when `prior_3mo_end < filter_start`. The AI also receives an explicit instruction to ignore flagged L3M values.
+  - **Scorecard footer updated**: `last_3mo_vs_prior_3mo_pct` (unreliable) replaced with `last_3mo_yoy_pct` (same 90 days last year), labeled "90-day momentum (Feb 17–May 16) vs prior year".
+  - **"This period" eliminated**: stale_lines and new_lines format strings now use explicit `({start_label}–{end_label})` and `({prior_start_label}–{prior_end_label})`. Added to NEVER WRITE: `"this period"`, `"current period"`, `"previous period"`, `"prior period"`, `"recent months"`, `"recent period"`. AI is instructed to always write exact date ranges.
+  - **Per-rep trend chart added** (`_generate_trend_chart_html`): new module-level function generates a matplotlib chart embedded as a base64 PNG `<img>` tag inside each per-rep email. Two lines on one chart: (1) dashed gray — all reps combined cumulative YTD % vs prior year; (2) blue solid — this rep's cumulative YTD % vs prior year. X-axis: fiscal weeks in the filter window, labeled by month. Y-axis: `+/- %`. When prior-year data is unavailable, falls back to a bar chart of raw weekly revenue. Chart rendered in non-interactive `Agg` backend; errors are silently caught and return `""` so email generation never blocks. `matplotlib` installed to venv.
+  - **`_wrap_ai_body`** gains `chart_html: str = ""` parameter; chart is injected between the AI body text and the scorecard footer.
+  - **`_apply_draft_text`** calls `_generate_trend_chart_html(self._df, self._prior_df, rep_key, fb_start, fb_end)` and passes `chart_html` to `_wrap_ai_body`.
+  - **30/30 tests pass.**
+
+- **2026-05-18** — Analytical AI framework for weekly emails (per-rep + master BI report):
+
   - **`_AiReplyWorker(QThread)`** new class: drafts a data-rich 100–220 word reply using fresh warehouse data, fulfilling the rep's specific request. Temperature 0.35. `get_db` passed from `main_window.py`.
   - **`_ReplyComposeDialog(QDialog)`** new class: polished compose window with readonly To/Subject, collapsible thread history, editable draft body, Send Reply button (dispatches via SMTP with `In-Reply-To` header, then calls `save_message()` on the **existing** conversation — not `record_send()` — so `needs_reply` is cleared correctly).
   - **AI system prompt** restricted to data-only service offers (no scheduling calls, meetings, or check-ins).
