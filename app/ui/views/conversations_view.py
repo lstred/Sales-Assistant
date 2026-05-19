@@ -645,8 +645,7 @@ class _AiReplyWorker(QThread):
         if not self._get_db:
             return ""
         try:
-            from datetime import date as _date
-            import pandas as pd
+            from datetime import date as _date, timedelta as _td
             from app.data.loaders import (
                 load_cost_centers,
                 load_open_orders,
@@ -799,6 +798,57 @@ class _AiReplyWorker(QThread):
             lines.append(f"  {'TOTAL':<36} ${cc_total:>11,.0f}")
 
             lines.append("")
+
+            # ── Per-day breakdown for next 14 days (covers 'tomorrow', 'this week') ──
+            # This is the EXACT source for any 'shipping on <date>' question.
+            lines.append(
+                "SHIPPING SCHEDULE — DAY-BY-DAY (use this for any specific-date question):"
+            )
+            lines.append(f"  {'Date':<24} {'Open $':>12}  {'Lines':>6}")
+            lines.append(f"  {'-'*24} {'-'*12}  {'-'*6}")
+            for offset in range(0, 15):  # today + next 14 days
+                day = today + _td(days=offset)
+                day_rows = df[df["_ship_date"] == day]
+                day_rev = day_rows["open_revenue"].sum() if not day_rows.empty else 0.0
+                day_cnt = int(len(day_rows))
+                if offset == 0:
+                    label = f"Today {day.strftime('%a %b %d')}"
+                elif offset == 1:
+                    label = f"Tomorrow {day.strftime('%a %b %d')}"
+                else:
+                    label = day.strftime("%a %b %d, %Y")
+                lines.append(
+                    f"  {label[:24]:<24} ${day_rev:>11,.0f}  {day_cnt:>6}"
+                )
+            lines.append("")
+
+            # ── Per-day × cost-center detail for next 7 days (mgmt only) ──
+            if is_management:
+                lines.append(
+                    "SHIPPING SCHEDULE — NEXT 7 DAYS BY COST CENTER (use this for 'by cost center' day questions):"
+                )
+                for offset in range(0, 8):
+                    day = today + _td(days=offset)
+                    day_rows = df[df["_ship_date"] == day]
+                    if day_rows.empty:
+                        continue
+                    day_total = day_rows["open_revenue"].sum()
+                    if offset == 0:
+                        day_label = f"Today {day.strftime('%a %b %d')}"
+                    elif offset == 1:
+                        day_label = f"Tomorrow {day.strftime('%a %b %d')}"
+                    else:
+                        day_label = day.strftime("%a %b %d, %Y")
+                    lines.append(f"  {day_label}  (${day_total:,.0f}):")
+                    day_cc = (
+                        day_rows.groupby("cost_center", dropna=False)["open_revenue"]
+                        .sum()
+                        .sort_values(ascending=False)
+                    )
+                    for cc, rev in day_cc.items():
+                        name = cc_name_map.get(str(cc).strip(), str(cc).strip())[:36]
+                        lines.append(f"    {name:<36} ${rev:>11,.0f}")
+                lines.append("")
 
             # ── Per-bucket detail ─────────────────────────────────────────
             for bkt in _BUCKET_ORDER:
@@ -1157,8 +1207,9 @@ class _AiReplyWorker(QThread):
             system_msg = (
                 "You are a FACT-CHECKER for an AI sales data assistant.\n"
                 "Your ONLY job is to verify that every number (dollar amounts, "
-                "percentages, order counts) in the DRAFT EMAIL can be directly "
-                "traced to the SOURCE DATA block.\n\n"
+                "percentages, order counts) AND every named entity (cost-center names, "
+                "product names, rep names) in the DRAFT EMAIL can be directly traced "
+                "to the SOURCE DATA block.\n\n"
                 "VERIFICATION PROCESS:\n"
                 "1. Extract every number from the draft.\n"
                 "2. Find each one in the source data — exact match OR provable sum "
@@ -1167,12 +1218,20 @@ class _AiReplyWorker(QThread):
                 "correct it using only what the source data shows.\n"
                 "4. If an entire section is fabricated (e.g. a cost-center table "
                 "with no matching data): replace it with what the data ACTUALLY "
-                "shows, or state the breakdown was not available.\n\n"
+                "shows, or state the breakdown was not available.\n"
+                "5. CHECK COST CENTER NAMES: any name in a cost-center table MUST "
+                "appear verbatim in the 'BY COST CENTER' table of the source data. "
+                "Reject and replace generic category names like 'Carpet Residential', "
+                "'Tile & Stone', 'Wood Flooring', 'Adhesives & Accessories', or "
+                "'Other' — these are HALLUCINATIONS unless they appear verbatim in "
+                "the source.\n"
+                "6. CHECK TOTALS: the TOTAL in the draft MUST equal the TOTAL row "
+                "in the source data exactly. If it does not, the breakdown is wrong.\n\n"
                 "OUTPUT RULES — STRICTLY FOLLOW:\n"
                 "- If the draft is 100% accurate: return it VERBATIM, unchanged.\n"
                 "- If corrections are needed: return ONLY the corrected text — no "
                 "commentary, no 'CORRECTED:' labels, no explanations.\n"
-                "- Do NOT invent any number not present in the source data.\n"
+                "- Do NOT invent any number or name not present in the source data.\n"
                 "- Preserve the tone, structure, and formatting of the original.\n"
                 "- The GRAND TOTAL in the source data is authoritative — never "
                 "contradict it."
@@ -1278,8 +1337,22 @@ class _AiReplyWorker(QThread):
                 "- The data block includes an 'OPEN ORDERS / FUTURE SHIPMENTS' section with live pipeline data.\n"
                 "- These are UN-INVOICED orders — not yet counted as sales. Show them clearly labeled as pipeline.\n"
                 "- Buckets: Overdue (past ship date, not invoiced), Next 7 days, 8–30 days, 31–90 days, 90+ days.\n"
+                "- For SPECIFIC-DATE questions ('tomorrow', 'Friday', 'May 22'): use the\n"
+                "  'SHIPPING SCHEDULE — DAY-BY-DAY' table — those rows are the exact source.\n"
+                "- For 'by cost center on <date>': use 'SHIPPING SCHEDULE — NEXT 7 DAYS BY COST CENTER'.\n"
                 "- Use this to answer questions about pending orders, upcoming shipments, backlog by rep/product,\n"
                 "  what's shipping this week or month, or what's overdue.\n\n"
+
+                "COST CENTER NAMES — CRITICAL:\n"
+                "- The ONLY valid cost-center names are those listed in the 'BY COST CENTER' table.\n"
+                "- NEVER invent generic flooring category names like 'Carpet Residential',\n"
+                "  'Tile & Stone', 'Wood Flooring', 'Adhesives & Accessories', or 'Other'.\n"
+                "- Use the EXACT cost-center names from the data — e.g. 'CARPET RESIDENTIAL',\n"
+                "  'CUSHION', 'CARPET COMMERCIAL BL', 'CERAMIC', 'COMMERCIAL RESILIENT', 'VCT',\n"
+                "  'RESILIENT LVT', 'HARDWOOD', 'UNFINISHED WOOD', 'CARPET LVT', 'SUPPLY LVT',\n"
+                "  'POWDER', 'ADHESIVE', 'SHOWER', 'SUNDRIES', etc. — whatever the data shows.\n"
+                "- Show EVERY cost center with non-zero values — do not collapse small CCs into 'Other'.\n"
+                "- The TOTAL row in your reply MUST equal the TOTAL row in the data exactly.\n\n"
 
                 "PROFESSIONAL FORMATTING RULES:\n"
                 "- Lead with the direct answer (the table or figure). Context after, not before.\n"
@@ -1326,8 +1399,16 @@ class _AiReplyWorker(QThread):
                 "- The data block includes an 'OPEN ORDERS / FUTURE SHIPMENTS' section with live pipeline.\n"
                 "- These are UN-INVOICED orders — pipeline, not sales revenue yet. Label them accordingly.\n"
                 "- Buckets: Overdue, Next 7 days, 8–30 days, 31–90 days, 90+ days.\n"
+                "- For specific-date questions ('tomorrow', 'Friday'): use the\n"
+                "  'SHIPPING SCHEDULE — DAY-BY-DAY' table — those rows are the exact source.\n"
                 "- If the rep asks 'what's shipping this week', 'do I have any open orders', 'what's my backlog',\n"
                 "  or anything about pending / upcoming / future orders — answer from this section.\n\n"
+
+                "COST CENTER NAMES — CRITICAL:\n"
+                "- The ONLY valid cost-center names are those listed in the 'BY COST CENTER' table.\n"
+                "- NEVER invent generic category names like 'Carpet Residential', 'Tile & Stone',\n"
+                "  'Wood Flooring', or 'Other'. Use EXACT names from the data.\n"
+                "- Show EVERY cost center with non-zero values — do not collapse small CCs into 'Other'.\n\n"
 
                 "PROFESSIONAL FORMATTING RULES:\n"
                 "- Lead with the direct answer (table or figure), then 1-2 sentences of context.\n"
@@ -1363,7 +1444,7 @@ class _AiReplyWorker(QThread):
             ],
             model=self._cfg.ai.model,
             max_output_tokens=max(1024, self._cfg.ai.max_output_tokens),
-            temperature=0.2,
+            temperature=0.1 if is_mgmt else 0.2,
             timeout_seconds=self._cfg.ai.request_timeout_seconds,
         )
         draft = result.text.strip()
