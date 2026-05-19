@@ -673,9 +673,19 @@ class _AiReplyWorker(QThread):
             try:
                 cc_df = load_all_cost_centers(db)
                 if cc_df is not None and not cc_df.empty:
+                    import math as _math
                     for _, r in cc_df.iterrows():
-                        code = str(r.get("cost_center", "")).strip()
-                        name = str(r.get("cost_center_name", "")).strip()
+                        code = str(r.get("cost_center", "") or "").strip()
+                        name_raw = r.get("cost_center_name", "")
+                        # Safely convert SQL NULL / NaN to empty string
+                        if name_raw is None:
+                            name = ""
+                        elif isinstance(name_raw, float) and _math.isnan(name_raw):
+                            name = ""
+                        else:
+                            name = str(name_raw).strip()
+                            if name.lower() in ("nan", "none", "na", "<na>", "null", ""):
+                                name = ""
                         if code and name:
                             cc_name_map[code] = name
             except Exception:  # noqa: BLE001
@@ -754,6 +764,25 @@ class _AiReplyWorker(QThread):
 
             df["_bucket"] = df["_ship_date"].apply(_bucket)
 
+            # Normalize CC codes: only 3-digit numeric codes (e.g. '010') are
+            # real cost centers.  Non-standard ICCTR values like 'TRAY',
+            # 'K.SHOWER', 'TT TRAY' exist in the ITEM table but are not
+            # valid cost centers — group them all under '' (UNCLASSIFIED).
+            import re as _re
+            _STD_CC = _re.compile(r'^\d{3}$')
+
+            def _norm_cc(val) -> str:
+                cc = str(val).strip() if val is not None else ""
+                return cc if _STD_CC.match(cc) else ""
+
+            df["_cc_norm"] = df["cost_center"].apply(_norm_cc)
+
+            def _cc_label(cc: str) -> str:
+                """Human-readable label for a normalized CC code."""
+                if not cc:
+                    return "UNCLASSIFIED"
+                return cc_name_map.get(cc, f"CC {cc}")
+
             grand_total: float = df["open_revenue"].sum()
             if grand_total == 0:
                 return ""
@@ -778,29 +807,27 @@ class _AiReplyWorker(QThread):
                     f"  {str(bkt):<28} ${brow['open_revenue']:>11,.0f}  {int(brow['count']):>6}"
                 )
 
-            # ── Company-wide BY COST CENTER summary (always shown) ────────
+            # ── Company-wide BY COST CENTER summary (total pipeline, all dates) ─
+            # This is the SOURCE OF TRUTH for any CC-breakdown question.
+            # It covers ALL open orders regardless of ship date.
             lines.append("")
-            lines.append("BY COST CENTER — total open pipeline:")
+            lines.append("BY COST CENTER — TOTAL OPEN PIPELINE (all dates, including orders with no confirmed ship date):")
             lines.append(f"  {'Cost Center':<36} {'Open $':>12}  {'Lines':>6}")
             lines.append(f"  {'-'*36} {'-'*12}  {'-'*6}")
             cc_grp = (
-                df.groupby("cost_center", dropna=False)
+                df.groupby("_cc_norm", dropna=False)
                 .agg(open_revenue=("open_revenue", "sum"), count=("open_revenue", "count"))
                 .reset_index()
                 .sort_values("open_revenue", ascending=False)
             )
             cc_total: float = 0.0
             for _, row in cc_grp.iterrows():
-                cc = str(row["cost_center"]).strip()
-                # Items with no ITEM-master record have empty cc; show clearly
-                if cc:
-                    name = cc_name_map.get(cc, cc)[:36]
-                else:
-                    name = "UNCLASSIFIED (no item record)"[:36]
-                rev = row["open_revenue"]
+                cc = str(row["_cc_norm"]).strip()
+                name = _cc_label(cc)
+                rev = float(row["open_revenue"]) if row["open_revenue"] == row["open_revenue"] else 0.0
                 cnt = int(row["count"])
                 cc_total += rev
-                lines.append(f"  {name:<36} ${rev:>11,.0f}  {cnt:>6}")
+                lines.append(f"  {name[:36]:<36} ${rev:>11,.0f}  {cnt:>6}")
             lines.append(f"  {'TOTAL':<36} ${cc_total:>11,.0f}")
 
             lines.append("")
@@ -831,13 +858,15 @@ class _AiReplyWorker(QThread):
             # ── Per-day × cost-center detail for next 7 days (mgmt only) ──
             if is_management:
                 lines.append(
-                    "SHIPPING SCHEDULE — NEXT 7 DAYS BY COST CENTER (use this for 'by cost center' day questions):"
+                    "SHIPPING SCHEDULE — NEXT 7 DAYS BY COST CENTER (confirmed ship-date orders only):"
                 )
+                any_day_printed = False
                 for offset in range(0, 8):
                     day = today + _td(days=offset)
                     day_rows = df[df["_ship_date"] == day]
                     if day_rows.empty:
                         continue
+                    any_day_printed = True
                     day_total = day_rows["open_revenue"].sum()
                     if offset == 0:
                         day_label = f"Today {day.strftime('%a %b %d')}"
@@ -847,17 +876,16 @@ class _AiReplyWorker(QThread):
                         day_label = day.strftime("%a %b %d, %Y")
                     lines.append(f"  {day_label}  (${day_total:,.0f}):")
                     day_cc = (
-                        day_rows.groupby("cost_center", dropna=False)["open_revenue"]
+                        day_rows.groupby("_cc_norm", dropna=False)["open_revenue"]
                         .sum()
                         .sort_values(ascending=False)
                     )
-                    for cc, rev in day_cc.items():
-                        cc_s = str(cc).strip()
-                        if cc_s:
-                            name = cc_name_map.get(cc_s, cc_s)[:36]
-                        else:
-                            name = "UNCLASSIFIED (no item record)"[:36]
-                        lines.append(f"    {name:<36} ${rev:>11,.0f}")
+                    for cc_n, rev in day_cc.items():
+                        name = _cc_label(str(cc_n).strip())
+                        lines.append(f"    {name[:36]:<36} ${rev:>11,.0f}")
+                if not any_day_printed:
+                    lines.append("  (No orders have a confirmed ship date in the next 7 days)")
+                    lines.append("  Use the BY COST CENTER table above for the full open pipeline.")
                 lines.append("")
 
             # ── Per-bucket detail ─────────────────────────────────────────
@@ -886,15 +914,15 @@ class _AiReplyWorker(QThread):
 
                     # Cost-center breakdown per bucket
                     cc_bkt = (
-                        sub.groupby("cost_center", dropna=False)["open_revenue"]
+                        sub.groupby("_cc_norm", dropna=False)["open_revenue"]
                         .sum()
                         .sort_values(ascending=False)
                     )
                     lines.append(f"  {'Cost Center':<36} {'Open $':>10}")
                     lines.append(f"  {'-'*36} {'-'*10}")
-                    for cc, rev in cc_bkt.items():
-                        name = cc_name_map.get(str(cc).strip(), str(cc).strip())[:36]
-                        lines.append(f"  {name:<36} ${rev:>9,.0f}")
+                    for cc_n, rev in cc_bkt.items():
+                        name = _cc_label(str(cc_n).strip())
+                        lines.append(f"  {name[:36]:<36} ${rev:>9,.0f}")
                 else:
                     # Account-level breakdown (rep view)
                     acct_grp = (
@@ -1344,14 +1372,23 @@ class _AiReplyWorker(QThread):
                 "- You CAN and SHOULD compare reps by name — that is appropriate for manager queries.\n\n"
 
                 "OPEN ORDERS / FUTURE SHIPMENTS:\n"
-                "- The data block includes an 'OPEN ORDERS / FUTURE SHIPMENTS' section with live pipeline data.\n"
-                "- These are UN-INVOICED orders — not yet counted as sales. Show them clearly labeled as pipeline.\n"
-                "- Buckets: Overdue (past ship date, not invoiced), Next 7 days, 8–30 days, 31–90 days, 90+ days.\n"
-                "- For SPECIFIC-DATE questions ('tomorrow', 'Friday', 'May 22'): use the\n"
-                "  'SHIPPING SCHEDULE — DAY-BY-DAY' table — those rows are the exact source.\n"
-                "- For 'by cost center on <date>': use 'SHIPPING SCHEDULE — NEXT 7 DAYS BY COST CENTER'.\n"
-                "- Use this to answer questions about pending orders, upcoming shipments, backlog by rep/product,\n"
-                "  what's shipping this week or month, or what's overdue.\n\n"
+                "- The data block has an 'OPEN ORDERS / FUTURE SHIPMENTS' section with live pipeline data.\n"
+                "- These are UN-INVOICED orders — NOT yet counted as sales. Always label them as pipeline.\n"
+                "- TWO key sections — use the right one for each question:\n"
+                "  1. 'BY COST CENTER — TOTAL OPEN PIPELINE': shows ALL open orders across ALL dates.\n"
+                "     Use this when asked 'what's in the pipeline by CC', 'what are we shipping'\n"
+                "     or any general shipping/CC breakdown question. This is the COMPLETE picture.\n"
+                "  2. 'SHIPPING SCHEDULE — DAY-BY-DAY': shows orders with a CONFIRMED ship date set.\n"
+                "     Use this for specific-date questions ('tomorrow', 'Thursday', 'May 22').\n"
+                "     IMPORTANT: many orders may have no confirmed ship date — if a day shows $0\n"
+                "     or a small amount, it means few orders have that exact date confirmed in the ERP,\n"
+                "     NOT that nothing is shipping. Always show the total pipeline context alongside.\n"
+                "  3. 'SHIPPING SCHEDULE — NEXT 7 DAYS BY COST CENTER': confirmed orders by CC per day.\n"
+                "     Use when asked 'by cost center for Thursday' etc.\n"
+                "- For 'shipping [day] by cost center' questions:\n"
+                "  (a) Report the confirmed day total from DAY-BY-DAY.\n"
+                "  (b) Show the BY COST CENTER breakdown from the TOTAL PIPELINE table.\n"
+                "  (c) Add a note: 'Note: $X confirmed with ship date [day]; full open pipeline by CC is shown above.'\n\n"
 
                 "COST CENTER NAMES — CRITICAL:\n"
                 "- The ONLY valid cost-center names are those listed in the 'BY COST CENTER' table.\n"
@@ -1360,9 +1397,11 @@ class _AiReplyWorker(QThread):
                 "- Use the EXACT cost-center names from the data — e.g. 'CARPET RESIDENTIAL',\n"
                 "  'CUSHION', 'CARPET COMMERCIAL BL', 'CERAMIC', 'COMMERCIAL RESILIENT', 'VCT',\n"
                 "  'RESILIENT LVT', 'HARDWOOD', 'UNFINISHED WOOD', 'CARPET LVT', 'SUPPLY LVT',\n"
-                "  'POWDER', 'ADHESIVE', 'SHOWER', 'SUNDRIES', etc. — whatever the data shows.\n"
+                "  'POWDER', 'ADHESIVE', 'SHOWER', 'SUNDRIES', 'UNCLASSIFIED', etc. — whatever the data shows.\n"
                 "- Show EVERY cost center with non-zero values — do not collapse small CCs into 'Other'.\n"
-                "- The TOTAL row in your reply MUST equal the TOTAL row in the data exactly.\n\n"
+                "- The TOTAL row in your reply MUST equal the TOTAL row in the data exactly.\n"
+                "- 'UNCLASSIFIED' in the data means orders for items without a standard cost center\n"
+                "  code — include this row if it appears, labeled as 'UNCLASSIFIED'.\n\n"
 
                 "PROFESSIONAL FORMATTING RULES:\n"
                 "- Lead with the direct answer (the table or figure). Context after, not before.\n"
@@ -1408,9 +1447,11 @@ class _AiReplyWorker(QThread):
                 "OPEN ORDERS / FUTURE SHIPMENTS:\n"
                 "- The data block includes an 'OPEN ORDERS / FUTURE SHIPMENTS' section with live pipeline.\n"
                 "- These are UN-INVOICED orders — pipeline, not sales revenue yet. Label them accordingly.\n"
-                "- Buckets: Overdue, Next 7 days, 8–30 days, 31–90 days, 90+ days.\n"
-                "- For specific-date questions ('tomorrow', 'Friday'): use the\n"
-                "  'SHIPPING SCHEDULE — DAY-BY-DAY' table — those rows are the exact source.\n"
+                "- 'BY COST CENTER — TOTAL OPEN PIPELINE': ALL open orders regardless of ship date.\n"
+                "  Use this for general shipping/backlog/CC breakdown questions.\n"
+                "- 'SHIPPING SCHEDULE — DAY-BY-DAY': only orders with a confirmed ship date set.\n"
+                "  If a day shows $0, it means no orders have that exact date confirmed — NOT that nothing ships.\n"
+                "  Always show the total pipeline context alongside any day-specific figures.\n"
                 "- If the rep asks 'what's shipping this week', 'do I have any open orders', 'what's my backlog',\n"
                 "  or anything about pending / upcoming / future orders — answer from this section.\n\n"
 
