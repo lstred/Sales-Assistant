@@ -293,6 +293,15 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
+- **2026-05-19 (latest)** — INNER JOIN → LEFT JOIN on ITEM: all open-order & invoiced revenue now captured:
+  - **Root cause**: Both `OPEN_ORDERS_LINES` and `INVOICED_SALES_LINES` used `JOIN dbo.ITEM AS i ON i.[ItemNumber] = o.[ITEM_MFGR_COLOR_PAT]` (an INNER JOIN). Any order line whose item code doesn't exist in `dbo.ITEM` (custom items, direct-ship products, special orders, non-stocked items) was silently dropped from all queries. This caused entire cost centers to go missing from AI responses and totals to be severely understated (observed: 11 CCs / $111k returned vs 23 CCs / $801k actual for Thursday shipping).
+  - **Fix 1 — `OPEN_ORDERS_LINES`**: Changed `JOIN dbo.ITEM` → `LEFT JOIN dbo.ITEM`. Used `ISNULL(LTRIM(RTRIM(i.[ICCTR])), '')` and `ISNULL(LTRIM(RTRIM(i.[IPRCCD])), '')` so unmatched rows get empty-string CC/price-class instead of being dropped. Updated `cc_csv` and `code_prefix` filter clauses to use `ISNULL(...)` consistently.
+  - **Fix 2 — `INVOICED_SALES_LINES`**: Same change — `JOIN` → `LEFT JOIN`, `ISNULL` wrappers on `i.[ICCTR]` and `i.[IPRCCD]`. Every invoiced revenue line now counted regardless of ITEM-master coverage.
+  - **Fix 3 — Invoice cache bumped v3 → v4**: Old cached DataFrames (built from INNER JOIN) are invalidated; next refresh re-fetches correct data from the warehouse.
+  - **Fix 4 — `_fetch_open_orders_data` uses `load_all_cost_centers`**: Switched from `load_cost_centers` (XREF-only, misses sample CCs and post-go-live unmapped CCs) to `load_all_cost_centers` (reads from `dbo.ITEM.[ICCTR]` directly — authoritative list). Ensures every CC returned by `OPEN_ORDERS_LINES` has a human-readable name in the prompt.
+  - **Fix 5 — UNCLASSIFIED label**: Items with empty cost_center (no ITEM-master match) are shown as `UNCLASSIFIED (no item record)` in the CC table so revenue is never invisible to the AI.
+  - **30/30 tests pass.**
+
 - **2026-05-22 (latest)** — Per-day shipping schedule + anti-hallucination hardening (round 2):
   - **Root cause still surfacing**: even with the BY COST CENTER summary added earlier today, the AI was still inventing generic flooring-industry CC names ("Carpet Residential", "Tile & Stone", "Wood Flooring", "Adhesives & Accessories", "Other") when asked about a specific date ("shipping tomorrow"). The bucket data only covered "Next 7 days" — no per-day granularity — so the AI had no exact source for "tomorrow" and fabricated the entire breakdown.
   - **Fix 1 — Per-day breakdown for next 15 days**: `_fetch_open_orders_data` now includes a `SHIPPING SCHEDULE — DAY-BY-DAY` table covering today + next 14 days (each row = one calendar date with total $ and line count). For every specific-date question ("tomorrow", "Friday", "May 22") the AI has exact source rows. Labels include `Today`, `Tomorrow`, and `Wed May 21, 2026` style dates.

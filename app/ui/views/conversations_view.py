@@ -647,7 +647,7 @@ class _AiReplyWorker(QThread):
         try:
             from datetime import date as _date, timedelta as _td
             from app.data.loaders import (
-                load_cost_centers,
+                load_all_cost_centers,
                 load_open_orders,
                 load_price_class_lookup,
                 load_rep_assignments,
@@ -667,9 +667,11 @@ class _AiReplyWorker(QThread):
             pc_lookup = load_price_class_lookup(db)
 
             # Cost-center name lookup: code → human-readable name
+            # Use load_all_cost_centers so sample CCs and every post-go-live
+            # CC (not just XREF-mapped ones) get a friendly name.
             cc_name_map: dict[str, str] = {}
             try:
-                cc_df = load_cost_centers(db)
+                cc_df = load_all_cost_centers(db)
                 if cc_df is not None and not cc_df.empty:
                     for _, r in cc_df.iterrows():
                         code = str(r.get("cost_center", "")).strip()
@@ -790,7 +792,11 @@ class _AiReplyWorker(QThread):
             cc_total: float = 0.0
             for _, row in cc_grp.iterrows():
                 cc = str(row["cost_center"]).strip()
-                name = cc_name_map.get(cc, cc)[:36]
+                # Items with no ITEM-master record have empty cc; show clearly
+                if cc:
+                    name = cc_name_map.get(cc, cc)[:36]
+                else:
+                    name = "UNCLASSIFIED (no item record)"[:36]
                 rev = row["open_revenue"]
                 cnt = int(row["count"])
                 cc_total += rev
@@ -846,7 +852,11 @@ class _AiReplyWorker(QThread):
                         .sort_values(ascending=False)
                     )
                     for cc, rev in day_cc.items():
-                        name = cc_name_map.get(str(cc).strip(), str(cc).strip())[:36]
+                        cc_s = str(cc).strip()
+                        if cc_s:
+                            name = cc_name_map.get(cc_s, cc_s)[:36]
+                        else:
+                            name = "UNCLASSIFIED (no item record)"[:36]
                         lines.append(f"    {name:<36} ${rev:>11,.0f}")
                 lines.append("")
 

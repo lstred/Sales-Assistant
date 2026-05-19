@@ -93,8 +93,8 @@ WHERE   ISNULL(LTRIM(RTRIM(b.[BSACCT])), '') <> ''
 INVOICED_SALES_LINES = """
 SELECT  TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD])         AS invoice_yyyymmdd,
         LTRIM(RTRIM(o.[ACCOUNT#I]))                          AS account_number,
-        LTRIM(RTRIM(i.[ICCTR]))                              AS cost_center,
-        LTRIM(RTRIM(i.[IPRCCD]))                             AS price_class,
+        ISNULL(LTRIM(RTRIM(i.[ICCTR])), '')                 AS cost_center,
+        ISNULL(LTRIM(RTRIM(i.[IPRCCD])), '')                AS price_class,
         LTRIM(RTRIM(o.[SALESPERSON_DESC]))                   AS salesperson_desc,
         TRY_CONVERT(int, o.[INVOICE#])                       AS invoice_number,
         TRY_CONVERT(int, o.[ORDER#])                         AS order_number,
@@ -102,16 +102,16 @@ SELECT  TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD])         AS invoice_yyyymmdd,
         TRY_CONVERT(decimal(18,2), o.[ENTENDED_PRICE_NO_FUNDS]) AS revenue,
         TRY_CONVERT(decimal(18,2), o.[LINE_GPD_WITHOUT_FUNDS])  AS gross_profit
 FROM    dbo._ORDERS AS o
-JOIN    dbo.ITEM    AS i ON i.[ItemNumber] = o.[ITEM_MFGR_COLOR_PAT]
+LEFT JOIN dbo.ITEM  AS i ON i.[ItemNumber] = o.[ITEM_MFGR_COLOR_PAT]
 WHERE   TRY_CONVERT(int, o.[ACCOUNT#I]) > 1
   AND   TRY_CONVERT(int, o.[ORDER#])    > 0
   AND   TRY_CONVERT(int, o.[INVOICE#])  > 0
   AND   TRY_CONVERT(int, o.[INVOICE_DATE_YYYYMMDD]) BETWEEN :start_yyyymmdd AND :end_yyyymmdd
   AND   ( :cc_csv = ''
-          OR LTRIM(RTRIM(i.[ICCTR])) IN
+          OR ISNULL(LTRIM(RTRIM(i.[ICCTR])), '') IN
              (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(:cc_csv, ',')) )
   AND   ( :code_prefix = ''
-          OR LTRIM(RTRIM(i.[ICCTR])) LIKE :code_prefix + '%' )
+          OR ISNULL(LTRIM(RTRIM(i.[ICCTR])), '') LIKE :code_prefix + '%' )
 """
 
 # Open orders: real orders (ORDER# > 0) that have **not** yet been invoiced.
@@ -121,22 +121,22 @@ OPEN_ORDERS_LINES = """
 SELECT  TRY_CONVERT(int, o.[ORDER_ENTRY_DATE_YYYYMMDD])     AS order_entry_yyyymmdd,
         TRY_CONVERT(int, o.[ORDER_SHIP_DATE])                AS order_ship_yyyymmdd,
         LTRIM(RTRIM(o.[ACCOUNT#I]))                          AS account_number,
-        LTRIM(RTRIM(i.[ICCTR]))                              AS cost_center,
-        LTRIM(RTRIM(i.[IPRCCD]))                             AS price_class,
+        ISNULL(LTRIM(RTRIM(i.[ICCTR])), '')                 AS cost_center,
+        ISNULL(LTRIM(RTRIM(i.[IPRCCD])), '')                AS price_class,
         LTRIM(RTRIM(o.[SALESPERSON_DESC]))                   AS salesperson_desc,
         TRY_CONVERT(int, o.[ORDER#])                         AS order_number,
         TRY_CONVERT(int, o.[LINE#I])                         AS line_number,
         TRY_CONVERT(decimal(18,2), o.[ENTENDED_PRICE_NO_FUNDS]) AS open_revenue
 FROM    dbo._ORDERS AS o
-JOIN    dbo.ITEM    AS i ON i.[ItemNumber] = o.[ITEM_MFGR_COLOR_PAT]
+LEFT JOIN dbo.ITEM  AS i ON i.[ItemNumber] = o.[ITEM_MFGR_COLOR_PAT]
 WHERE   TRY_CONVERT(int, o.[ACCOUNT#I]) > 1
   AND   TRY_CONVERT(int, o.[ORDER#])    > 0
   AND   ISNULL(TRY_CONVERT(int, o.[INVOICE#]), 0) = 0
   AND   ( :cc_csv = ''
-          OR LTRIM(RTRIM(i.[ICCTR])) IN
+          OR ISNULL(LTRIM(RTRIM(i.[ICCTR])), '') IN
              (SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(:cc_csv, ',')) )
   AND   ( :code_prefix = ''
-          OR LTRIM(RTRIM(i.[ICCTR])) LIKE :code_prefix + '%' )
+          OR ISNULL(LTRIM(RTRIM(i.[ICCTR])), '') LIKE :code_prefix + '%' )
 """
 
 # ------------------------------------- old-system summarized sales (≤ go-live)
