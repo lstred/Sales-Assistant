@@ -628,13 +628,21 @@ class WeeklyEmailView(QWidget):
                 return rk.upper() in _sc_whitelist
             return bool(rk)
 
+        # Filter on salesperson_desc — that is the column load_blended_sales
+        # returns.  rep_key is only an internal alias derived inside the
+        # analytics service's _normalise_sales helper; it is NOT present on
+        # the raw DataFrame we hold in self._df.
+        _desc_col = "salesperson_desc" if "salesperson_desc" in self._df.columns else "rep_key"
         sc_df = (
-            self._df[self._df["rep_key"].apply(_sc_rep_is_active)].copy()
+            self._df[self._df[_desc_col].fillna("").astype(str).apply(_sc_rep_is_active)].copy()
             if _sc_whitelist else self._df
         )
         sc_prior = (
-            self._prior_df[self._prior_df["rep_key"].apply(_sc_rep_is_active)].copy()
-            if (self._prior_df is not None and not self._prior_df.empty and _sc_whitelist)
+            self._prior_df[
+                self._prior_df[_desc_col].fillna("").astype(str).apply(_sc_rep_is_active)
+            ].copy()
+            if (self._prior_df is not None and not self._prior_df.empty and _sc_whitelist
+                and _desc_col in self._prior_df.columns)
             else self._prior_df
         )
 
@@ -664,7 +672,15 @@ class WeeklyEmailView(QWidget):
     def _generate_all(self) -> None:
         if self._df is None or self._df.empty:
             return
-        self._ensure_scorecards()
+        try:
+            self._ensure_scorecards()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("_ensure_scorecards failed in _generate_all")
+            self.preview.setPlainText(
+                f"\u274c Could not compute rep scorecards:\n{exc}\n\n"
+                "Check the app log for details."
+            )
+            return
         self._drafts.clear()
         self.list.clear()
 
@@ -822,20 +838,32 @@ class WeeklyEmailView(QWidget):
     def _generate_master(self) -> None:
         if self._df is None or self._df.empty:
             return
-        self._ensure_scorecards()
+        try:
+            self._ensure_scorecards()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("_ensure_scorecards failed in _generate_master")
+            self.preview.setPlainText(
+                f"\u274c Could not compute rep scorecards:\n{exc}\n\n"
+                "Check the app log for details."
+            )
+            return
 
-        # Anchor weekly windows to the latest invoice date in scope.
+        today = date.today()
+        # Anchor = latest invoice date in scope, capped at today.  Used ONLY
+        # to cap wk_end so we never show a "future" window.
         anchor = self._anchor_date()
 
-        # Week selection rule: if today is Friday (4) or Saturday (5), use
-        # the current (in-progress) week; otherwise use the last full week.
-        today = date.today()
-        if today.weekday() >= 4:  # Friday or Saturday
-            wk_start, wk_end_full = current_week_range(anchor)
+        # Week selection: always derive the window from *today* so the correct
+        # calendar week is chosen regardless of the anchor date.  Weeks run
+        # Sun → Sat.  On Mon–Thu show the last FULL week; on Fri–Sat show the
+        # current in-progress week.
+        if today.weekday() >= 4:  # Friday (4) or Saturday (5)
+            wk_start, wk_end_full = current_week_range(today)
             wk_end = min(anchor, wk_end_full)
             using_current_week = True
-        else:
-            wk_start, wk_end = previous_week_range(anchor)
+        else:  # Mon–Thu — last full week
+            wk_start, wk_end = previous_week_range(today)
+            wk_end = min(anchor, wk_end)  # cap in case invoices not yet posted
             using_current_week = False
 
         # Per-rep weekly revenue for the chosen window.
@@ -1154,9 +1182,13 @@ class WeeklyEmailView(QWidget):
         df = df[df["salesperson_desc"].astype(str).str.strip() == rep_key]
         if df.empty:
             return {}
+        today = date.today()
         anchor = self._anchor_date()
-        prev_s, prev_e = previous_week_range(anchor)
-        cur_s, cur_e_full = current_week_range(anchor)
+        # Always use *today* for week boundaries — anchor only caps the end
+        # dates to avoid displaying future invoices.
+        prev_s, prev_e = previous_week_range(today)
+        prev_e = min(anchor, prev_e)
+        cur_s, cur_e_full = current_week_range(today)
         cur_e = min(anchor, cur_e_full)
         df = df.copy()
         df["invoice_date"] = pd.to_datetime(df["invoice_date"], errors="coerce")
