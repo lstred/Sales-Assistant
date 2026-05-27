@@ -293,6 +293,32 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
+- **2026-05-26 (latest)** — Closed-account → open-successor merge + AI "no visits to closed accounts" rule:
+  - **Root cause**: When a customer closes and reopens at the same physical address under a new BACCT#, `dbo.BILLTO` keeps both rows — the closed one (`BNAME` starts with `*`, often `*CLSD*`) and the new open one. Sales attributed to the old number stay stranded there. Reps would see the closed account flagged as "stale — win back" and the new (open) account analysed separately, undercounted. Worse, the AI sometimes told reps to "visit" or "call" closed accounts that are physically out of business.
+  - **Fix 1 — BILLTO directory + successor map** in `app/data/loaders.py`:
+    - New SQL `BILLTO_DIRECTORY` returns `account_number`, `account_name`, `old_account_number` (BBANK2), `address1` (BADDR1), and `is_closed` (BNAME starts with `*`).
+    - `load_account_directory(db)` runs it.
+    - `_normalise_address(s)` upper-cases, collapses whitespace, rejects junk (`""`, `"N/A"`, `"NONE"`, single-char, `<4` chars).
+    - `build_account_successor_map(directory_df) -> (successor_map, closed_no_successor, meta)`: groups open accounts by normalised BADDR1. For each closed acct → exactly one open at same address ⇒ remap; zero opens ⇒ `closed_no_successor`; >1 opens ⇒ ambiguous, intentionally NOT remapped. Always recorded in `meta`.
+  - **Fix 2 — Sales remap before attribution** in `load_blended_sales`:
+    - Successor map built once at the top.
+    - New-system DataFrame: `account_number` strip + remap happens UNCONDITIONALLY (was previously gated inside `if rep_map_df`), so legacy-only date ranges also get remapped. Rep merge stays inside the `rep_map_df` guard.
+    - Legacy path: `_unpivot_old_sales` accepts `*, successor_map: dict[str, str] | None = None` and applies the remap to `df["account_number"]` BEFORE the `(acct, cc)` rep lookup — so reattribution flows through to the open account's owner correctly.
+    - `load_open_orders` also applies the remap so pipeline answers match invoiced views.
+    - **Invariant preserved**: remap is a 1:1 rename of `account_number`, never duplicates or drops rows, so `sum(revenue)` is identical before/after.
+    - **No cache bump** — remap happens AFTER `load_invoiced_sales` (cached layer) returns.
+  - **Fix 3 — is_closed flag propagated** in `app/services/manager_analytics.py`:
+    - `account_info[acct]` now carries `is_closed: bool` (preserved from BILLTO).
+    - `_records_for_email` includes `"is_closed"` on every account dict in growing/declining/stale/new lists.
+    - `format_account_label(rec, style=...)` appends ` [CLOSED]` suffix when `rec["is_closed"]` is True. Used everywhere account labels appear (weekly emails, scorecards, fallbacks).
+  - **Fix 4 — CLOSED ACCOUNT RULE in all four AI sys_msgs**:
+    - `app/ui/views/weekly_email_view.py` `_build_rep_prompt` and master BI prompt
+    - `app/ui/views/conversations_view.py` management `_AiReplyWorker` sys_msg
+    - `app/ui/views/conversations_view.py` rep `_AiReplyWorker` sys_msg
+    - `app/ui/views/ai_chat_view.py` `SYSTEM_PROMPT`
+    - Rule: "Account labels suffixed with '[CLOSED]' are permanently closed accounts. Closed accounts that reopened at the same address have ALREADY been merged into the open account's history — the data reflects the unified customer. Never tell the rep to call, visit, or re-engage a closed account. You may mention a closed account to explain a revenue drop or quantify lost territory — but every action item must target OPEN accounts."
+  - **Tests**: new `tests/test_account_successor.py` with 4 cases (whitespace/junk normalisation, unambiguous match, no-open-listed-as-closed, ambiguous skipped). **34/34 tests pass.**
+
 - **2026-05-19 (latest)** — INNER JOIN → LEFT JOIN on ITEM: all open-order & invoiced revenue now captured:
   - **Root cause**: Both `OPEN_ORDERS_LINES` and `INVOICED_SALES_LINES` used `JOIN dbo.ITEM AS i ON i.[ItemNumber] = o.[ITEM_MFGR_COLOR_PAT]` (an INNER JOIN). Any order line whose item code doesn't exist in `dbo.ITEM` (custom items, direct-ship products, special orders, non-stocked items) was silently dropped from all queries. This caused entire cost centers to go missing from AI responses and totals to be severely understated (observed: 11 CCs / $111k returned vs 23 CCs / $801k actual for Thursday shipping).
   - **Fix 1 — `OPEN_ORDERS_LINES`**: Changed `JOIN dbo.ITEM` → `LEFT JOIN dbo.ITEM`. Used `ISNULL(LTRIM(RTRIM(i.[ICCTR])), '')` and `ISNULL(LTRIM(RTRIM(i.[IPRCCD])), '')` so unmatched rows get empty-string CC/price-class instead of being dropped. Updated `cc_csv` and `code_prefix` filter clauses to use `ISNULL(...)` consistently.

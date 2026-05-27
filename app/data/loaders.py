@@ -49,6 +49,112 @@ def load_rep_assignments(db: DatabaseConfig) -> pd.DataFrame:
     return df
 
 
+def load_account_directory(db: DatabaseConfig) -> pd.DataFrame:
+    """Full ``dbo.BILLTO`` directory: every account with name, BBANK2,
+    BADDR1, and a derived ``is_closed`` flag (BNAME starts with ``*``).
+
+    Used to build the closed-account → successor map (see
+    :func:`build_account_successor_map`).
+    """
+    df = read_dataframe(db, queries.BILLTO_DIRECTORY)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=[
+            "account_number", "account_name", "old_account_number",
+            "address1", "is_closed",
+        ])
+    if "is_closed" in df.columns:
+        df["is_closed"] = df["is_closed"].astype(bool)
+    return df
+
+
+def _normalise_address(s: str) -> str:
+    """Address1 normaliser used for matching closed → reopened accounts.
+
+    Upper-case, collapse internal whitespace, strip non-alphanumeric padding.
+    Returns ``""`` when the input is empty / too short to be a meaningful key
+    (we don't want every blank address to collide).
+    """
+    if s is None:
+        return ""
+    txt = str(s).upper().strip()
+    if not txt:
+        return ""
+    # Collapse whitespace, drop trailing punctuation.
+    txt = " ".join(txt.split())
+    # Reject obvious junk values (a single character, "N/A", placeholders).
+    if len(txt) < 4 or txt in {"N/A", "NA", "NONE", "UNKNOWN", "."}:
+        return ""
+    return txt
+
+
+def build_account_successor_map(
+    directory_df: pd.DataFrame,
+) -> tuple[dict[str, str], set[str], dict[str, dict]]:
+    """Match each closed account to an open successor at the same address.
+
+    Returns a tuple of:
+
+    1. ``successor_map`` — ``{closed_account_number: open_account_number}``.
+       Only includes closed accounts that share a normalised
+       :func:`_normalise_address` address with EXACTLY ONE open account
+       (unambiguous match). Closed accounts at addresses with multiple
+       open candidates are intentionally NOT remapped — they're surfaced
+       via ``closed_account_meta`` so the AI can mention the ambiguity.
+    2. ``closed_no_successor`` — set of closed account numbers that have
+       no open match (the account is simply closed, business lost).
+    3. ``closed_account_meta`` — ``{closed_account: {account_name,
+       address1, successor_account, successor_account_name}}`` for every
+       closed account, with ``successor_account`` populated only when an
+       unambiguous match exists.
+
+    The matching key is BADDR1 (street address) because closed-and-reopened
+    accounts at the same physical location share the address line. BBANK2
+    is unreliable for this — it's the legacy customer number, often blank
+    or reused.
+    """
+    successor_map: dict[str, str] = {}
+    closed_no_successor: set[str] = set()
+    meta: dict[str, dict] = {}
+    if directory_df is None or directory_df.empty:
+        return successor_map, closed_no_successor, meta
+
+    d = directory_df.copy()
+    d["account_number"] = d["account_number"].fillna("").astype(str).str.strip()
+    d["account_name"] = d["account_name"].fillna("").astype(str).str.strip()
+    d["address1"] = d["address1"].fillna("").astype(str)
+    d["addr_key"] = d["address1"].map(_normalise_address)
+    d["is_closed"] = d.get("is_closed", False).astype(bool)
+    d = d[d["account_number"] != ""]
+
+    # Group open accounts by address key for fast lookup.
+    open_by_addr: dict[str, list[dict]] = {}
+    for r in d[~d["is_closed"] & (d["addr_key"] != "")].to_dict("records"):
+        open_by_addr.setdefault(r["addr_key"], []).append(r)
+
+    closed_rows = d[d["is_closed"]].to_dict("records")
+    for r in closed_rows:
+        acct = r["account_number"]
+        addr = r["addr_key"]
+        rec = {
+            "account_name": r.get("account_name", "") or "",
+            "address1": r.get("address1", "") or "",
+            "successor_account": "",
+            "successor_account_name": "",
+        }
+        candidates = open_by_addr.get(addr, []) if addr else []
+        if len(candidates) == 1:
+            succ = candidates[0]
+            successor_map[acct] = succ["account_number"]
+            rec["successor_account"] = succ["account_number"]
+            rec["successor_account_name"] = succ.get("account_name", "") or ""
+        elif not candidates:
+            closed_no_successor.add(acct)
+        # >1 candidate => ambiguous, leave unmapped, no successor recorded.
+        meta[acct] = rec
+
+    return successor_map, closed_no_successor, meta
+
+
 # ----------------------------------------------------------------- sales
 def load_invoiced_sales(
     db: DatabaseConfig,
@@ -180,30 +286,51 @@ def load_blended_sales(
             for r in ax.to_dict("records")
         }
 
+    # Closed-account successor map: when a customer closed their old
+    # account number and reopened under a new BACCT# at the same physical
+    # address (same BADDR1), credit the OLD account's sales to the NEW
+    # account so the customer's history is unified. Sales totals are
+    # preserved exactly — only the ``account_number`` column changes for
+    # the affected rows, which then flow through the BILLSLMN-driven rep
+    # attribution above (picking up the successor's current owner).
+    successor_map: dict[str, str] = {}
+    try:
+        directory_df_ = load_account_directory(db)
+        successor_map, _closed_no_succ, _closed_meta = build_account_successor_map(
+            directory_df_
+        )
+    except Exception:  # noqa: BLE001
+        successor_map = {}
+
     # New-system portion
     new_start = max(start, NEW_SYSTEM_CUTOFF)
     if new_start <= end:
         new_df = load_invoiced_sales(db, new_start, end, cost_centers, prefix)
         if new_df is not None and not new_df.empty:
             new_df = new_df.copy()
+            new_df = new_df.reset_index(drop=True)
+            new_df["account_number"] = (
+                new_df["account_number"].fillna("").astype(str).str.strip()
+            )
+            new_df["cost_center"] = (
+                new_df["cost_center"].fillna("").astype(str).str.strip()
+            )
+            # Apply closed-account → successor remap BEFORE the rep
+            # merge so the open-account's current owner gets credit.
+            # This is a 1:1 relabel of account_number — row count and
+            # sum(revenue) are preserved exactly.
+            if successor_map:
+                new_df["account_number"] = new_df["account_number"].map(
+                    lambda a: successor_map.get(a, a)
+                )
             # Re-attribute each line to the CURRENT account owner per BILLSLMN
             # using a vectorized merge.
             #
             # Index note: load_invoiced_sales may return a boolean-filtered
             # slice of the per-month cache, giving a non-sequential index
             # (e.g. rows 0, 5, 12…). After the left-merge, `merged` gets a
-            # fresh RangeIndex (0..N-1). We MUST reset new_df's index first
-            # so that the final assignment aligns correctly; otherwise
-            # override.where(…, orig) would use pandas label-alignment and
-            # produce NaN everywhere the fallback fires.
+            # fresh RangeIndex (0..N-1). We've already reset the index above.
             if rep_map_df is not None and not rep_map_df.empty:
-                new_df = new_df.reset_index(drop=True)
-                new_df["account_number"] = (
-                    new_df["account_number"].fillna("").astype(str).str.strip()
-                )
-                new_df["cost_center"] = (
-                    new_df["cost_center"].fillna("").astype(str).str.strip()
-                )
                 merged = new_df.merge(
                     rep_map_df,
                     on=["account_number", "cost_center"],
@@ -232,6 +359,7 @@ def load_blended_sales(
             legacy = _unpivot_old_sales(
                 old_raw, start, legacy_end, cost_centers,
                 six_week_january_years, rep_map, prefix,
+                successor_map=successor_map,
             )
             if not legacy.empty:
                 legacy["data_source"] = "legacy"
@@ -260,6 +388,8 @@ def _unpivot_old_sales(
     six_week_january_years: Iterable[int],
     rep_map: dict[tuple[str, str], str] | None = None,
     code_prefix: str = "",
+    *,
+    successor_map: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """Unpivot ``ClydeMarketingHistory`` SalesPeriod1..12 / CostsPeriod1..12
     columns into one row per (account × cost center × fiscal period) within
@@ -275,6 +405,12 @@ def _unpivot_old_sales(
     df = raw.copy()
     df["cost_center"] = df["cost_center"].astype(str).str.strip()
     df["account_number"] = df["account_number"].fillna("").astype(str).str.strip()
+
+    # Closed-account → successor remap (preserves row count + sum(revenue)).
+    if successor_map:
+        df["account_number"] = df["account_number"].map(
+            lambda a: successor_map.get(a, a)
+        )
 
     if cost_centers:
         wanted = {str(c).strip() for c in cost_centers if c}
@@ -332,13 +468,32 @@ def load_open_orders(
     code_prefix: str = "",
 ) -> pd.DataFrame:
     """Open (un-invoiced) order lines. Useful for pipeline insights only —
-    never counted as salesman credit until the invoice posts."""
+    never counted as salesman credit until the invoice posts.
+
+    Closed accounts that have an open successor at the same address get
+    their ``account_number`` remapped so pipeline view matches the
+    unified-customer view used by invoiced sales.
+    """
     cc_csv = ",".join(c for c in (cost_centers or ()) if c)
-    return read_dataframe(
+    df = read_dataframe(
         db,
         queries.OPEN_ORDERS_LINES,
         params={"cc_csv": cc_csv, "code_prefix": (code_prefix or "").strip()},
     )
+    if df is not None and not df.empty and "account_number" in df.columns:
+        try:
+            directory_df_ = load_account_directory(db)
+            successor_map, _, _ = build_account_successor_map(directory_df_)
+            if successor_map:
+                df = df.copy()
+                df["account_number"] = (
+                    df["account_number"].fillna("").astype(str).str.strip().map(
+                        lambda a: successor_map.get(a, a)
+                    )
+                )
+        except Exception:  # noqa: BLE001
+            pass
+    return df
 
 
 # ----------------------------------------------------------------- displays

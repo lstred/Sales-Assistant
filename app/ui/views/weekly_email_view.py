@@ -2194,7 +2194,14 @@ def _build_master_bi_prompt(
         "• Dashboard summaries without interpretation\n"
         "• Excessive positivity masking real concerns\n"
         "• Percentages without accompanying dollar context\n"
-        "• Causation claims without strong supporting evidence"
+        "• Causation claims without strong supporting evidence\n"
+        "\n"
+        "CLOSED ACCOUNTS — CRITICAL RULE:\n"
+        "• Account labels suffixed with '[CLOSED]' are permanently closed (out of business or "
+        "moved away with no new account at the same address).\n"
+        "• Never recommend reps visit, call, or pursue a closed account.\n"
+        "• You MAY reference a closed account to explain a revenue drop or quantify lost "
+        "territory — but recommendations must always target OPEN accounts."
     )
 
     # Build the user message: aggregate data across all reps
@@ -2459,6 +2466,15 @@ def _build_rep_prompt(
         "(e.g. 'February–May 2026' or 'August 2025–May 2026')\n"
         "• Numbers from the L3M block if it is marked DATA NOT LOADED — any prior-3-month "
         "surge or decline percentage is FORBIDDEN when that flag is present; use yoy_3mo only\n"
+        "\n"
+        "CLOSED ACCOUNTS — CRITICAL RULE:\n"
+        "• Any account label suffixed with '[CLOSED]' is a permanently closed account.\n"
+        "• NEVER tell the rep to call, visit, follow up with, or re-engage a closed account — "
+        "the customer is gone and the doors are locked.\n"
+        "• You MAY mention a closed account ONCE to explain a revenue drop or pinpoint lost "
+        "business — frame it as 'replace this lost volume at active accounts X, Y, Z' and "
+        "name 2–3 specific active accounts the rep should target instead.\n"
+        "• Action items must always be aimed at OPEN accounts only.\n"
     )
     if scorecard.is_yoy_outlier:
         sys_msg += (

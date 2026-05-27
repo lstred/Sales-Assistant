@@ -172,6 +172,22 @@ LEFT JOIN dbo.BILLTO AS bt
 WHERE   h.[FiscalYear] BETWEEN :fy_start AND :fy_end
 """
 
+# ------------------------------------------------- full BILLTO directory
+# Every customer/account in BILLTO. Used to detect *CLSD* prefixed names
+# (closed accounts) and to find "reopen-under-new-number" successors by
+# matching BADDR1 (street address) between a closed account and an open
+# account at the same physical location.
+BILLTO_DIRECTORY = """
+SELECT  LTRIM(RTRIM(bt.[BACCT#]))           AS account_number,
+        LTRIM(RTRIM(bt.[BNAME]))            AS account_name,
+        LTRIM(RTRIM(bt.[BBANK2]))           AS old_account_number,
+        LTRIM(RTRIM(ISNULL(bt.[BADDR1], ''))) AS address1,
+        CASE WHEN LEFT(LTRIM(ISNULL(bt.[BNAME], '')), 1) = '*'
+             THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS is_closed
+FROM    dbo.BILLTO AS bt
+WHERE   ISNULL(LTRIM(RTRIM(bt.[BACCT#])), '') <> ''
+"""
+
 # ----------------------------------------------------- displays (CLASSES + BCACCT)
 DISPLAY_TYPES = """
 SELECT  LTRIM(RTRIM([CLCODE])) AS display_code,

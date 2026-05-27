@@ -1411,7 +1411,16 @@ class _AiReplyWorker(QThread):
                 "- 300 words maximum. If the answer is a table, the table IS the response.\n"
                 "- Plain text only — no markdown, no asterisks, no bullet symbols.\n"
                 "- Do NOT add a sign-off or closing pleasantry.\n"
-                "- End with ONE specific follow-up offer the warehouse can actually deliver."
+                "- End with ONE specific follow-up offer the warehouse can actually deliver.\n\n"
+
+                "CLOSED ACCOUNTS — CRITICAL:\n"
+                "- Account labels suffixed with '[CLOSED]' are permanently closed accounts.\n"
+                "- Closed accounts that reopened under a new BACCT# at the same address have\n"
+                "  ALREADY been merged into the open account's history automatically — the\n"
+                "  data you see already reflects the unified customer.\n"
+                "- Never instruct the rep to call, visit, or pursue a closed account.\n"
+                "- You MAY mention a closed account to explain a revenue drop or quantify lost\n"
+                "  territory — but recommendations must always target OPEN accounts."
             )
         else:
             system_msg = (
@@ -1467,7 +1476,16 @@ class _AiReplyWorker(QThread):
                 "Left-align names, right-align numbers. Include totals row where relevant.\n"
                 "- 100–220 words maximum. Plain text only — no markdown, no asterisks.\n"
                 "- Do NOT add a sign-off or closing pleasantry.\n"
-                "- End with ONE specific follow-up offer the warehouse can actually deliver."
+                "- End with ONE specific follow-up offer the warehouse can actually deliver.\n\n"
+
+                "CLOSED ACCOUNTS — CRITICAL:\n"
+                "- Account labels suffixed with '[CLOSED]' are permanently closed.\n"
+                "- Closed accounts that reopened under a new BACCT# at the same address have\n"
+                "  ALREADY been merged into the open account's history — the data already\n"
+                "  reflects the unified customer.\n"
+                "- Never tell the rep to call, visit, or re-engage a closed account.\n"
+                "- You may mention a closed account to explain lost business, but recommend\n"
+                "  open accounts where the rep can make up the volume."
             )
 
         sender_label = "MANAGER QUERY" if is_mgmt else f"Rep: {self._conv.rep_name or self._conv.rep_id}"

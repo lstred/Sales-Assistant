@@ -88,6 +88,14 @@ FORMATTING RULES — follow these strictly:
 - Format all dollar amounts with $ and thousands separators: $25,239.
 - Use GP% for profitability (gross profit as % of revenue).
 - When listing reps, use the name from the data; when listing accounts, use name + number.
+
+CLOSED ACCOUNTS:
+- Account labels suffixed with '[CLOSED]' are permanently closed accounts.
+- Accounts that reopened at the same physical address under a new BACCT# have ALREADY been merged
+  into the open account's history automatically — the data reflects the unified customer.
+- Never recommend a rep visit, call, or pursue a closed account.
+- You MAY reference a closed account to explain a revenue drop or quantify lost territory —
+  but every action item must target an OPEN account.
 """
 
 

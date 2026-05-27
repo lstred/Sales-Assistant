@@ -275,6 +275,7 @@ def compute_rep_scorecards(
             account_info[acct] = {
                 "old": getattr(r, "old_account_number", "") or "",
                 "name": getattr(r, "account_name", "") or "",
+                "is_closed": bool(getattr(r, "is_closed", False)),
             }
         a = a[a["salesman_name"] != ""]
         if "is_closed" in a.columns:
@@ -569,6 +570,7 @@ def _records_for_email(
             "account": acct,
             "old_account": meta.get("old", ""),
             "account_name": meta.get("name", ""),
+            "is_closed": bool(meta.get("is_closed", False)),
             "current": float(r.get("revenue_curr", 0.0)),
             "prior": float(r.get("revenue_prior", 0.0)),
             "delta": float(r.get("delta", 0.0)),
@@ -593,13 +595,16 @@ def format_account_label(rec: dict, *, style: str = "short") -> str:
     acct = str(rec.get("account", "") or "").strip()
     old = str(rec.get("old_account", "") or "").strip()
     name = str(rec.get("account_name", "") or "").strip()
+    is_closed = bool(rec.get("is_closed", False))
+    closed_tag = " [CLOSED]" if is_closed else ""
     if style == "long":
         bits = [acct]
         if name:
             bits.append("· " + name)
         if old and old != acct:
             bits.append(f"(#{old})")
-        return " ".join(bits).strip()
+        label = " ".join(bits).strip()
+        return label + closed_tag
     # short
     paren_bits: list[str] = []
     if old and old != acct:
@@ -607,8 +612,8 @@ def format_account_label(rec: dict, *, style: str = "short") -> str:
     if name:
         paren_bits.append(name)
     if paren_bits:
-        return f"{acct} ({' · '.join(paren_bits)})"
-    return acct
+        return f"{acct} ({' · '.join(paren_bits)}){closed_tag}"
+    return acct + closed_tag
 
 
 def _slice_revenue_by_rep(
