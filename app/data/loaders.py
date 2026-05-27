@@ -508,6 +508,24 @@ def load_display_placements(db: DatabaseConfig) -> pd.DataFrame:
     return df
 
 
+# --------------------------------------------------------- marketing programs
+def load_marketing_program_types(db: DatabaseConfig) -> pd.DataFrame:
+    """Return one row per marketing program (``CLASSES.CLCAT='MP'``)."""
+    return read_dataframe(db, queries.MARKETING_PROGRAM_TYPES)
+
+
+def load_marketing_program_placements(db: DatabaseConfig) -> pd.DataFrame:
+    """Return one row per (account, marketing_program) enrollment.
+
+    Mirrors :func:`load_display_placements` exactly but pulls
+    ``BCCAT='MP'`` rows instead of ``BCCAT='DT'``.
+    """
+    df = read_dataframe(db, queries.MARKETING_PROGRAM_PLACEMENTS)
+    if "enrolled_on" in df.columns:
+        df["enrolled_on"] = pd.to_datetime(df["enrolled_on"], errors="coerce")
+    return df
+
+
 def load_price_class_lookup(db: DatabaseConfig) -> dict[str, str]:
     """Return a ``{price_class_code: description}`` mapping from ``dbo.PRICE``.
 

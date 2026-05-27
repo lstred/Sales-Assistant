@@ -293,7 +293,26 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
-- **2026-05-27 (latest)** — Anti-hallucination: category integrity in weekly email + Ask AI auto-loads prior-year:
+- **2026-05-27 (latest)** — Marketing Programs feature (new menu + AI integration across all surfaces):
+  - **Goal**: Surface customer enrollment in marketing programs (e.g. CCA Buying Group, NRF Rebate Program) as first-class signal in every AI surface so the model can find correlations between program participation and rep/account success.
+  - **Data layer**:
+    - `app/data/queries.py`: new `MARKETING_PROGRAM_TYPES` (catalog: `dbo.CLASSES` where `CLCAT='MP'`) and `MARKETING_PROGRAM_PLACEMENTS` (per-account: `dbo.BILL_CD` where `BCCAT='MP'`, returns `enrolled_on` from `DateFormatted`). Both use `LEFT JOIN dbo.CLASSES` so orphan codes still surface.
+    - `app/data/loaders.py`: `load_marketing_program_types(db)` + `load_marketing_program_placements(db)`. Placements loader coerces `enrolled_on` via `pd.to_datetime(..., errors='coerce')`.
+  - **Config (`app/config/models.py`)** — three new fields on `AppConfig`:
+    - `marketing_program_categories: list[str]` (default `["CCA Buying Group", "NRF Rebate Program"]`).
+    - `marketing_program_category_by_code: dict[str, str]` (program code → category).
+    - `marketing_program_starred: list[str]` (codes flagged important).
+  - **Shared service `app/services/marketing_programs.py`**: `UNCATEGORIZED` constant, `normalise_placements`, `build_program_directory`, `summarise_for_ai(..., account_filter=None, max_lines=30)` (CATEGORY ROLL-UP + STARRED PROGRAMS + TOP PROGRAMS blocks), `per_account_program_lines(..., only_starred=False)`. Returns `""` when nothing meaningful exists so prompts never get noise.
+  - **UI `app/ui/views/marketing_programs_view.py`**: new sidebar entry "Marketing Programs". 5-column table (⭐ checkbox, Code, Description, Category combo, Enrolled count) with right-side panel listing enrolled accounts for the selected program. Search filter, "Add category…" via `QInputDialog`, persisted to `AppConfig`. Mirrors `CoreDisplaysView` styling.
+  - **`app/ui/main_window.py`**: imported view, added `("marketing", "Marketing Programs")` to `NAV_ITEMS` between core_displays and fiscal, wired into `_views`.
+  - **AI integration — all surfaces inject MP context + a MARKETING PROGRAMS rule into the system prompt**:
+    - **Conversations (`conversations_view.py`)**: `_AiReplyWorker` gained `_fetch_marketing_programs_block(account_filter=…)` helper. `_fetch_rep_data` now stashes `self._rep_accounts` + `self._rep_account_labels` so MP scope follows the rep's BILLSLMN territory. `_generate` appends the block to `warehouse_block` for both management (full scope) and rep (territory scope) branches. Rep mode also gets a per-account starred-program listing via `per_account_program_lines(..., only_starred=True)`. Both sys_msgs (mgmt + rep) gained a MARKETING PROGRAMS section.
+    - **Ask AI (`ai_chat_view.py`)**: lazy-cached `self._mp_types_df` / `self._mp_placements_df`. `_ask` injects `mp_block` (scoped to accounts present in the current filter DataFrame) between `prior_block` and `pc_ref` in the user message. `SYSTEM_PROMPT` gained a MARKETING PROGRAMS section emphasising starred-program priority + correlation-not-causation language.
+    - **Weekly Email (`weekly_email_view.py`)**: new `_ensure_marketing_programs`, `_marketing_programs_block(rep_accounts)`, `_accounts_for_rep(rep_key)` helpers. `_build_rep_prompt` + `_build_master_bi_prompt` gained `marketing_programs_block: str = ""` kwarg; callers pass per-rep scope (rep prompt) or `None` for full org (master). Both sys_msgs gained the MARKETING PROGRAMS rule.
+  - **Safety**: every MP fetch is wrapped in try/except returning `""` so AI flows never crash if MP data fails to load (table empty, column rename, etc.). MP queries don't touch invoice cache — no cache bump.
+  - **Tests**: new `tests/test_marketing_programs.py` with 4 cases (directory categorization+starring, scoping via `account_filter`, empty-input safety, `only_starred=True` filter). **38/38 tests pass.**
+
+- **2026-05-27 (previous latest)** — Anti-hallucination: category integrity in weekly email + Ask AI auto-loads prior-year:
   - **Root cause 1 (product-category mixing)**: `RepScorecard.price_class_top` carried only `(price_class, desc, revenue, gp_pct)` with no cost-center anchor. The weekly-email rep prompt also had no authoritative "SALES BY CATEGORY" block. The AI saw "TOP PRODUCTS" and "SALES BY COST CENTER" as two unconnected lists and invented narratives like "Carpet Residential top sellers: MW-H, DC4" when MW-H actually belongs to Carpet Commercial (different cost center).
   - **Fix 1 — `app/services/manager_analytics.py`**:
     - `RepScorecard` gains `cc_top: list[dict] = field(default_factory=list)` (top cost centers by revenue: `{cost_center, cost_center_name, revenue, gp_pct, lines, accounts}`).

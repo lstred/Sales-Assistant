@@ -189,6 +189,25 @@ class AppConfig(BaseModel):
     core_displays_by_cc: dict[str, list[str]] = Field(default_factory=dict)
     """Map cost-center code -> list of CLASSES.CLCODE values that count as 'core' displays."""
 
+    # ---------------- Marketing Programs (CLASSES/BILL_CD with CAT='MP') ----------------
+    marketing_program_categories: list[str] = Field(
+        default_factory=lambda: ["CCA Buying Group", "NRF Rebate Program"]
+    )
+    """High-level grouping options the manager can tag each marketing program with.
+    User can append new categories from the Marketing Programs view (e.g. "Co-op",
+    "Spiff"). Defaults to the two original options."""
+
+    marketing_program_category_by_code: dict[str, str] = Field(default_factory=dict)
+    """Map CLASSES.CLCODE (where CLCAT='MP') -> category name from
+    :attr:`marketing_program_categories`. Programs not in this map are
+    considered 'Uncategorized'."""
+
+    marketing_program_starred: list[str] = Field(default_factory=list)
+    """Marketing program codes the manager flagged as 'important'. The AI
+    surfaces these specifically in every analysis (per-rep email, master
+    leaderboard, conversations, Ask AI) so the user can hunt for correlations
+    between program enrollment and rep/account success."""
+
     rep_emails: dict[str, str] = Field(default_factory=dict)
     """Map SALESMAN.YSLMN# -> email address (overrides any other lookup)."""
 

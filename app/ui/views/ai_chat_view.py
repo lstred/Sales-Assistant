@@ -112,6 +112,16 @@ PRIOR-YEAR DATA (year-over-year comparisons):
 PLAIN LANGUAGE:
 - Speak the way a real sales manager talks. Avoid jargon like 'whitespace'. Say 'missing
   product category' or 'cross-sell gap' instead.
+
+MARKETING PROGRAMS:
+- When the user message includes a 'MARKETING PROGRAMS' block, use it to look for
+  correlations between program enrollment (e.g. CCA Buying Group, NRF Rebate Program)
+  and rep/account performance metrics already in the aggregates.
+- Programs flagged with '*' or listed under 'STARRED PROGRAMS' have been marked as
+  important by the manager — prioritise insights about them.
+- Correlation is not causation: never claim a program 'caused' growth. Speak in terms
+  of 'enrolled accounts are growing X% faster than non-enrolled accounts in scope'.
+- Never invent a program name, code, or category not present in the block.
 """
 
 
@@ -159,6 +169,9 @@ class AIChatView(QWidget):
         # Enrichment lookups loaded lazily when first ask is made
         self._pc_lookup: dict[str, str] = {}   # price_class_code -> description
         self._acct_lookup: dict[str, dict] = {}  # account_number -> {name, old}
+        # Marketing programs cache (loaded once per session in _ask).
+        self._mp_types_df = None
+        self._mp_placements_df = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -343,6 +356,16 @@ class AIChatView(QWidget):
                             self._acct_lookup[acct] = {"name": name, "old": old}
             except Exception:  # noqa: BLE001
                 pass
+        if self._mp_types_df is None or self._mp_placements_df is None:
+            try:
+                from app.data.loaders import (
+                    load_marketing_program_placements,
+                    load_marketing_program_types,
+                )
+                self._mp_types_df = load_marketing_program_types(self._get_db())
+                self._mp_placements_df = load_marketing_program_placements(self._get_db())
+            except Exception:  # noqa: BLE001
+                pass
 
         # Enrich the DataFrame copy: add price_class_desc so the CSV sent to
         # the AI uses descriptions, not 6-char codes.
@@ -452,6 +475,29 @@ class AIChatView(QWidget):
                 "requires a YoY comparison, tell the user to enable that option and re-run.\n"
             )
 
+        # Marketing-programs context — included automatically so the AI can
+        # look for correlations between program enrollment and account/rep
+        # performance. Scoped to accounts that appear in the loaded sales
+        # DataFrame so we don't drown the prompt in programs outside scope.
+        mp_block = ""
+        try:
+            from app.services.marketing_programs import summarise_for_ai
+            scope_accts: set[str] | None = None
+            if "account_number" in self._df.columns:
+                scope_accts = set(self._df["account_number"].dropna().astype(str).str.strip().unique())
+                scope_accts.discard("")
+            mp_summary = summarise_for_ai(
+                self._mp_placements_df,
+                self._mp_types_df,
+                self._cfg.marketing_program_category_by_code,
+                self._cfg.marketing_program_starred,
+                account_filter=scope_accts,
+            )
+            if mp_summary:
+                mp_block = "\n" + mp_summary
+        except Exception:  # noqa: BLE001
+            mp_block = ""
+
         user_msg = (
             f"Date range (invoice date): {s.isoformat()} to {e.isoformat()}\n"
             f"Cost centers in scope: {', '.join(ccs)}\n"
@@ -460,6 +506,7 @@ class AIChatView(QWidget):
             f"PRE-AGGREGATED TABLES (full dataset \u2014 use these for ranking "
             f"and totals):\n{agg_text}\n"
             f"{prior_block}"
+            f"{mp_block}"
             f"{pc_ref}"
             f"Question: {question}\n\n"
             f"FULL INVOICED LINES (CSV \u2014 all {len(df_enriched):,} rows, "

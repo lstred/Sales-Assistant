@@ -210,6 +210,33 @@ WHERE   LTRIM(RTRIM(b.[BCCAT])) = 'DT'
   AND   ISNULL(LTRIM(RTRIM(b.[BCACCT])), '') <> ''
 """
 
+# ----------------------------------------------------- marketing programs (CLASSES + BILL_CD, CAT='MP')
+# Marketing programs follow the EXACT same schema pattern as display types:
+#   • dbo.CLASSES with CLCAT='MP' = catalog of marketing programs.
+#   • dbo.BILL_CD with BCCAT='MP' = which accounts are enrolled in each program.
+# The manager can group programs into high-level categories (e.g. "CCA Buying
+# Group", "NRF Rebate Program") locally in the app for AI correlation analysis.
+MARKETING_PROGRAM_TYPES = """
+SELECT  LTRIM(RTRIM([CLCODE])) AS program_code,
+        LTRIM(RTRIM([CLDESC])) AS program_desc
+FROM    dbo.CLASSES
+WHERE   LTRIM(RTRIM([CLCAT])) = 'MP'
+ORDER BY [CLCODE]
+"""
+
+MARKETING_PROGRAM_PLACEMENTS = """
+SELECT  LTRIM(RTRIM(b.[BCACCT]))   AS account_number,
+        LTRIM(RTRIM(b.[BCCODE]))   AS program_code,
+        LTRIM(RTRIM(c.[CLDESC]))   AS program_desc,
+        b.[DateFormatted]          AS enrolled_on
+FROM    dbo.BILL_CD AS b
+LEFT JOIN dbo.CLASSES AS c
+    ON  LTRIM(RTRIM(c.[CLCODE])) = LTRIM(RTRIM(b.[BCCODE]))
+   AND  LTRIM(RTRIM(c.[CLCAT]))  = 'MP'
+WHERE   LTRIM(RTRIM(b.[BCCAT])) = 'MP'
+  AND   ISNULL(LTRIM(RTRIM(b.[BCACCT])), '') <> ''
+"""
+
 # Price class reference — unique (code → description) lookup from dbo.PRICE.
 # Used to enrich rep scorecards and weekly-email AI prompts with product-type
 # context (e.g. "WIN WIN", "ALLURE", "TOP GUN").

@@ -470,6 +470,9 @@ class WeeklyEmailView(QWidget):
         self._context_loaders: list[_ContextLoader] = []
         self._ai_workers: list[_AIDraftWorker] = []
         self._pending_ai_jobs = 0
+        # Marketing-programs cache (loaded lazily once per session).
+        self._mp_types_df: pd.DataFrame | None = None
+        self._mp_placements_df: pd.DataFrame | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -599,9 +602,84 @@ class WeeklyEmailView(QWidget):
         )
 
     # --------------------------------------------------------------- analytics
-    def _ensure_scorecards(self) -> None:
-        if self._scorecards or self._df is None:
+    def _ensure_marketing_programs(self) -> None:
+        """Lazily load the marketing-programs catalog + placements once."""
+        if self._mp_types_df is not None and self._mp_placements_df is not None:
             return
+        try:
+            from app.data.loaders import (
+                load_marketing_program_placements,
+                load_marketing_program_types,
+            )
+            db = self._get_db()
+            self._mp_types_df = load_marketing_program_types(db)
+            self._mp_placements_df = load_marketing_program_placements(db)
+        except Exception:  # noqa: BLE001
+            log.exception("marketing programs lazy-load failed")
+
+    def _marketing_programs_block(self, rep_accounts: set[str] | None) -> str:
+        """Return the formatted marketing-programs prompt block for the given scope."""
+        self._ensure_marketing_programs()
+        if self._mp_placements_df is None or self._mp_types_df is None:
+            return ""
+        try:
+            from app.services.marketing_programs import (
+                per_account_program_lines,
+                summarise_for_ai,
+            )
+            summary = summarise_for_ai(
+                self._mp_placements_df,
+                self._mp_types_df,
+                self._cfg.marketing_program_category_by_code,
+                self._cfg.marketing_program_starred,
+                account_filter=rep_accounts,
+            )
+            if not summary:
+                return ""
+            if rep_accounts:
+                acct_labels: dict[str, str] = {}
+                if self._assignments_df is not None and not self._assignments_df.empty:
+                    for _, r in self._assignments_df.iterrows():
+                        acct = str(r.get("account_number", "")).strip()
+                        if acct and acct in rep_accounts:
+                            nm = str(r.get("account_name", "")).strip().lstrip("*").strip()
+                            if nm:
+                                acct_labels[acct] = nm
+                lines = per_account_program_lines(
+                    self._mp_placements_df,
+                    self._mp_types_df,
+                    self._cfg.marketing_program_category_by_code,
+                    self._cfg.marketing_program_starred,
+                    rep_accounts,
+                    account_labels=acct_labels,
+                    only_starred=True,
+                )
+                if lines:
+                    summary += (
+                        "STARRED-PROGRAM ENROLLMENT BY ACCOUNT (this rep's territory):\n"
+                        + lines
+                    )
+            return summary
+        except Exception:  # noqa: BLE001
+            log.exception("marketing programs format failed")
+            return ""
+
+    def _accounts_for_rep(self, rep_key: str) -> set[str] | None:
+        """Return the rep's assigned account-number set from BILLSLMN."""
+        if self._assignments_df is None or self._assignments_df.empty:
+            return None
+        try:
+            sub = self._assignments_df[
+                self._assignments_df["salesman_name"].fillna("").astype(str).str.strip().str.upper()
+                == rep_key.strip().upper()
+            ]
+            accts = set(sub["account_number"].dropna().astype(str).str.strip())
+            accts.discard("")
+            return accts or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _ensure_scorecards(self) -> None:
         # Lazily load the price class lookup (small, static reference table).
         if not self._price_class_lookup:
             try:
@@ -756,6 +834,9 @@ class WeeklyEmailView(QWidget):
                 start=s, end=e,
                 week_lines=week_lines,
                 tone=tone,
+                marketing_programs_block=self._marketing_programs_block(
+                    self._accounts_for_rep(rep_key)
+                ),
             )
             ai_jobs.append((rep_key, system_msg, user_msg))
 
@@ -999,6 +1080,7 @@ class WeeklyEmailView(QWidget):
                     fb_end=fb_end,
                     wk_start=wk_start,
                     wk_end=wk_end,
+                    marketing_programs_block=self._marketing_programs_block(None),
                 )
                 provider = build_provider(self._cfg.ai)
                 bi_result = provider.complete(
@@ -2095,6 +2177,7 @@ def _build_master_bi_prompt(
     fb_end: date,
     wk_start: date,
     wk_end: date,
+    marketing_programs_block: str = "",
 ) -> tuple[str, str]:
     """Build (sys_msg, user_msg) for the master company-wide weekly BI briefing.
 
@@ -2217,7 +2300,17 @@ def _build_master_bi_prompt(
         "moved away with no new account at the same address).\n"
         "• Never recommend reps visit, call, or pursue a closed account.\n"
         "• You MAY reference a closed account to explain a revenue drop or quantify lost "
-        "territory — but recommendations must always target OPEN accounts."
+        "territory — but recommendations must always target OPEN accounts.\n"
+        "\n"
+        "MARKETING PROGRAMS:\n"
+        "• When a 'MARKETING PROGRAMS' block is included, treat it as the source of truth for "
+        "program enrollment (CCA Buying Group, NRF Rebate Program, etc.). Programs flagged "
+        "with '*' or under 'STARRED PROGRAMS' are manager priorities — surface insights about "
+        "them when they explain revenue / margin / retention patterns.\n"
+        "• Look for correlations: do enrolled accounts (or reps with high enrollment) grow "
+        "faster, retain better, carry more categories, or hold margin better than unenrolled "
+        "ones? Speak in correlation language, not causation.\n"
+        "• Never invent a program name, code, or category not present in the block."
     )
 
     # Build the user message: aggregate data across all reps
@@ -2321,6 +2414,7 @@ def _build_master_bi_prompt(
         + "\n".join(rep_lines)
         + stale_block
         + declining_block
+        + (f"\n\n{marketing_programs_block}" if marketing_programs_block else "")
     )
 
     return sys_msg, user_msg
@@ -2336,6 +2430,7 @@ def _build_rep_prompt(
     end: date,
     week_lines: dict,
     tone: int,
+    marketing_programs_block: str = "",
 ) -> tuple[str, str]:
     tone_word = (
         "extra-encouraging and warm" if tone >= 2
@@ -2507,6 +2602,15 @@ def _build_rep_prompt(
         "business — frame it as 'replace this lost volume at active accounts X, Y, Z' and "
         "name 2–3 specific active accounts the rep should target instead.\n"
         "• Action items must always be aimed at OPEN accounts only.\n"
+        "\n"
+        "MARKETING PROGRAMS:\n"
+        "• When a 'MARKETING PROGRAMS' block is included, treat it as the source of truth for "
+        "which of this rep's accounts are enrolled in programs (CCA Buying Group, NRF Rebate "
+        "Program, etc.). Programs flagged with '*' or under 'STARRED PROGRAMS' are manager "
+        "priorities — call out enrollment gaps or wins when relevant.\n"
+        "• Look for correlations: do enrolled accounts grow faster, retain better, or buy more "
+        "categories than unenrolled ones in this territory?\n"
+        "• Speak in correlation language, not causation. Never invent a program or category.\n"
     )
     if scorecard.is_yoy_outlier:
         sys_msg += (
@@ -2653,7 +2757,8 @@ def _build_rep_prompt(
         f"STALE ACCOUNTS (had revenue {prior_start_label}–{prior_end_label}, zero {start_label}–{end_label}):\n{stale_lines}\n\n"
         f"NEW ACCOUNTS (zero {prior_start_label}–{prior_end_label}, revenue {start_label}–{end_label}):\n{new_lines}\n"
         f"{week_block}\n"
-        f"NOTES:\n  " + ("\n  ".join(sc.notes) if sc.notes else "(none)")
+        + (f"\n{marketing_programs_block}\n" if marketing_programs_block else "")
+        + f"NOTES:\n  " + ("\n  ".join(sc.notes) if sc.notes else "(none)")
     )
     return sys_msg, user_msg
 

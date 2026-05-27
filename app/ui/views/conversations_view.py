@@ -205,6 +205,10 @@ class _AiReplyWorker(QThread):
         self._conv = conv
         self._messages = messages
         self._get_db = get_db
+        # Populated by _fetch_rep_data for rep-mode prompts so the marketing-
+        # programs block can be scoped to the rep's territory.
+        self._rep_accounts: set[str] | None = None
+        self._rep_account_labels: dict[str, str] = {}
 
     def run(self) -> None:
         try:
@@ -369,6 +373,11 @@ class _AiReplyWorker(QThread):
                 acct = str(r["account_number"]).strip()
                 acct_name_map[acct] = str(r.get("account_name", "")).strip().lstrip("*")
                 old_acct_map[acct] = str(r.get("old_account_number", "")).strip()
+
+            # Stash on self so other prompt sections (e.g. marketing programs)
+            # can scope their data to this rep's accounts.
+            self._rep_accounts = rep_accounts
+            self._rep_account_labels = dict(acct_name_map)
 
             # Load invoiced sales (product CCs only — prefix "0")
             df_cur = load_invoiced_sales(db, cur_start, cur_end, code_prefix="0")
@@ -1228,6 +1237,60 @@ class _AiReplyWorker(QThread):
             log.warning("Management data fetch failed: %s", exc)
             return ""
 
+    def _fetch_marketing_programs_block(self, *, account_filter: set[str] | None) -> str:
+        """Return a compact marketing-programs context block for the AI prompt.
+
+        When ``account_filter`` is given (rep mode), counts scope to those
+        accounts; otherwise (management mode) it covers the whole company.
+        Returns ``""`` on any error so the prompt never breaks.
+        """
+        if not self._get_db:
+            return ""
+        try:
+            from app.data.loaders import (
+                load_marketing_program_placements,
+                load_marketing_program_types,
+            )
+            from app.services.marketing_programs import (
+                per_account_program_lines,
+                summarise_for_ai,
+            )
+            db = self._get_db()
+            if db is None:
+                return ""
+            placements = load_marketing_program_placements(db)
+            programs = load_marketing_program_types(db)
+            summary = summarise_for_ai(
+                placements,
+                programs,
+                self._cfg.marketing_program_category_by_code,
+                self._cfg.marketing_program_starred,
+                account_filter=account_filter,
+            )
+            if not summary:
+                return ""
+            # In rep mode also list which of the rep's accounts hold starred
+            # programs (when there are any).
+            if account_filter:
+                lines = per_account_program_lines(
+                    placements,
+                    programs,
+                    self._cfg.marketing_program_category_by_code,
+                    self._cfg.marketing_program_starred,
+                    account_filter,
+                    account_labels=self._rep_account_labels,
+                    only_starred=True,
+                )
+                if lines:
+                    summary += (
+                        "STARRED-PROGRAM ENROLLMENT BY ACCOUNT (this rep's territory only):\n"
+                        + lines
+                    )
+            return summary
+        except Exception:  # noqa: BLE001
+            log.exception("marketing programs fetch failed")
+            return ""
+
     def _validate_draft(self, draft: str, warehouse_block: str) -> str:
         """Second AI pass: fact-check every number in the draft against source data.
 
@@ -1323,7 +1386,10 @@ class _AiReplyWorker(QThread):
             account_numbers = self._extract_account_numbers(all_text)
             account_detail = self._fetch_account_detail(account_numbers)
             open_orders = self._fetch_open_orders_data(is_management=True)
-            warehouse_block = "\n\n".join(x for x in [warehouse_data, account_detail, open_orders] if x)
+            mp_block = self._fetch_marketing_programs_block(account_filter=None)
+            warehouse_block = "\n\n".join(
+                x for x in [warehouse_data, account_detail, open_orders, mp_block] if x
+            )
         else:
             # Rep sender — scope to this rep's territory only.
             rep_data = self._fetch_rep_data()
@@ -1333,7 +1399,12 @@ class _AiReplyWorker(QThread):
             account_numbers = self._extract_account_numbers(all_text)
             account_detail = self._fetch_account_detail(account_numbers)
             open_orders = self._fetch_open_orders_data(is_management=False)
-            warehouse_block = "\n\n".join(x for x in [rep_data, account_detail, open_orders] if x)
+            mp_block = self._fetch_marketing_programs_block(
+                account_filter=self._rep_accounts
+            )
+            warehouse_block = "\n\n".join(
+                x for x in [rep_data, account_detail, open_orders, mp_block] if x
+            )
 
         if is_mgmt:
             system_msg = (
@@ -1420,7 +1491,16 @@ class _AiReplyWorker(QThread):
                 "  data you see already reflects the unified customer.\n"
                 "- Never instruct the rep to call, visit, or pursue a closed account.\n"
                 "- You MAY mention a closed account to explain a revenue drop or quantify lost\n"
-                "  territory — but recommendations must always target OPEN accounts."
+                "  territory — but recommendations must always target OPEN accounts.\n\n"
+
+                "MARKETING PROGRAMS:\n"
+                "- When a 'MARKETING PROGRAMS' block is present, use it to look for correlations\n"
+                "  between program enrollment and performance (revenue, growth, retention).\n"
+                "- Programs marked with a leading '*' or listed under 'STARRED PROGRAMS' have\n"
+                "  been flagged as important by the manager — prioritise insights about them.\n"
+                "- You may answer at the high-level category (e.g. 'CCA Buying Group') OR at\n"
+                "  the specific program code level. Never invent a program or category not\n"
+                "  present in the block."
             )
         else:
             system_msg = (
@@ -1485,7 +1565,14 @@ class _AiReplyWorker(QThread):
                 "  reflects the unified customer.\n"
                 "- Never tell the rep to call, visit, or re-engage a closed account.\n"
                 "- You may mention a closed account to explain lost business, but recommend\n"
-                "  open accounts where the rep can make up the volume."
+                "  open accounts where the rep can make up the volume.\n\n"
+
+                "MARKETING PROGRAMS:\n"
+                "- When a 'MARKETING PROGRAMS' block is present, use it to spot correlations\n"
+                "  between program enrollment and the rep's account performance. Programs\n"
+                "  marked with '*' or under 'STARRED PROGRAMS' were flagged as important by\n"
+                "  the manager — mention them when relevant. Never invent a program name or\n"
+                "  category not present in the block."
             )
 
         sender_label = "MANAGER QUERY" if is_mgmt else f"Rep: {self._conv.rep_name or self._conv.rep_id}"

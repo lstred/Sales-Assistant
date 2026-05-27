@@ -29,6 +29,7 @@ from app.ui.views.conversations_view import ConversationsView
 from app.ui.views.core_displays_view import CoreDisplaysView
 from app.ui.views.dashboard_view import DashboardView
 from app.ui.views.fiscal_calendar_view import FiscalCalendarView
+from app.ui.views.marketing_programs_view import MarketingProgramsView
 from app.ui.views.reps_view import RepsView
 from app.ui.views.sales_by_cc_view import SalesByCostCenterView
 from app.ui.views.sales_by_rep_view import SalesByRepView
@@ -54,6 +55,7 @@ NAV_ITEMS = [
     ("weekly_email",  "Weekly Email"),
     ("cc_mapping",    "CC Mapping"),
     ("core_displays", "Core Displays"),
+    ("marketing",     "Marketing Programs"),
     ("fiscal",        "Fiscal Calendar"),
     ("settings",      "Settings"),
     ("help",          "Help"),
@@ -122,6 +124,7 @@ class MainWindow(QMainWindow):
         self.budget_view = BudgetView(self._cfg, get_db=lambda: self._cfg.database)
         self.cc_mapping_view = CCMappingView(self._cfg, get_db=lambda: self._cfg.database)
         self.core_displays_view = CoreDisplaysView(self._cfg, get_db=lambda: self._cfg.database)
+        self.marketing_view = MarketingProgramsView(self._cfg, get_db=lambda: self._cfg.database)
         self.fiscal_view = FiscalCalendarView(self._cfg)
         self.help_view = HelpView()
         self.settings_view = SettingsView()
@@ -140,6 +143,7 @@ class MainWindow(QMainWindow):
             "budget":        self.budget_view,
             "cc_mapping":    self.cc_mapping_view,
             "core_displays": self.core_displays_view,
+            "marketing":     self.marketing_view,
             "fiscal":        self.fiscal_view,
             "settings":      self.settings_view,
             "help":          self.help_view,
