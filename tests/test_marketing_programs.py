@@ -7,6 +7,7 @@ from app.services.marketing_programs import (
     UNCATEGORIZED,
     account_program_maps,
     build_program_directory,
+    category_to_accounts_lines,
     per_account_program_lines,
     summarise_for_ai,
 )
@@ -124,3 +125,43 @@ def test_account_program_maps_all_programs_when_not_only_starred() -> None:
     assert cat_map["1001"] == {"CCA Buying Group", "NRF Rebate Program"}
     assert code_map["1001"] == {"CCA01", "NRF02"}
     assert cat_map["1003"] == {UNCATEGORIZED}
+
+
+def test_category_to_accounts_lines_lists_membership_and_skips_uncategorized() -> None:
+    cats = {"CCA01": "CCA Buying Group", "NRF02": "NRF Rebate Program"}
+    out = category_to_accounts_lines(
+        _placements_df(), _types_df(), cats, ["CCA01"],
+        account_labels={"1001": "ACME", "1002": "BETA"},
+    )
+    assert "[CCA Buying Group]" in out
+    assert "[NRF Rebate Program]" in out
+    # 1001 (in CCA + NRF) listed with label; 1002 (CCA only) listed.
+    assert "ACME [1001]" in out
+    assert "BETA [1002]" in out
+    # 1003 only in MISC9 (uncategorized) -> must NOT appear anywhere.
+    assert "[1003]" not in out
+    assert UNCATEGORIZED not in out
+
+
+def test_category_to_accounts_lines_respects_account_filter_and_truncates() -> None:
+    cats = {"CCA01": "CCA Buying Group"}
+    # Scope to a single account; output should reflect only that account.
+    out = category_to_accounts_lines(
+        _placements_df(), _types_df(), cats, [],
+        account_filter={"1002"},
+    )
+    assert "[1002]" in out
+    assert "[1001]" not in out
+
+    # Truncation: build a wider placements set and cap at 1.
+    big = pd.DataFrame(
+        [
+            {"account_number": f"{i:04d}", "program_code": "CCA01",
+             "program_desc": "CCA Spring Buy"}
+            for i in range(5)
+        ]
+    )
+    out2 = category_to_accounts_lines(
+        big, _types_df(), cats, [], max_per_category=1,
+    )
+    assert "and 4 more" in out2

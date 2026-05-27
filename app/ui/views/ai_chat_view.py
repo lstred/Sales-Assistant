@@ -584,12 +584,13 @@ class AIChatView(QWidget):
                         + "; Prior = " + prior_s.isoformat() + " to " + prior_e.isoformat() + "):"
                     ]
                     from app.services.marketing_programs import UNCATEGORIZED as _UNCAT
+                    _MAX_PER_CAT = 50  # cap to bound prompt size; full data still in CSV.
                     for cat in sorted(cat_to_accts.keys()):
                         if cat == _UNCAT:
                             continue  # skip noise; manager hasn't categorised these
                         rows = sorted(cat_to_accts[cat], key=lambda r: r[1], reverse=True)
                         lines.append(f"\n[{cat}] — {len(rows)} enrolled account(s) with activity in scope:")
-                        for acct, c_rev, p_rev in rows:
+                        for acct, c_rev, p_rev in rows[:_MAX_PER_CAT]:
                             info = self._acct_lookup.get(acct, {})
                             name = info.get("name", "")
                             old = info.get("old", "")
@@ -605,6 +606,11 @@ class AIChatView(QWidget):
                             lines.append(
                                 f"  - {label}: ${c_rev:,.0f} cur vs ${p_rev:,.0f} prior "
                                 f"({delta:+,.0f}, {pct_s}) — codes: {codes}"
+                            )
+                        if len(rows) > _MAX_PER_CAT:
+                            lines.append(
+                                f"  - … and {len(rows) - _MAX_PER_CAT} more (filter on "
+                                f"the CSV column 'marketing_categories' for the full list)"
                             )
                     mp_accounts_block = "\n" + "\n".join(lines) + "\n"
         except Exception:  # noqa: BLE001

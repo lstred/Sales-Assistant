@@ -220,6 +220,62 @@ def per_account_program_lines(
     return "\n".join(out) + "\n"
 
 
+def category_to_accounts_lines(
+    placements_df: pd.DataFrame | None,
+    program_types_df: pd.DataFrame | None,
+    category_by_code: dict[str, str] | None,
+    starred: Iterable[str] | None,
+    *,
+    account_filter: Iterable[str] | None = None,
+    account_labels: dict[str, str] | None = None,
+    max_per_category: int = 80,
+) -> str:
+    """Return an authoritative ``category -> accounts`` listing for AI prompts.
+
+    Unlike :func:`summarise_for_ai` (which emits aggregate counts) this lists the
+    actual enrolled accounts under each marketing category so a model asked
+    "which CCA accounts ..." cannot hallucinate the membership. UNCATEGORIZED
+    is intentionally skipped to keep prompts focused.
+    """
+    cat_map, _ = account_program_maps(
+        placements_df, program_types_df, category_by_code, starred,
+        only_starred=False,
+    )
+    if not cat_map:
+        return ""
+    scope: set[str] | None = None
+    if account_filter is not None:
+        scope = {str(a).strip() for a in account_filter if str(a).strip()}
+    labels = account_labels or {}
+
+    by_cat: dict[str, list[str]] = {}
+    for acct, cats in cat_map.items():
+        if scope is not None and acct not in scope:
+            continue
+        for cat in cats:
+            if cat == UNCATEGORIZED:
+                continue
+            by_cat.setdefault(cat, []).append(acct)
+
+    if not by_cat:
+        return ""
+
+    out: list[str] = [
+        "ACCOUNTS BY MARKETING CATEGORY (AUTHORITATIVE \u2014 for any question "
+        "naming a marketing category, use ONLY these accounts as ground truth; "
+        "never include an account outside its category heading):"
+    ]
+    for cat in sorted(by_cat.keys()):
+        accts = sorted(by_cat[cat])
+        out.append(f"\n[{cat}] \u2014 {len(accts)} enrolled account(s):")
+        for acct in accts[:max_per_category]:
+            lbl = labels.get(acct)
+            out.append(f"  - {lbl} [{acct}]" if lbl else f"  - [{acct}]")
+        if len(accts) > max_per_category:
+            out.append(f"  - \u2026 and {len(accts) - max_per_category} more (truncated for prompt size)")
+    return "\n".join(out) + "\n"
+
+
 def account_program_maps(
     placements_df: pd.DataFrame | None,
     program_types_df: pd.DataFrame | None,

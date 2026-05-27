@@ -624,6 +624,7 @@ class WeeklyEmailView(QWidget):
             return ""
         try:
             from app.services.marketing_programs import (
+                category_to_accounts_lines,
                 per_account_program_lines,
                 summarise_for_ai,
             )
@@ -636,6 +637,33 @@ class WeeklyEmailView(QWidget):
             )
             if not summary:
                 return ""
+            # Authoritative per-category account listing so the AI never
+            # invents which customers are in CCA / NRF / etc. Master mode
+            # (rep_accounts is None) covers the whole company; rep mode
+            # scopes to that rep's accounts.
+            # Build labels for ALL relevant accounts (master uses assignments,
+            # rep uses the per-rep subset).
+            label_map: dict[str, str] = {}
+            if self._assignments_df is not None and not self._assignments_df.empty:
+                for _, _r in self._assignments_df.iterrows():
+                    _a = str(_r.get("account_number", "")).strip()
+                    if not _a:
+                        continue
+                    if rep_accounts is not None and _a not in rep_accounts:
+                        continue
+                    _nm = str(_r.get("account_name", "")).strip().lstrip("*").strip()
+                    if _nm:
+                        label_map[_a] = _nm
+            cat_accts = category_to_accounts_lines(
+                self._mp_placements_df,
+                self._mp_types_df,
+                self._cfg.marketing_program_category_by_code,
+                self._cfg.marketing_program_starred,
+                account_filter=rep_accounts,
+                account_labels=label_map or None,
+            )
+            if cat_accts:
+                summary += "\n" + cat_accts
             if rep_accounts:
                 acct_labels: dict[str, str] = {}
                 if self._assignments_df is not None and not self._assignments_df.empty:

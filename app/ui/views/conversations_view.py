@@ -1252,6 +1252,7 @@ class _AiReplyWorker(QThread):
                 load_marketing_program_types,
             )
             from app.services.marketing_programs import (
+                category_to_accounts_lines,
                 per_account_program_lines,
                 summarise_for_ai,
             )
@@ -1269,6 +1270,20 @@ class _AiReplyWorker(QThread):
             )
             if not summary:
                 return ""
+            # Authoritative per-category account list — prevents the AI from
+            # guessing membership when asked questions like "which CCA
+            # accounts ...". Scoped to rep accounts in rep mode, full org in
+            # management mode.
+            cat_accts = category_to_accounts_lines(
+                placements,
+                programs,
+                self._cfg.marketing_program_category_by_code,
+                self._cfg.marketing_program_starred,
+                account_filter=account_filter,
+                account_labels=(self._rep_account_labels if account_filter else None),
+            )
+            if cat_accts:
+                summary += "\n" + cat_accts
             # In rep mode also list which of the rep's accounts hold starred
             # programs (when there are any).
             if account_filter:
