@@ -218,3 +218,37 @@ def per_account_program_lines(
     if not out:
         return ""
     return "\n".join(out) + "\n"
+
+
+def account_program_maps(
+    placements_df: pd.DataFrame | None,
+    program_types_df: pd.DataFrame | None,
+    category_by_code: dict[str, str] | None,
+    starred: Iterable[str] | None,
+    *,
+    only_starred: bool = False,
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Return ``(acct -> set[category], acct -> set[program_code])``.
+
+    When ``only_starred=True`` only starred programs (and the categories they
+    belong to) are included — used when the AI needs an authoritative answer
+    to "which accounts are in <starred category>" questions.
+    """
+    cat_map: dict[str, set[str]] = {}
+    code_map: dict[str, set[str]] = {}
+    placements = normalise_placements(placements_df)
+    if placements.empty:
+        return cat_map, code_map
+    directory = build_program_directory(program_types_df, category_by_code, starred)
+    for _, row in placements.iterrows():
+        code = str(row["program_code"]).strip()
+        acct = str(row["account_number"]).strip()
+        if not code or not acct:
+            continue
+        d = directory.get(code) or {"category": UNCATEGORIZED, "starred": False}
+        if only_starred and not d.get("starred"):
+            continue
+        cat = str(d["category"])
+        cat_map.setdefault(acct, set()).add(cat)
+        code_map.setdefault(acct, set()).add(code)
+    return cat_map, code_map

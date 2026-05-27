@@ -122,6 +122,22 @@ MARKETING PROGRAMS:
 - Correlation is not causation: never claim a program 'caused' growth. Speak in terms
   of 'enrolled accounts are growing X% faster than non-enrolled accounts in scope'.
 - Never invent a program name, code, or category not present in the block.
+
+CATEGORY-SCOPED ACCOUNT QUESTIONS — CRITICAL:
+- For ANY question that names a marketing category or program (e.g. 'which CCA accounts
+  grew', 'list NRF Rebate Program customers that declined', 'top CCA Buying Group
+  accounts'), you MUST answer using ONLY accounts that appear in the
+  'ACCOUNTS BY MARKETING CATEGORY' block under that exact category heading.
+- An account is "in CCA Buying Group" if and only if it is listed under the
+  '[CCA Buying Group]' heading in that block. Do NOT include any account that is not
+  under that heading, no matter how its name reads. The category heading is the
+  authoritative enrollment list.
+- Each row in the FULL INVOICED LINES CSV also carries 'marketing_categories' and
+  'marketing_program_codes' columns. If you filter the CSV by category, only include
+  rows whose 'marketing_categories' column contains that exact category string.
+- If the named category has zero matching accounts with activity in scope, say so
+  plainly ("No CCA Buying Group accounts have invoiced revenue in the current window").
+  Never substitute a non-enrolled account to make the answer non-empty.
 """
 
 
@@ -377,6 +393,33 @@ class AIChatView(QWidget):
                 )
             )
 
+        # Enrich each row with the account's marketing-program categories +
+        # starred-program codes so the AI can FILTER the CSV deterministically
+        # by questions like "which CCA accounts grew?". Without these columns
+        # the model has no per-row way to know which accounts are in CCA and
+        # ends up picking arbitrary accounts.
+        acct_cat_map: dict[str, set[str]] = {}
+        acct_code_map: dict[str, set[str]] = {}
+        try:
+            from app.services.marketing_programs import account_program_maps
+            acct_cat_map, acct_code_map = account_program_maps(
+                self._mp_placements_df,
+                self._mp_types_df,
+                self._cfg.marketing_program_category_by_code,
+                self._cfg.marketing_program_starred,
+                only_starred=False,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        if acct_cat_map and "account_number" in df_enriched.columns:
+            acct_col = df_enriched["account_number"].astype(str).str.strip()
+            df_enriched["marketing_categories"] = acct_col.map(
+                lambda a: "; ".join(sorted(acct_cat_map.get(a, set()))) or ""
+            )
+            df_enriched["marketing_program_codes"] = acct_col.map(
+                lambda a: ",".join(sorted(acct_code_map.get(a, set()))) or ""
+            )
+
         # Full dataset — no row cap. The aggregate tables handle large datasets
         # efficiently; the raw CSV is also sent in full so the AI can answer
         # line-level questions without losing data.
@@ -498,6 +541,75 @@ class AIChatView(QWidget):
         except Exception:  # noqa: BLE001
             mp_block = ""
 
+        # Authoritative per-category × account revenue block. For each
+        # marketing category (CCA Buying Group, NRF Rebate Program, …) list
+        # EVERY enrolled account that has revenue in scope, with current and
+        # prior-year totals + delta. This is the ONLY source of truth for
+        # "which <category> accounts grew / shrank" questions — without it
+        # the model has no per-account answer and hallucinates.
+        mp_accounts_block = ""
+        try:
+            if acct_cat_map and "account_number" in self._df.columns:
+                import pandas as _pd
+                cur = (
+                    self._df.groupby(
+                        self._df["account_number"].astype(str).str.strip()
+                    )["revenue"].sum()
+                    if "revenue" in self._df.columns else _pd.Series(dtype=float)
+                )
+                if self._prior_df is not None and not self._prior_df.empty and \
+                   "account_number" in self._prior_df.columns and "revenue" in self._prior_df.columns:
+                    prior = self._prior_df.groupby(
+                        self._prior_df["account_number"].astype(str).str.strip()
+                    )["revenue"].sum()
+                else:
+                    prior = _pd.Series(dtype=float)
+
+                # Build category -> list of (acct, cur, prior)
+                cat_to_accts: dict[str, list[tuple[str, float, float]]] = {}
+                for acct, cats in acct_cat_map.items():
+                    c_rev = float(cur.get(acct, 0.0) or 0.0)
+                    p_rev = float(prior.get(acct, 0.0) or 0.0)
+                    if c_rev == 0.0 and p_rev == 0.0:
+                        continue  # not in scope window
+                    for cat in cats:
+                        cat_to_accts.setdefault(cat, []).append((acct, c_rev, p_rev))
+
+                if cat_to_accts:
+                    lines: list[str] = [
+                        "ACCOUNTS BY MARKETING CATEGORY (AUTHORITATIVE — for any "
+                        "question asking about a specific marketing category, use "
+                        "ONLY these accounts. Do not pick accounts outside this "
+                        "list. Current = " + s.isoformat() + " to " + e.isoformat()
+                        + "; Prior = " + prior_s.isoformat() + " to " + prior_e.isoformat() + "):"
+                    ]
+                    from app.services.marketing_programs import UNCATEGORIZED as _UNCAT
+                    for cat in sorted(cat_to_accts.keys()):
+                        if cat == _UNCAT:
+                            continue  # skip noise; manager hasn't categorised these
+                        rows = sorted(cat_to_accts[cat], key=lambda r: r[1], reverse=True)
+                        lines.append(f"\n[{cat}] — {len(rows)} enrolled account(s) with activity in scope:")
+                        for acct, c_rev, p_rev in rows:
+                            info = self._acct_lookup.get(acct, {})
+                            name = info.get("name", "")
+                            old = info.get("old", "")
+                            label = (
+                                f"{name} (#{old}) [{acct}]" if name and old
+                                else f"{name} [{acct}]" if name
+                                else f"[{acct}]"
+                            )
+                            codes = ",".join(sorted(acct_code_map.get(acct, set())))
+                            delta = c_rev - p_rev
+                            pct = (delta / p_rev * 100.0) if p_rev > 0 else None
+                            pct_s = f"{pct:+.1f}%" if pct is not None else "n/a"
+                            lines.append(
+                                f"  - {label}: ${c_rev:,.0f} cur vs ${p_rev:,.0f} prior "
+                                f"({delta:+,.0f}, {pct_s}) — codes: {codes}"
+                            )
+                    mp_accounts_block = "\n" + "\n".join(lines) + "\n"
+        except Exception:  # noqa: BLE001
+            mp_accounts_block = ""
+
         user_msg = (
             f"Date range (invoice date): {s.isoformat()} to {e.isoformat()}\n"
             f"Cost centers in scope: {', '.join(ccs)}\n"
@@ -507,10 +619,12 @@ class AIChatView(QWidget):
             f"and totals):\n{agg_text}\n"
             f"{prior_block}"
             f"{mp_block}"
+            f"{mp_accounts_block}"
             f"{pc_ref}"
             f"Question: {question}\n\n"
             f"FULL INVOICED LINES (CSV \u2014 all {len(df_enriched):,} rows, "
-            f"price_class_desc column added for readability):\n{csv_text}"
+            f"price_class_desc + marketing_categories + marketing_program_codes "
+            f"columns added):\n{csv_text}"
         )
 
         self.transcript.append(

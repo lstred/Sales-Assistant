@@ -5,6 +5,7 @@ import pandas as pd
 
 from app.services.marketing_programs import (
     UNCATEGORIZED,
+    account_program_maps,
     build_program_directory,
     per_account_program_lines,
     summarise_for_ai,
@@ -97,3 +98,29 @@ def test_per_account_program_lines_only_starred_filters_accounts() -> None:
     assert "1003" not in out
     # Starred programs should have a trailing '*' marker.
     assert "CCA01*" in out
+
+
+def test_account_program_maps_only_starred_excludes_non_starred() -> None:
+    cats = {"CCA01": "CCA Buying Group", "NRF02": "NRF Rebate Program"}
+    starred = ["CCA01"]  # NRF02 not starred
+    cat_map, code_map = account_program_maps(
+        _placements_df(), _types_df(), cats, starred, only_starred=True
+    )
+    # 1001 is in CCA01 (starred) AND NRF02 (not starred) — only CCA should appear.
+    assert cat_map["1001"] == {"CCA Buying Group"}
+    assert code_map["1001"] == {"CCA01"}
+    # 1002 is in CCA01 only.
+    assert cat_map["1002"] == {"CCA Buying Group"}
+    # 1003 is only in MISC9 (not starred) — must be absent entirely.
+    assert "1003" not in cat_map
+    assert "1003" not in code_map
+
+
+def test_account_program_maps_all_programs_when_not_only_starred() -> None:
+    cats = {"CCA01": "CCA Buying Group", "NRF02": "NRF Rebate Program"}
+    cat_map, code_map = account_program_maps(
+        _placements_df(), _types_df(), cats, [], only_starred=False
+    )
+    assert cat_map["1001"] == {"CCA Buying Group", "NRF Rebate Program"}
+    assert code_map["1001"] == {"CCA01", "NRF02"}
+    assert cat_map["1003"] == {UNCATEGORIZED}

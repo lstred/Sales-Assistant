@@ -293,7 +293,18 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
-- **2026-05-27 (latest)** — Marketing Programs feature (new menu + AI integration across all surfaces):
+- **2026-05-27 (latest)** — Ask AI: per-account marketing-category filter (fixes "CCA accounts" returning non-CCA accounts):
+  - **Root cause**: When the user asked "What CCA accounts have increased their sales for the last 90 days vs last year", Ask AI returned KMAF ASSOCIATES (#51149) and KENNY ENTERPRISES (#50816) — both *declining*, and described them as "in the CCA Buying Group" without ground truth. The injected MP block (`summarise_for_ai`) only emitted aggregate counts ("CCA Buying Group: 73 enrolled accounts") with no per-account mapping, and the FULL CSV rows had no `marketing_categories` column. The AI had no way to WHERE-filter accounts by category, so it guessed.
+  - **`app/services/marketing_programs.py`**: new `account_program_maps(placements_df, types_df, category_by_code, starred, *, only_starred=False) -> (cat_map, code_map)`. Returns `{acct: {category, ...}}` and `{acct: {program_code, ...}}`. When `only_starred=True`, restricts to starred programs (and the categories they belong to).
+  - **`app/ui/views/ai_chat_view.py` `_ask()`**:
+    1. Builds `acct_cat_map` + `acct_code_map` via `account_program_maps(..., only_starred=False)` after lazy-loading MP DataFrames.
+    2. Adds two new columns to the CSV sent to the AI: `marketing_categories` (semicolon-joined category names per row's account) and `marketing_program_codes` (comma-joined program codes). The AI can now filter the CSV deterministically by category.
+    3. Adds a new authoritative `ACCOUNTS BY MARKETING CATEGORY` block between the existing MP block and the price-class reference. For each category (except UNCATEGORIZED), lists every enrolled account with activity in scope, with current period revenue, prior-period revenue, $ delta, and % delta — sorted desc by current revenue. Uses `self._acct_lookup` for `NAME (#old) [acct]` labels. Marked AUTHORITATIVE with explicit date-range labels.
+    4. `SYSTEM_PROMPT` gains a `CATEGORY-SCOPED ACCOUNT QUESTIONS — CRITICAL` section instructing the AI that for ANY question naming a marketing category, it MUST use only accounts under that exact category heading in the new block, MUST filter CSV rows by `marketing_categories`, and MUST say "No <category> accounts have invoiced revenue in the current window" when zero match — never substitute a non-enrolled account.
+  - **Tests**: 2 new — `test_account_program_maps_only_starred_excludes_non_starred` and `test_account_program_maps_all_programs_when_not_only_starred`. **40/40 pass.**
+
+- **2026-05-27 (previous latest)** — Marketing Programs feature (new menu + AI integration across all surfaces):
+
   - **Goal**: Surface customer enrollment in marketing programs (e.g. CCA Buying Group, NRF Rebate Program) as first-class signal in every AI surface so the model can find correlations between program participation and rep/account success.
   - **Data layer**:
     - `app/data/queries.py`: new `MARKETING_PROGRAM_TYPES` (catalog: `dbo.CLASSES` where `CLCAT='MP'`) and `MARKETING_PROGRAM_PLACEMENTS` (per-account: `dbo.BILL_CD` where `BCCAT='MP'`, returns `enrolled_on` from `DateFormatted`). Both use `LEFT JOIN dbo.CLASSES` so orphan codes still surface.
