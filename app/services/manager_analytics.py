@@ -78,7 +78,8 @@ class RepScorecard:
     peer_count: int = 0
     is_yoy_outlier: bool = False            # True when YoY is so extreme it
                                             # would skew peer comparisons
-    price_class_top: list[dict] = field(default_factory=list)  # top price classes
+    price_class_top: list[dict] = field(default_factory=list)  # top price classes (each tagged with its cost_center)
+    cc_top: list[dict] = field(default_factory=list)  # sales by cost center (category) for this rep
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -183,6 +184,7 @@ def compute_rep_scorecards(
     core_displays_by_cc: dict[str, list[str]] | None = None,
     sample_to_product_cc: dict[str, str] | None = None,
     price_class_lookup: dict[str, str] | None = None,
+    cc_name_lookup: dict[str, str] | None = None,
     selected_ccs: list[str] | None = None,
     today: date | None = None,
 ) -> dict[str, RepScorecard]:
@@ -476,8 +478,9 @@ def compute_rep_scorecards(
                 "product lines — this metric is omitted from the email."
             )
 
-        # Top price classes (by revenue) for this rep — used to surface
-        # product-type patterns in the coaching email and AI prompt.
+        # Top price classes (by revenue) for this rep — each tagged with the
+        # cost center it belongs to so the AI cannot mis-group products under
+        # a category they do not belong to.
         pc_top: list[dict] = []
         if "price_class" in sales.columns:
             rep_pc = sales[
@@ -486,7 +489,11 @@ def compute_rep_scorecards(
                 & (sales["price_class"].astype(str).str.strip() != "")
             ]
             if not rep_pc.empty:
-                pc_grp = rep_pc.groupby("price_class", as_index=False).agg(
+                # Group by (price_class, cost_center) so each row is anchored
+                # to its category. A product code appears under exactly one CC.
+                pc_grp = rep_pc.groupby(
+                    ["price_class", "cost_center"], as_index=False
+                ).agg(
                     revenue=("revenue", "sum"),
                     gross_profit=("gross_profit", "sum"),
                     lines=("revenue", "size"),
@@ -494,18 +501,48 @@ def compute_rep_scorecards(
                 pc_grp = pc_grp.sort_values("revenue", ascending=False).head(8)
                 for r in pc_grp.to_dict("records"):
                     pc = str(r.get("price_class") or "").strip()
-                    # Use "" as the default so the caller's `desc or code` fallback works.
+                    cc = str(r.get("cost_center") or "").strip()
                     desc = (price_class_lookup or {}).get(pc) or ""
+                    cc_name = (cc_name_lookup or {}).get(cc) or ""
                     rev_pc = float(r.get("revenue") or 0.0)
                     gp_pc = float(r.get("gross_profit") or 0.0)
                     gp_pct_pc = (gp_pc / rev_pc * 100.0) if rev_pc else 0.0
                     pc_top.append({
                         "price_class": pc,
                         "desc": desc,
+                        "cost_center": cc,
+                        "cost_center_name": cc_name,
                         "revenue": rev_pc,
                         "gp_pct": round(gp_pct_pc, 1),
                         "lines": int(r.get("lines") or 0),
                     })
+
+        # Sales by Cost Center (Category) for this rep — gives the AI the
+        # ground-truth category breakdown so it never invents a category.
+        cc_top: list[dict] = []
+        rep_cc = sales[(sales["rep_key"] == rep_key) & (sales["cost_center"].astype(str).str.strip() != "")]
+        if not rep_cc.empty:
+            cc_grp = rep_cc.groupby("cost_center", as_index=False).agg(
+                revenue=("revenue", "sum"),
+                gross_profit=("gross_profit", "sum"),
+                lines=("revenue", "size"),
+                accounts=("account_number", "nunique"),
+            )
+            cc_grp = cc_grp.sort_values("revenue", ascending=False)
+            for r in cc_grp.to_dict("records"):
+                cc = str(r.get("cost_center") or "").strip()
+                cc_name = (cc_name_lookup or {}).get(cc) or ""
+                rev_cc = float(r.get("revenue") or 0.0)
+                gp_cc = float(r.get("gross_profit") or 0.0)
+                gp_pct_cc = (gp_cc / rev_cc * 100.0) if rev_cc else 0.0
+                cc_top.append({
+                    "cost_center": cc,
+                    "cost_center_name": cc_name,
+                    "revenue": rev_cc,
+                    "gp_pct": round(gp_pct_cc, 1),
+                    "lines": int(r.get("lines") or 0),
+                    "accounts": int(r.get("accounts") or 0),
+                })
 
         out[rep_key] = RepScorecard(
             rep_key=rep_key,
@@ -550,6 +587,7 @@ def compute_rep_scorecards(
             peer_count=len(peer_yoys),
             is_yoy_outlier=(rep_key in rep_outliers),
             price_class_top=pc_top,
+            cc_top=cc_top,
             notes=notes,
         )
     return out

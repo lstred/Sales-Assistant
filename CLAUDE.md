@@ -293,7 +293,31 @@ CREATE-IF-NOT-EXISTS at startup, defined in `app/storage/schema.py`:
 Newest first. Older entries are condensed at the bottom of the list —
 read those plus this file's earlier sections for full context.
 
-- **2026-05-26 (latest)** — Closed-account → open-successor merge + AI "no visits to closed accounts" rule:
+- **2026-05-27 (latest)** — Anti-hallucination: category integrity in weekly email + Ask AI auto-loads prior-year:
+  - **Root cause 1 (product-category mixing)**: `RepScorecard.price_class_top` carried only `(price_class, desc, revenue, gp_pct)` with no cost-center anchor. The weekly-email rep prompt also had no authoritative "SALES BY CATEGORY" block. The AI saw "TOP PRODUCTS" and "SALES BY COST CENTER" as two unconnected lists and invented narratives like "Carpet Residential top sellers: MW-H, DC4" when MW-H actually belongs to Carpet Commercial (different cost center).
+  - **Fix 1 — `app/services/manager_analytics.py`**:
+    - `RepScorecard` gains `cc_top: list[dict] = field(default_factory=list)` (top cost centers by revenue: `{cost_center, cost_center_name, revenue, gp_pct, lines, accounts}`).
+    - `compute_rep_scorecards()` gains `cc_name_lookup: dict[str, str] | None = None` kwarg.
+    - `pc_top` build is now `groupby(["price_class","cost_center"])` so every top-product entry carries its actual `cost_center` (and resolved `cost_center_name`). A product that appears in two CCs (rare) shows as two separate entries — accurate, not mixed.
+    - New `cc_top` build aggregates the rep's sales by `cost_center`, producing the authoritative per-category totals.
+  - **Fix 2 — `app/ui/views/weekly_email_view.py`**:
+    - `_ensure_scorecards()` builds a `cc_name_map` from `self.filter_bar.cc._df` and passes it as `cc_name_lookup` to `compute_rep_scorecards()`.
+    - `_build_rep_prompt()` user_msg now emits a `SALES BY CATEGORY / COST CENTER (AUTHORITATIVE)` block built from `sc.cc_top` BEFORE `TOP PRODUCTS BY REVENUE`. Every `TOP PRODUCTS` line is now prefixed with `[CATEGORY NAME]` (or `[UNCLASSIFIED]`).
+    - Rep `sys_msg` gains a `CATEGORY INTEGRITY — CRITICAL ANTI-HALLUCINATION RULE` section: (a) SALES BY CATEGORY is the only source of truth for category names/totals; (b) every product MUST stay under its bracket-tagged category; (c) a category absent from SALES BY CATEGORY = zero sales there.
+    - Section 2 (CATEGORY PERFORMANCE) instructions rewritten to point at the new authoritative block.
+  - **Root cause 2 ("whitespace" jargon)**: 5 prompt occurrences in `weekly_email_view.py` instructed the AI to flag "whitespace" — a term users found unintuitive. The AI was parroting it in output emails.
+  - **Fix 3**: All 5 occurrences replaced with plain English ("missing product category", "cross-sell gap", "accounts missing complementary product lines", "MISSING-CATEGORY OPPORTUNITIES"). Both rep and master prompts now explicitly forbid the term "whitespace". CSS `white-space:nowrap` in other files is untouched (not jargon).
+  - **Root cause 3 (Ask AI YoY refusal)**: `AIChatView` only connected to `SalesFilterBar.sales_loaded` (current-window df), never to `sales_loaded_with_prior`. So `self._prior_df` was never populated. When asked "which rep grew the most in last 90 days vs same window last year", the AI honestly answered it only had current-period data.
+  - **Fix 4 — `app/ui/views/ai_chat_view.py`**:
+    - `__init__` adds `self._prior_df: pd.DataFrame | None = None`.
+    - Signal connect switched from `sales_loaded` → `sales_loaded_with_prior`; `_on_loaded(df)` is now `_on_loaded(df, prior_df=None)` and stores both.
+    - `_ask()` computes `prior_agg = aggregate_for_ai(self._prior_df)` when present, formats it via `_format_aggregates(...)`, and injects a `PRIOR-YEAR SAME WINDOW AGGREGATES (YYYY-MM-DD to YYYY-MM-DD — use these for year-over-year comparisons)` block into the user_msg. Prior CSV is NOT sent (token budget); aggregates are sufficient for ranking/growth questions.
+    - When prior-year is not loaded, a clear instruction tells the AI to direct the user to enable "Also load prior year" on the filter bar.
+    - `SYSTEM_PROMPT` gains a `PRIOR-YEAR DATA (year-over-year comparisons)` section that mandates use of the prior block and forbids YoY refusal when the block is present. Also gains a `PLAIN LANGUAGE` section forbidding "whitespace".
+    - Header subtitle updated to mention auto-loaded prior-year data.
+  - **Tests**: 34/34 pass. Import smoke test of all three modified modules passes.
+
+- **2026-05-26 (previous latest)** — Closed-account → open-successor merge + AI "no visits to closed accounts" rule:
   - **Root cause**: When a customer closes and reopens at the same physical address under a new BACCT#, `dbo.BILLTO` keeps both rows — the closed one (`BNAME` starts with `*`, often `*CLSD*`) and the new open one. Sales attributed to the old number stay stranded there. Reps would see the closed account flagged as "stale — win back" and the new (open) account analysed separately, undercounted. Worse, the AI sometimes told reps to "visit" or "call" closed accounts that are physically out of business.
   - **Fix 1 — BILLTO directory + successor map** in `app/data/loaders.py`:
     - New SQL `BILLTO_DIRECTORY` returns `account_number`, `account_name`, `old_account_number` (BBANK2), `address1` (BADDR1), and `is_closed` (BNAME starts with `*`).

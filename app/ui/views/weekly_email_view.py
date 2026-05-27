@@ -646,6 +646,20 @@ class WeeklyEmailView(QWidget):
             else self._prior_df
         )
 
+        # Build a CC code -> CC name map so RepScorecard rows tag each
+        # product with its Cost Center category (anti-hallucination guardrail).
+        cc_name_map: dict[str, str] = {}
+        cc_df = getattr(self.filter_bar.cc, "_df", None)
+        if cc_df is not None and not cc_df.empty and "cost_center" in cc_df.columns:
+            try:
+                cc_name_map = {
+                    str(r["cost_center"]).strip(): str(r.get("cost_center_name") or "").strip()
+                    for _, r in cc_df.iterrows()
+                    if str(r.get("cost_center", "")).strip()
+                }
+            except Exception:  # noqa: BLE001
+                cc_name_map = {}
+
         self._scorecards = compute_rep_scorecards(
             sc_df,
             prior_df=sc_prior,
@@ -655,6 +669,7 @@ class WeeklyEmailView(QWidget):
             core_displays_by_cc=self._cfg.core_displays_by_cc,
             sample_to_product_cc=self._cfg.sample_to_product_cc,
             price_class_lookup=self._price_class_lookup or None,
+            cc_name_lookup=cc_name_map or None,
             selected_ccs=self.filter_bar.selected_codes() or None,
         )
         s, e = self.filter_bar.date_range()
@@ -2112,8 +2127,9 @@ def _build_master_bi_prompt(
         "stalled sample-to-sale conversion is an early warning.\n"
         "4. DISPLAY EFFECTIVENESS: Compare accounts with vs without displays. Display accounts "
         "should outperform — if they don't, that's a key insight.\n"
-        "5. CATEGORY WHITESPACE: Identify accounts or territories underpenetrated in "
-        "complementary categories — cross-selling opportunities.\n"
+        "5. MISSING-CATEGORY OPPORTUNITIES: Identify accounts or territories under-penetrated "
+        "in complementary product categories — cross-selling opportunities. Use plain "
+        "English; do NOT use the term 'whitespace'.\n"
         "6. EARLY WARNINGS: Slowing order frequency, narrowing category breadth, margin drift, "
         "or declining sample activity are risk signals — name them before they hit revenue.\n"
         "7. AVOID MISLEADING CONCLUSIONS: Distinguish likely correlation, strong correlation, "
@@ -2156,13 +2172,13 @@ def _build_master_bi_prompt(
         "   • Fastest-growing and weakening categories\n"
         "   • Margin shifts by category\n"
         "   • Sample conversion trends — which categories are converting, which aren't?\n"
-        "   • Cross-selling whitespace patterns (accounts buying one category but not "
-        "its complement)\n\n"
+        "   • Cross-selling gaps (accounts buying one product category but not "
+        "its complement). Phrase plainly — never use the word 'whitespace'.\n\n"
 
         "4. ACCOUNT-LEVEL OPPORTUNITIES (2–3 named bullets)\n"
         "   High-signal accounts across the organization. Always name accounts (name + number).\n"
         "   Focus on: high-potential accounts underperforming, accounts showing unusual growth, "
-        "stale high-value accounts, display candidates, accounts with whitespace opportunities.\n"
+        "stale high-value accounts, display candidates, accounts missing complementary product lines.\n"
         "   Quantify every opportunity — include dollar amounts and trend direction.\n\n"
 
         "5. REP PERFORMANCE INSIGHTS (2–3 bullets)\n"
@@ -2386,10 +2402,23 @@ def _build_rep_prompt(
         "after heavy sampling is a red flag\n"
         "• DISPLAY EFFECTIVENESS: Display accounts should outperform non-display accounts "
         "in frequency and category breadth — if they don't, note it\n"
-        "• WHITESPACE: Flag accounts buying one category but missing complementary categories\n"
+        "• MISSING-CATEGORY OPPORTUNITIES: Flag accounts buying one product category but not its "
+        "complementary ones (e.g. buys carpet but no cushion). Say it in plain English — "
+        "do NOT use the term 'whitespace'.\n"
         "• EARLY WARNINGS: Slowing order frequency, narrowing category breadth, margin drift, "
         "declining sample activity are risk signals — name them\n"
         "• CORRELATION: Distinguish likely correlation from confirmed trend in your language\n\n"
+
+        "CATEGORY INTEGRITY — CRITICAL ANTI-HALLUCINATION RULE:\n"
+        "• The 'SALES BY CATEGORY / COST CENTER' block is the ONLY source of truth for "
+        "product-category names and totals. Use those category names verbatim. Never invent "
+        "category names that are not in that block.\n"
+        "• In the 'TOP PRODUCTS' block each product is prefixed with its category in [brackets]. "
+        "You MUST keep every product under its bracket category. Never describe a product as "
+        "belonging to a different category (e.g. do not put product code MW-H under 'Carpet "
+        "Residential' if its tag says [CARPET COMMERCIAL]).\n"
+        "• If a category is not in the SALES BY CATEGORY block, the rep had ZERO sales in it — "
+        "do not pretend they have sales there.\n\n"
     )
     _tier_line = (
         "STRUGGLING — be direct, name specific gaps, set clear expectations. "
@@ -2422,11 +2451,14 @@ def _build_rep_prompt(
         "   • ONE key positive and ONE key concern. One line each. No editorializing.\n\n"
 
         "2. CATEGORY PERFORMANCE (2–3 sentences)\n"
-        "   Analyze product mix using the TOP PRODUCTS data block.\n"
+        "   Use ONLY the 'SALES BY CATEGORY / COST CENTER' block for category-level totals — "
+        "those are the authoritative category names and amounts. Use the TOP PRODUCTS block "
+        "for product-level color, keeping each product under its tagged [CATEGORY].\n"
         "   • Which categories are strongest? Growing, flat, or declining?\n"
         "   • Are margins healthy in the top categories or compressing?\n"
         "   • Are sample placements correlating with category expansion into accounts?\n"
-        "   • Is there a whitespace opportunity (accounts missing a complementary category)?\n\n"
+        "   • Is there an account buying one category but missing a complementary one "
+        "(e.g. carpet without cushion)? Say it plainly — do NOT use the word 'whitespace'.\n\n"
 
         "3. ACCOUNT OPPORTUNITIES (2–3 named bullets)\n"
         "   Identify specific, actionable opportunities. Every bullet must name an account "
@@ -2529,8 +2561,16 @@ def _build_rep_prompt(
     ) or "  (none)"
 
     pc_lines = "\n".join(
-        f"  - {p['desc'] or p['price_class']}: ${p['revenue']:,.0f}, GP%={p['gp_pct']:.1f}%"
+        f"  - [{p.get('cost_center_name') or p.get('cost_center') or 'UNCLASSIFIED'}] "
+        f"{p['desc'] or p['price_class']}: ${p['revenue']:,.0f}, GP%={p['gp_pct']:.1f}%"
         for p in sc.price_class_top
+    ) or "  (none)"
+
+    cc_lines = "\n".join(
+        f"  - {c.get('cost_center_name') or c.get('cost_center') or 'UNCLASSIFIED'} "
+        f"({c.get('cost_center')}): ${c['revenue']:,.0f}, GP%={c['gp_pct']:.1f}%, "
+        f"{c['accounts']} accounts, {c['lines']} lines"
+        for c in (sc.cc_top or [])
     ) or "  (none)"
 
     # Build explicit L3M labels so the AI can cite actual dates, not vague "recent".
@@ -2606,7 +2646,8 @@ def _build_rep_prompt(
         f"  last_3mo ({_l3m_lbl})=${sc.last_3mo_revenue:,.0f}\n"
         + _p3m_note
         + f"  yoy_3mo ({_yoy_lbl})={l3y} [use this as the momentum indicator]\n\n"
-        f"TOP PRODUCTS BY REVENUE (what this rep is actually selling):\n{pc_lines}\n\n"
+        f"SALES BY CATEGORY / COST CENTER (AUTHORITATIVE — use these category names verbatim, never invent others):\n{cc_lines}\n\n"
+        f"TOP PRODUCTS BY REVENUE (each line tagged with [CATEGORY] — keep each product under its tagged category, never under a different one):\n{pc_lines}\n\n"
         f"TOP GROWING ACCOUNTS ({start_label}–{end_label} vs {prior_start_label}–{prior_end_label}):\n{growing_lines}\n\n"
         f"TOP DECLINING ACCOUNTS ({start_label}–{end_label} vs {prior_start_label}–{prior_end_label}):\n{declining_lines}\n\n"
         f"STALE ACCOUNTS (had revenue {prior_start_label}–{prior_end_label}, zero {start_label}–{end_label}):\n{stale_lines}\n\n"

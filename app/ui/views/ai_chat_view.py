@@ -96,6 +96,22 @@ CLOSED ACCOUNTS:
 - Never recommend a rep visit, call, or pursue a closed account.
 - You MAY reference a closed account to explain a revenue drop or quantify lost territory —
   but every action item must target an OPEN account.
+
+PRIOR-YEAR DATA (year-over-year comparisons):
+- The user message ALWAYS includes a 'PRIOR-YEAR SAME WINDOW AGGREGATES' block whenever
+  prior-year data has been loaded (the SalesFilterBar's 'Also load prior year' option is
+  on by default). That block contains by_rep, by_cc, top_accounts and by_period tables for
+  EXACTLY the same calendar window one year earlier.
+- For ANY question about year-over-year change, growth vs last year, 'last N days vs same N days
+  last year', or 'who grew the most' — USE the PRIOR-YEAR SAME WINDOW aggregates as the
+  comparison baseline. Do NOT refuse the question on grounds of 'only the current window is
+  provided' if the prior-year block is present.
+- If the prior-year block is missing (the user turned the option off), say so plainly and ask the
+  user to enable 'Also load prior year' on the filter bar.
+
+PLAIN LANGUAGE:
+- Speak the way a real sales manager talks. Avoid jargon like 'whitespace'. Say 'missing
+  product category' or 'cross-sell gap' instead.
 """
 
 
@@ -138,6 +154,7 @@ class AIChatView(QWidget):
         self._cfg = cfg
         self._get_db = get_db
         self._df: pd.DataFrame | None = None
+        self._prior_df: pd.DataFrame | None = None
         self._workers: list[_AskWorker] = []
         # Enrichment lookups loaded lazily when first ask is made
         self._pc_lookup: dict[str, str] = {}   # price_class_code -> description
@@ -151,7 +168,8 @@ class AIChatView(QWidget):
             ViewHeader(
                 "Ask the AI",
                 "Ask any question about the currently-loaded invoiced sales. "
-                "Pick cost centers + dates, press Run, then type your question.",
+                "Pick cost centers + dates, press Run, then type your question. "
+                "Prior-year same-window data is included automatically for year-over-year questions.",
             )
         )
 
@@ -169,7 +187,7 @@ class AIChatView(QWidget):
         body = QHBoxLayout()
         body.setSpacing(12)
         self.filter_bar = SalesFilterBar(get_db, cfg=self._cfg, code_prefix_filter="0", page_id="ask_ai")
-        self.filter_bar.sales_loaded.connect(self._on_loaded)
+        self.filter_bar.sales_loaded_with_prior.connect(self._on_loaded)
         body.addWidget(self.filter_bar)
 
         # Right side: splitter [history | chat]
@@ -274,8 +292,9 @@ class AIChatView(QWidget):
         self._refresh_history()
 
     # --------------------------------------------------------------- data
-    def _on_loaded(self, df: pd.DataFrame) -> None:
+    def _on_loaded(self, df: pd.DataFrame, prior_df: pd.DataFrame | None = None) -> None:
         self._df = df
+        self._prior_df = prior_df if (prior_df is not None and not prior_df.empty) else None
         self.ask_btn.setEnabled(not df.empty)
         self._refresh_token_estimate()
 
@@ -346,8 +365,31 @@ class AIChatView(QWidget):
         agg = aggregate_for_ai(self._df)
         agg_text = _format_aggregates(agg, acct_lookup=self._acct_lookup)
 
+        # Prior-year same window aggregates — included automatically so the AI
+        # can answer YoY / "last N days vs same N days last year" questions
+        # without needing the user to expand the date range manually.
+        prior_agg_text = ""
+        if self._prior_df is not None and not self._prior_df.empty:
+            try:
+                prior_agg = aggregate_for_ai(self._prior_df)
+                prior_agg_text = _format_aggregates(prior_agg, acct_lookup=self._acct_lookup)
+            except Exception:  # noqa: BLE001
+                prior_agg_text = ""
+
         s, e = self.filter_bar.date_range()
         ccs = self.filter_bar.selected_codes() or ["ALL"]
+
+        # Compute the prior-year same-window date range for the prompt label.
+        try:
+            prior_s = s.replace(year=s.year - 1)
+        except ValueError:
+            from datetime import timedelta as _td
+            prior_s = s - _td(days=365)
+        try:
+            prior_e = e.replace(year=e.year - 1)
+        except ValueError:
+            from datetime import timedelta as _td
+            prior_e = e - _td(days=365)
 
         # Pull in the manager's app-side context so the AI can reason about
         # related sample CCs and core displays even though those rows aren't
@@ -396,6 +438,20 @@ class AIChatView(QWidget):
                 f"  {code}: {desc}" for code, desc in sorted(self._pc_lookup.items())
             ) + "\n"
 
+        prior_block = ""
+        if prior_agg_text:
+            prior_block = (
+                f"\nPRIOR-YEAR SAME WINDOW AGGREGATES "
+                f"({prior_s.isoformat()} to {prior_e.isoformat()} — use these for "
+                f"year-over-year comparisons):\n{prior_agg_text}\n"
+            )
+        else:
+            prior_block = (
+                "\nPRIOR-YEAR SAME WINDOW AGGREGATES: not loaded — the user has "
+                "'Also load prior year' turned OFF on the filter bar. If the question "
+                "requires a YoY comparison, tell the user to enable that option and re-run.\n"
+            )
+
         user_msg = (
             f"Date range (invoice date): {s.isoformat()} to {e.isoformat()}\n"
             f"Cost centers in scope: {', '.join(ccs)}\n"
@@ -403,6 +459,7 @@ class AIChatView(QWidget):
             f"Total rows: {len(df_enriched):,} (full dataset — no truncation).\n\n"
             f"PRE-AGGREGATED TABLES (full dataset \u2014 use these for ranking "
             f"and totals):\n{agg_text}\n"
+            f"{prior_block}"
             f"{pc_ref}"
             f"Question: {question}\n\n"
             f"FULL INVOICED LINES (CSV \u2014 all {len(df_enriched):,} rows, "
