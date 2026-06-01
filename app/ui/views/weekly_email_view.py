@@ -634,7 +634,9 @@ class WeeklyEmailView(QWidget):
             return []
         try:
             from app.storage.repos import recent_weekly_email_texts
-            return recent_weekly_email_texts(salesman_number, days=30)
+            # Cadence is monthly — look back 90 days so the same insight is not
+            # repeated across roughly the last three monthly emails.
+            return recent_weekly_email_texts(salesman_number, days=90)
         except Exception:  # noqa: BLE001
             log.debug("recent_weekly_email_texts lookup failed", exc_info=True)
             return []
@@ -1762,7 +1764,34 @@ def _wrap_ai_body(
     footer = ""
     if scorecard is not None:
         footer = _scorecard_footer_html(scorecard)
-    return cc_html + overview_html + week_html + body_html + chart_html + footer
+    return cc_html + overview_html + week_html + body_html + chart_html + footer + _reply_guidance_html()
+
+
+def _reply_guidance_html() -> str:
+    """Footer block inviting the rep to reply, with guidance on good questions.
+
+    Frames the email as a two-way channel and steers reps toward questions the
+    AI assistant can actually answer from the warehouse data.
+    """
+    return (
+        "<div style='background:#F0F9FF;border:1px solid #BAE6FD;border-radius:8px;"
+        "padding:12px 16px;margin:18px 0 4px 0;font-size:12px;color:#0C4A6E;"
+        "line-height:1.55;'>"
+        "<p style='margin:0 0 6px 0;font-weight:600;color:#075985;'>"
+        "\U0001f4ac Reply any time \u2014 I'll pull the numbers for you</p>"
+        "<p style='margin:0 0 6px 0;'>Just reply to this email with a question and "
+        "I'll answer it directly from the live sales data. Good things to ask about:</p>"
+        "<ul style='margin:0 0 6px 18px;padding:0;'>"
+        "<li>A specific account's trend (e.g. \u201chow is ABC Flooring (#1234) tracking this year?\u201d)</li>"
+        "<li>How a product line is doing in your territory (e.g. \u201cmy Win Win sales YTD\u201d)</li>"
+        "<li>What's in your open-order pipeline or shipping soon</li>"
+        "<li>How you compare to the <b>company average</b> (e.g. \u201cam I above average on GP%?\u201d)</li>"
+        "<li>Tell me what you'd like to see in <b>future emails</b> and I'll include it going forward</li>"
+        "</ul>"
+        "<p style='margin:0;color:#0369A1;'>I can share your own territory's detail and "
+        "company-wide averages \u2014 I'm not able to share another rep's individual numbers.</p>"
+        "</div>"
+    )
 
 
 def _scorecard_footer_html(sc: RepScorecard) -> str:
@@ -2596,7 +2625,7 @@ def _build_rep_prompt(
 
         "FRESHNESS — DO NOT REPEAT YOURSELF:\n"
         "• If 'RECENT EMAILS ALREADY SENT TO THIS REP' is provided, do NOT reuse the same wins, "
-        "concerns, accounts, or coaching angle you already used in the last ~30 days. Find a fresh "
+        "concerns, accounts, or coaching angle you already used in the last ~90 days. Find a fresh "
         "angle from a different category, account, or signal. Repetition makes the email worthless.\n\n"
 
         "NEVER WRITE:\n"
@@ -2619,7 +2648,19 @@ def _build_rep_prompt(
         "MARKETING PROGRAMS:\n"
         "• When a 'MARKETING PROGRAMS' block is included, use it as the source of truth for which "
         "of your accounts are enrolled. Programs flagged '*' or under 'STARRED PROGRAMS' are "
-        "priorities — call out gaps or wins when relevant. Correlation language only; never invent a program.\n"
+        "priorities — call out gaps or wins when relevant. Correlation language only; never invent a program.\n\n"
+
+        "REP REQUESTS / CUSTOM CONTENT — CLEAR DELINEATION:\n"
+        "• The standard email is always the three sections above (WHAT'S GOING WELL / WHAT'S "
+        "TRENDING THE WRONG WAY / WHAT TO FOCUS ON THIS WEEK). Write those first, every time.\n"
+        "• If the KNOWN FACTS block lists a rep PREFERENCE for what they want to see going forward "
+        "(e.g. 'always include my top declining accounts', 'show LVT sample conversion'), honor it.\n"
+        "• Put any rep-requested / custom content in a SEPARATE, clearly delineated section AFTER "
+        "the three standard sections, under this exact header line:\n"
+        "      ——— YOU ASKED TO SEE ———\n"
+        "  Then provide the requested info using ONLY data present in the data block. If the data "
+        "block does not contain what they asked for, say so plainly in one line under that header.\n"
+        "• Do NOT add this section at all if there is no relevant rep preference in KNOWN FACTS.\n"
     )
     if scorecard.is_yoy_outlier:
         sys_msg += (
@@ -2784,8 +2825,8 @@ def _recent_emails_block(recent_email_texts: list[str] | None) -> str:
     if not recent_email_texts:
         return ""
     lines = [
-        "RECENT EMAILS ALREADY SENT TO THIS REP (last ~30 days) — do NOT reuse the same "
-        "wins, concerns, accounts, or coaching angle. Pick FRESH angles this week:"
+        "RECENT EMAILS ALREADY SENT TO THIS REP (last ~90 days) — do NOT reuse the same "
+        "wins, concerns, accounts, or coaching angle. Pick FRESH angles this month:"
     ]
     for i, body in enumerate(recent_email_texts[:4], start=1):
         excerpt = (body or "").strip().replace("\n", " ")

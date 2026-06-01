@@ -582,6 +582,120 @@ class _AiReplyWorker(QThread):
             log.warning("Rep data fetch failed: %s", exc)
             return ""
 
+    def _fetch_benchmark_averages(self) -> str:
+        """Company-wide AVERAGES only — no individual rep figures.
+
+        Lets a rep benchmark their own numbers against the company average
+        without ever exposing a specific other rep's data. Every figure here is
+        an aggregate/average across all active reps. Returns '' on any error so
+        the reply flow never blocks.
+        """
+        if not self._get_db:
+            return ""
+        try:
+            import datetime as _dt
+
+            from app.data.loaders import (
+                load_invoiced_sales,
+                load_price_class_lookup,
+                load_reps,
+            )
+            from app.services.fiscal_calendar import fiscal_year_for, fy_start_date
+
+            _EXCL = frozenset({"", "house account", "(legacy / pre-aug 2025)"})
+            db = self._get_db()
+            if db is None:
+                return ""
+
+            active_reps_df = load_reps(db)
+            active_rep_names: set[str] = set()
+            if active_reps_df is not None and not active_reps_df.empty:
+                active_rep_names = {
+                    str(n).strip().upper()
+                    for n in active_reps_df["name"]
+                    if str(n).strip()
+                }
+
+            def _is_valid_rep(name: str) -> bool:
+                n = name.strip()
+                if n.lower() in _EXCL:
+                    return False
+                if active_rep_names:
+                    return n.upper() in active_rep_names
+                return bool(n)
+
+            today = _dt.date.today()
+            fy = fiscal_year_for(today)
+            fy_start = fy_start_date(fy)
+            df = load_invoiced_sales(db, fy_start, today, code_prefix="0")
+            if df is None or df.empty:
+                return ""
+            df = df[
+                df["salesperson_desc"].fillna("").astype(str).str.strip().apply(_is_valid_rep)
+            ].copy()
+            if df.empty:
+                return ""
+
+            df["_rep"] = df["salesperson_desc"].fillna("").astype(str).str.strip()
+            rep_rev = df.groupby("_rep")["revenue"].sum()
+            rep_rev = rep_rev[rep_rev > 0]
+            n_reps = int(rep_rev.shape[0])
+            if n_reps == 0:
+                return ""
+
+            total_rev = float(df["revenue"].sum())
+            total_gp = (
+                float(df["gross_profit"].sum()) if "gross_profit" in df.columns else 0.0
+            )
+            avg_rev = total_rev / n_reps
+            median_rev = float(rep_rev.median())
+            gp_pct = total_gp / total_rev * 100 if total_rev > 0 else 0.0
+
+            acct_per_rep = df.groupby("_rep")["account_number"].nunique()
+            avg_accts = float(acct_per_rep.mean()) if not acct_per_rep.empty else 0.0
+            n_accts = int(df["account_number"].nunique())
+            avg_rev_per_acct = total_rev / n_accts if n_accts else 0.0
+
+            lines: list[str] = [
+                "COMPANY BENCHMARK AVERAGES (all active reps — AVERAGES ONLY; no "
+                "individual rep figures are available here or anywhere in this reply):",
+                f"Period: {fy_start.strftime('%b %d, %Y')} → {today.strftime('%b %d, %Y')}  (FY {fy} YTD)",
+                f"  Active reps:               {n_reps}",
+                f"  Avg revenue per rep:       ${avg_rev:,.0f}",
+                f"  Median revenue per rep:    ${median_rev:,.0f}",
+                f"  Avg accounts per rep:      {avg_accts:,.0f}",
+                f"  Avg revenue per account:   ${avg_rev_per_acct:,.0f}",
+                f"  Company-wide GP%:          {gp_pct:.1f}%",
+            ]
+
+            # Per-product-line averages (company total ÷ rep count) so a rep can
+            # benchmark "how does my Win Win compare to the average rep".
+            try:
+                pc_lookup = load_price_class_lookup(db)
+                pc_tot = (
+                    df.groupby("price_class", dropna=False)["revenue"]
+                    .sum()
+                    .sort_values(ascending=False)
+                    .head(10)
+                )
+                if not pc_tot.empty:
+                    lines.append("")
+                    lines.append(
+                        "  AVG PER REP BY TOP PRODUCT LINE (company total ÷ active reps):"
+                    )
+                    lines.append(f"  {'Product line':<34} {'Avg/Rep':>12}")
+                    lines.append(f"  {'-'*34} {'-'*12}")
+                    for code, tot in pc_tot.items():
+                        desc = str(pc_lookup.get(str(code).strip(), str(code)))[:34]
+                        lines.append(f"  {desc:<34} ${tot / n_reps:>10,.0f}")
+            except Exception:  # noqa: BLE001
+                log.debug("benchmark per-product-line failed", exc_info=True)
+
+            return "\n".join(lines)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Benchmark averages fetch failed: %s", exc)
+            return ""
+
     def _fetch_account_detail(self, account_numbers: list[str]) -> str:
         """Period-by-period invoiced sales for specific accounts mentioned in the thread.
 
@@ -1559,6 +1673,9 @@ class _AiReplyWorker(QThread):
             mp_block = self._fetch_marketing_programs_block(
                 account_filter=self._rep_accounts
             )
+            # Company-wide AVERAGES only (no individual rep figures) so the rep
+            # can benchmark themselves without seeing another rep's specifics.
+            benchmark_block = self._fetch_benchmark_averages()
             if not rep_data:
                 completeness_notes.append("your territory sales summary could not be loaded")
             if account_numbers and not account_detail:
@@ -1566,7 +1683,7 @@ class _AiReplyWorker(QThread):
                     "per-account detail for the referenced account(s) could not be loaded"
                 )
             warehouse_block = "\n\n".join(
-                x for x in [rep_data, account_detail, open_orders, mp_block] if x
+                x for x in [rep_data, account_detail, open_orders, mp_block, benchmark_block] if x
             )
 
         # Durable rep-asserted facts (closed accounts, supplier switches, etc.).
@@ -1693,6 +1810,30 @@ class _AiReplyWorker(QThread):
                 "on behalf of the sales manager. You have live warehouse data pulled directly from "
                 "the sales database — always use it. NEVER invent any number.\n\n"
 
+                "DATA SCOPE & PRIVACY — CRITICAL, NON-NEGOTIABLE:\n"
+                "- This rep may ONLY receive SPECIFIC figures for THEIR OWN territory: their "
+                "accounts, their products, their orders. All specific data in the warehouse "
+                "block is already scoped to this rep — never present account-level or "
+                "order-level detail for anyone else.\n"
+                "- If the rep asks for ANOTHER individual rep's specific numbers (by name, "
+                "territory, 'the top rep', 'rep X', 'who sells the most', a ranking of named "
+                "reps, etc.), you MUST politely decline: explain you can only share their own "
+                "territory detail, then offer the COMPANY BENCHMARK AVERAGES instead.\n"
+                "- The rep CAN ask about COMPANY-WIDE AVERAGES or BENCHMARKS (e.g. 'how do I "
+                "compare to the average rep', 'what's the average GP%', 'average sales per "
+                "account'). Answer those ONLY from the 'COMPANY BENCHMARK AVERAGES' block, "
+                "which contains aggregate averages and NEVER names or breaks out any "
+                "individual rep. Never reverse-engineer or estimate a specific rep's number "
+                "from an average.\n"
+                "- When you cite a benchmark, you MAY compare it to this rep's own figure "
+                "(both are allowed) — e.g. 'Your GP% is 31% vs the 28% company average.'\n\n"
+
+                "FUTURE-EMAIL PREFERENCES:\n"
+                "- If the rep tells you what they want to see in their WEEKLY/MONTHLY summary "
+                "email going forward (e.g. 'always include my top declining accounts'), "
+                "acknowledge in ONE sentence that you've noted it and it will be applied to "
+                "future emails. (It is saved automatically — you do not need to do anything else.)\n\n"
+
                 "TERMINOLOGY — understand what common terms mean in this business:\n"
                 "- 'Product' or 'product line': a PRICE CLASS with a description (e.g. 'WIN WIN BROADLOOM').\n"
                 "- Reps use informal product names. 'Win Win' matches any product description containing "
@@ -1713,8 +1854,9 @@ class _AiReplyWorker(QThread):
                 "- NEVER say 'CLARIFICATION NEEDED' for a product name. Always search partial names "
                 "from COMPLETE PRODUCT CATALOG. Reserve 'CLARIFICATION NEEDED' ONLY for genuinely "
                 "ambiguous requests where data cannot be found even with partial matching.\n"
-                "- If the rep asks for data 'by rep' for all reps: you have this rep's territory only. "
-                "Say so in one sentence, then immediately deliver the product × account table instead.\n"
+                "- If the rep asks for data 'by rep' for all reps: you do NOT share other "
+                "reps' specific numbers. Point them to the COMPANY BENCHMARK AVERAGES and "
+                "deliver their own product × account table.\n"
                 "- Always cite the exact date range (e.g. 'Feb 1 – May 20, 2026 FY YTD').\n"
                 "- Address the rep by first name once, at the start.\n\n"
 
