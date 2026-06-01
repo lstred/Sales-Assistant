@@ -696,66 +696,253 @@ class _AiReplyWorker(QThread):
             log.warning("Benchmark averages fetch failed: %s", exc)
             return ""
 
-    def _fetch_account_detail(self, account_numbers: list[str]) -> str:
-        """Period-by-period invoiced sales for specific accounts mentioned in the thread.
+    @staticmethod
+    def _resolve_referenced_accounts(
+        asgn,
+        account_numbers: list[str],
+        restrict_to_accounts: set[str] | None = None,
+    ) -> dict[str, dict[str, str]]:
+        """Resolve user-typed account numbers (old OR new) → canonical NEW accounts.
 
-        Supplements the rep dashboard above with granular monthly detail when the
-        rep or manager explicitly referenced specific account numbers.
+        Reps refer to accounts by their OLD (BBANK2) number — e.g. "51149" — but
+        the warehouse stores sales under the NEW account number (BACCT#, which may
+        be alphanumeric like "PROHAR"). Each referenced token is matched against
+        BOTH the new ``account_number`` and the old ``old_account_number`` columns.
+
+        Returns ``{new_account: {"name", "old", "closed"}}``. When
+        ``restrict_to_accounts`` is given (rep mode), resolution is limited to those
+        new accounts so a rep can never pull another rep's account by guessing.
+        """
+        wanted = {str(a).strip().lstrip("#") for a in account_numbers if str(a).strip()}
+        if not wanted or asgn is None or getattr(asgn, "empty", True):
+            return {}
+        restrict = (
+            {str(a).strip() for a in restrict_to_accounts}
+            if restrict_to_accounts else None
+        )
+        resolved: dict[str, dict[str, str]] = {}
+        for _, row in asgn.iterrows():
+            new_acct = str(row.get("account_number", "")).strip()
+            old_acct = str(row.get("old_account_number", "")).strip()
+            if not new_acct:
+                continue
+            if restrict is not None and new_acct not in restrict:
+                continue
+            if new_acct in wanted or (old_acct and old_acct in wanted):
+                raw_name = str(row.get("account_name", "")).strip()
+                resolved[new_acct] = {
+                    "name": raw_name.lstrip("*").strip(),
+                    "old": old_acct,
+                    "closed": "1" if raw_name.startswith("*") else "",
+                }
+        return resolved
+
+    def _fetch_account_detail(
+        self, account_numbers: list[str], restrict_to_accounts: set[str] | None = None
+    ) -> str:
+        """Complete, authoritative breakdown for accounts the rep/manager referenced.
+
+        Reps refer to accounts by their OLD (BBANK2) number — e.g. "51149" — but
+        the warehouse stores sales under the NEW account number (BACCT#, which may
+        be alphanumeric like "PROHAR"). This method resolves each referenced number
+        against BOTH the new account number AND the old account number, then emits a
+        COMPLETE total for the account (FY YTD with prior-year comparison) broken
+        down by category (cost center), by product, and by month — with NO
+        truncation — so the AI never undercounts.
+
+        ``restrict_to_accounts`` (rep mode) limits resolution to the rep's own
+        accounts so a rep can never pull another rep's account by guessing a number.
         """
         if not account_numbers or not self._get_db:
             return ""
         try:
-            from datetime import date as _date
-            from app.data.loaders import load_invoiced_sales, load_rep_assignments
+            import datetime as _dt
+
+            from app.data.loaders import (
+                load_all_cost_centers,
+                load_invoiced_sales,
+                load_price_class_lookup,
+                load_rep_assignments,
+            )
+            from app.services.fiscal_calendar import fiscal_year_for, fy_start_date
+
             db = self._get_db()
             if db is None:
                 return ""
-            end = _date.today()
-            start = _date(end.year - 1, 1, 1)
-            df = load_invoiced_sales(db, start, end)
-            if df is None or df.empty:
-                return ""
-            df = df[df["account_number"].astype(str).isin(account_numbers)].copy()
-            if df.empty:
+
+            wanted = {str(a).strip().lstrip("#") for a in account_numbers if str(a).strip()}
+            if not wanted:
                 return ""
 
-            acct_names: dict[str, str] = {}
-            try:
-                asgn = load_rep_assignments(db)
-                if "account_number" in asgn.columns and "account_name" in asgn.columns:
-                    for _, row in asgn[
-                        asgn["account_number"].astype(str).isin(account_numbers)
-                    ].iterrows():
-                        acct_names[str(row["account_number"])] = str(row.get("account_name", ""))
-            except Exception:  # noqa: BLE001
-                pass
+            # ── Resolve referenced numbers (old OR new) → canonical NEW account ──
+            asgn = load_rep_assignments(db)
+            if asgn is None or asgn.empty:
+                return ""
 
-            period_col = "fiscal_period_name" if "fiscal_period_name" in df.columns else None
-            if period_col is None:
-                df["_period"] = df["invoice_date"].dt.to_period("M").astype(str)
-                period_col = "_period"
-
-            grp = (
-                df.groupby(["account_number", period_col], dropna=False)
-                .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
-                .reset_index()
-                .sort_values(["account_number", period_col])
+            restrict = (
+                {str(a).strip() for a in restrict_to_accounts}
+                if restrict_to_accounts
+                else None
             )
 
-            lines: list[str] = ["\nACCOUNT DETAIL (month-by-month):"]
-            for acct_num, sub in grp.groupby("account_number"):
-                name = acct_names.get(str(acct_num), "")
-                label = f"{name} (#{acct_num})" if name else f"#{acct_num}"
-                total = sub["revenue"].sum()
-                lines.append(f"\n{label}  —  ${total:,.0f} total")
-                lines.append(f"  {'Period':<20} {'Revenue':>10} {'GP':>10}")
-                lines.append(f"  {'-'*20} {'-'*10} {'-'*10}")
-                for _, r in sub.iterrows():
-                    lines.append(
-                        f"  {str(r[period_col]):<20}"
-                        f" ${r['revenue']:>9,.0f}"
-                        f" ${r['gp']:>9,.0f}"
-                    )
+            resolved = self._resolve_referenced_accounts(
+                asgn, account_numbers, restrict_to_accounts
+            )
+
+            if not resolved:
+                # Referenced account is not in scope (or not this rep's). Tell the AI
+                # plainly so it does not guess or substitute a different account.
+                joined = ", ".join(sorted(wanted))
+                scope = "your territory" if restrict is not None else "the account directory"
+                return (
+                    "\nREFERENCED ACCOUNT — NOT FOUND:\n"
+                    f"  No account matching {joined} was found in {scope}. "
+                    "Do NOT substitute a different account or guess — tell the reader "
+                    "the account number was not recognized and ask them to confirm it."
+                )
+
+            new_accounts = set(resolved.keys())
+
+            # ── Load full invoiced sales (product CCs) current + prior FY YTD ──
+            today = _dt.date.today()
+            fy = fiscal_year_for(today)
+            fy_start = fy_start_date(fy)
+            days_offset = (today - fy_start).days
+            prior_fy_start = fy_start_date(fy - 1)
+            prior_end = prior_fy_start + _dt.timedelta(days=days_offset)
+
+            df_c = load_invoiced_sales(db, fy_start, today, code_prefix="0")
+            df_p = load_invoiced_sales(db, prior_fy_start, prior_end, code_prefix="0")
+            if df_c is None or df_c.empty:
+                return ""
+
+            df_c = df_c[df_c["account_number"].astype(str).str.strip().isin(new_accounts)].copy()
+            if df_p is not None and not df_p.empty:
+                df_p = df_p[
+                    df_p["account_number"].astype(str).str.strip().isin(new_accounts)
+                ].copy()
+            else:
+                df_p = df_c.iloc[0:0].copy()
+
+            if df_c.empty:
+                joined = ", ".join(sorted(wanted))
+                return (
+                    "\nREFERENCED ACCOUNT — NO INVOICED SALES THIS FISCAL YEAR:\n"
+                    f"  Account {joined} is recognized but has no invoiced product sales "
+                    f"in FY {fy} YTD ({fy_start.strftime('%b %d, %Y')} → {today.strftime('%b %d, %Y')}). "
+                    "Report that plainly — do not invent figures."
+                )
+
+            pc_lookup = load_price_class_lookup(db)
+            cc_name_map: dict[str, str] = {}
+            try:
+                cc_df = load_all_cost_centers(db)
+                if cc_df is not None and not cc_df.empty:
+                    for _, r in cc_df.iterrows():
+                        code = str(r.get("cost_center", "") or "").strip()
+                        nm = str(r.get("cost_center_name", "") or "").strip()
+                        if code and nm and nm.lower() not in ("nan", "none", "null", "<na>"):
+                            cc_name_map[code] = nm
+            except Exception:  # noqa: BLE001
+                log.debug("cc name lookup failed", exc_info=True)
+
+            cur_total = float(df_c["revenue"].sum())
+            prior_total = float(df_p["revenue"].sum()) if not df_p.empty else 0.0
+            gp_total = float(df_c["gross_profit"].sum()) if "gross_profit" in df_c.columns else 0.0
+            gp_pct = gp_total / cur_total * 100 if cur_total > 0 else 0.0
+            yoy = (
+                f"{(cur_total - prior_total) / prior_total * 100:+.1f}% YoY"
+                if prior_total > 0 else "no prior-year sales"
+            )
+
+            lines: list[str] = [
+                "\nREFERENCED ACCOUNT — COMPLETE & AUTHORITATIVE BREAKDOWN",
+                "(This is the FULL total for the account across ALL categories — use "
+                "these figures as the single source of truth for this account. Do NOT "
+                "use truncated per-product slices from other sections to total this account.)",
+            ]
+            for new_acct in sorted(new_accounts):
+                meta = resolved[new_acct]
+                name = meta["name"]
+                old = meta["old"]
+                closed = " [CLOSED]" if meta.get("closed") else ""
+                label = (
+                    f"{name} (#{old})" if name and old
+                    else name or f"#{old or new_acct}"
+                )
+                sub_c = df_c[df_c["account_number"].astype(str).str.strip() == new_acct]
+                sub_p = (
+                    df_p[df_p["account_number"].astype(str).str.strip() == new_acct]
+                    if not df_p.empty else df_c.iloc[0:0]
+                )
+                a_cur = float(sub_c["revenue"].sum())
+                a_prior = float(sub_p["revenue"].sum()) if not sub_p.empty else 0.0
+                a_gp = float(sub_c["gross_profit"].sum()) if "gross_profit" in sub_c.columns else 0.0
+                a_gp_pct = a_gp / a_cur * 100 if a_cur > 0 else 0.0
+                a_yoy = (
+                    f"{(a_cur - a_prior) / a_prior * 100:+.1f}% YoY"
+                    if a_prior > 0 else "no prior-year sales"
+                )
+                lines.append(
+                    f"\n{label}{closed}  [new acct {new_acct}]"
+                    f"\n  FY {fy} YTD TOTAL (ALL CATEGORIES): ${a_cur:,.0f}"
+                    f"  |  Prior FY YTD: ${a_prior:,.0f}  ({a_yoy})  |  GP {a_gp_pct:.1f}%"
+                    f"\n  Window: {fy_start.strftime('%b %d, %Y')} → {today.strftime('%b %d, %Y')}"
+                    f"  |  Prior: {prior_fy_start.strftime('%b %d, %Y')} → {prior_end.strftime('%b %d, %Y')}"
+                )
+
+                # By category (cost center) — complete, no truncation
+                by_cc = (
+                    sub_c.groupby("cost_center", dropna=False)
+                    .agg(revenue=("revenue", "sum"), gp=("gross_profit", "sum"))
+                    .reset_index()
+                    .sort_values("revenue", ascending=False)
+                )
+                prior_cc = (
+                    sub_p.groupby("cost_center")["revenue"].sum().to_dict()
+                    if not sub_p.empty else {}
+                )
+                lines.append("  BY CATEGORY (cost center) — complete:")
+                lines.append(f"    {'Category':<28} {'FY YTD $':>12} {'Prior $':>12} {'GP%':>6}")
+                lines.append(f"    {'-'*28} {'-'*12} {'-'*12} {'-'*6}")
+                for _, r in by_cc.iterrows():
+                    cc = str(r["cost_center"]).strip()
+                    cc_nm = (cc_name_map.get(cc, cc) or "UNCLASSIFIED")[:28]
+                    rev = float(r["revenue"])
+                    pr = float(prior_cc.get(cc, 0.0))
+                    g = float(r["gp"]) / rev * 100 if rev > 0 else 0.0
+                    lines.append(f"    {cc_nm:<28} ${rev:>10,.0f} ${pr:>10,.0f} {g:>5.1f}%")
+                lines.append(f"    {'TOTAL':<28} ${a_cur:>10,.0f} ${a_prior:>10,.0f} {a_gp_pct:>5.1f}%")
+
+                # By product (price class) — complete
+                by_pc = (
+                    sub_c.groupby("price_class", dropna=False)
+                    .agg(revenue=("revenue", "sum"))
+                    .reset_index()
+                    .sort_values("revenue", ascending=False)
+                )
+                lines.append("  BY PRODUCT — complete:")
+                for _, r in by_pc.iterrows():
+                    pc = str(r["price_class"]).strip()
+                    desc = (pc_lookup.get(pc, pc) or pc)[:34]
+                    rev = float(r["revenue"])
+                    lines.append(f"    {desc:<34} ${rev:>10,.0f}")
+
+                # By month
+                df_m = sub_c.copy()
+                if "fiscal_period_name" in df_m.columns:
+                    pcol = "fiscal_period_name"
+                else:
+                    df_m["_period"] = df_m["invoice_date"].dt.to_period("M").astype(str)
+                    pcol = "_period"
+                by_m = (
+                    df_m.groupby(pcol, dropna=False)["revenue"].sum().reset_index()
+                    .sort_values(pcol)
+                )
+                lines.append("  BY MONTH:")
+                for _, r in by_m.iterrows():
+                    lines.append(f"    {str(r[pcol]):<28} ${float(r['revenue']):>10,.0f}")
+
             return "\n".join(lines)
         except Exception as exc:  # noqa: BLE001
             log.warning("Account detail fetch failed: %s", exc)
@@ -1668,7 +1855,9 @@ class _AiReplyWorker(QThread):
                 (m.body_text or self._strip_html(m.body_html or "")) for m in self._messages
             )
             account_numbers = self._extract_account_numbers(all_text)
-            account_detail = self._fetch_account_detail(account_numbers)
+            account_detail = self._fetch_account_detail(
+                account_numbers, restrict_to_accounts=self._rep_accounts
+            )
             open_orders = self._fetch_open_orders_data(is_management=False)
             mp_block = self._fetch_marketing_programs_block(
                 account_filter=self._rep_accounts
@@ -1714,7 +1903,19 @@ class _AiReplyWorker(QThread):
                 "- 'CC': cost center / product category (e.g. 'Carpet Residential').\n"
                 "- 'GP' = gross profit dollars. 'GP%' = gross profit percentage.\n\n"
 
-                "HOW TO FIND PRODUCTS — follow this order every time:\n"
+                "ACCOUNT TOTALS — CRITICAL ACCURACY RULE:\n"
+                "- When the reader references a specific account number, the 'REFERENCED ACCOUNT — "
+                "COMPLETE & AUTHORITATIVE BREAKDOWN' section is the ONLY source of truth for that "
+                "account's total. It already resolves old vs new account numbers and sums ALL "
+                "categories. NEVER total an account by adding up truncated per-product or per-rep "
+                "slices from other sections — those are capped and will undercount.\n"
+                "- Reps refer to accounts by their OLD number (e.g. #51149); the warehouse stores a "
+                "different NEW number (which may be alphanumeric). They are the SAME account — the "
+                "breakdown shows both. Always echo the number the reader used.\n"
+                "- If the breakdown says the account was NOT FOUND or has no sales, say so plainly — "
+                "never substitute a different account.\n\n"
+
+
                 "1. Check QUERY-MATCHED PRODUCTS first — this section is pre-computed from the "
                 "exact conversation text. It already contains the correct data. USE IT.\n"
                 "2. If QUERY-MATCHED PRODUCTS has no data for the question, scan COMPLETE PRODUCT "
@@ -1842,8 +2043,20 @@ class _AiReplyWorker(QThread):
                 "- 'YTD': fiscal year to date (fiscal year starts Feb 1).\n"
                 "- 'GP' = gross profit dollars. 'GP%' = gross profit percentage.\n\n"
 
-                "HOW TO FIND PRODUCTS — follow this order every time:\n"
-                "1. Check QUERY-MATCHED PRODUCTS first — pre-computed from this conversation. USE IT.\n"
+                "ACCOUNT TOTALS — CRITICAL ACCURACY RULE:\n"
+                "- When you reference one of your account numbers, the 'REFERENCED ACCOUNT — "
+                "COMPLETE & AUTHORITATIVE BREAKDOWN' section is the ONLY source of truth for that "
+                "account's total. It already resolves your old account number to the warehouse's "
+                "internal number and sums ALL of your categories for that account. NEVER total an "
+                "account by adding up truncated per-product slices from other sections — those are "
+                "capped and will undercount badly.\n"
+                "- The account number you use (e.g. #51149) is the OLD number; the warehouse stores a "
+                "different internal number for the same account. The breakdown shows both — always "
+                "use the number you recognize when replying.\n"
+                "- Use the BY CATEGORY and TOTAL lines in that section for the figure. If it says the "
+                "account was NOT FOUND or has no sales, say so plainly — never guess.\n\n"
+
+
                 "2. If not there, scan COMPLETE PRODUCT CATALOG with case-insensitive substring matching.\n"
                 "3. If multiple variants match, show ALL with a combined total.\n"
                 "4. For product-by-account questions: use QUERY-MATCHED PRODUCTS or "
