@@ -18,14 +18,18 @@ from typing import Callable
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QListWidget,
     QListWidgetItem,
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QTextBrowser,
     QTextEdit,
@@ -40,13 +44,16 @@ from app.storage.repos import (
     Conversation,
     Message,
     create_conversation_for_inbound,
+    delete_rep_fact,
     find_conversation_for_reply,
     list_action_items,
     list_conversations,
     list_messages,
+    list_rep_facts,
     record_inbound,
     resolve_action_item,
     save_message,
+    set_rep_fact_active,
 )
 from app.ui.theme import ACCENT, BORDER, DANGER, SURFACE, SURFACE_ALT, TEXT, TEXT_MUTED
 from app.ui.views._header import ViewHeader
@@ -1306,7 +1313,109 @@ class _AiReplyWorker(QThread):
             log.exception("marketing programs fetch failed")
             return ""
 
-    def _validate_draft(self, draft: str, warehouse_block: str) -> str:
+    def _extract_and_save_facts(
+        self,
+        rep_id: str,
+        last_body: str,
+        inbound: list,
+    ) -> None:
+        """Detect durable facts the rep asserted and persist them (auditable).
+
+        Runs a small, cheap AI call that reads the rep's latest message and
+        returns a JSON array of facts (e.g. an account is closed).  Each fact
+        is saved to the rep_facts table so future emails and replies honor it.
+        Manager senders never create rep facts.  Fails open — never blocks the
+        reply flow.
+        """
+        if not rep_id or not last_body.strip():
+            return
+        if self._is_management_sender():
+            return
+        try:
+            import json
+
+            from app.ai.base import ChatMessage
+            from app.ai.factory import build_provider
+            from app.storage.repos import save_rep_fact
+
+            source_message_id = None
+            for m in reversed(inbound):
+                if getattr(m, "id", None):
+                    source_message_id = m.id
+                    break
+            conv_id = getattr(self._conv, "id", None)
+
+            provider = build_provider(self._cfg.ai)
+            system_msg = (
+                "You extract durable, actionable FACTS that a sales rep states about their "
+                "accounts in an email. Only extract facts that should change how we treat an "
+                "account going forward — NOT questions, requests, or pleasantries.\n\n"
+                "Return ONLY a JSON array (no prose). Each element:\n"
+                '  {"account_number": "<digits or empty>", "account_label": "<name or empty>", '
+                '"fact_type": "account_closed|account_note|preference|other", '
+                '"fact_text": "<concise restatement of the fact>"}\n\n'
+                "Rules:\n"
+                "- 'account_closed': the rep says an account is closed, out of business, or no "
+                "longer a customer.\n"
+                "- 'account_note': a durable status about an account (changed buyer, switched "
+                "supplier, on credit hold, seasonal, etc.).\n"
+                "- 'preference': how the rep wants to be communicated with or what they care about.\n"
+                "- 'other': any other durable fact worth remembering.\n"
+                "- Extract the account NUMBER if the rep gives one (4-6 digits).\n"
+                "- If the message contains NO durable facts, return exactly: []\n"
+                "- Never fabricate an account number or fact not stated by the rep."
+            )
+            user_msg = (
+                f"REP MESSAGE:\n{last_body[:2000]}\n\n"
+                "Return the JSON array of durable facts now:"
+            )
+            result = provider.complete(
+                [
+                    ChatMessage(role="system", content=system_msg),
+                    ChatMessage(role="user", content=user_msg),
+                ],
+                model=self._cfg.ai.model,
+                max_output_tokens=512,
+                temperature=0.0,
+                timeout_seconds=self._cfg.ai.request_timeout_seconds,
+            )
+            raw = (result.text or "").strip()
+            # Strip code fences if the model wrapped the JSON.
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw).strip()
+            # Isolate the JSON array.
+            start = raw.find("[")
+            endp = raw.rfind("]")
+            if start == -1 or endp == -1 or endp <= start:
+                return
+            facts = json.loads(raw[start : endp + 1])
+            if not isinstance(facts, list):
+                return
+            for f in facts:
+                if not isinstance(f, dict):
+                    continue
+                fact_text = str(f.get("fact_text", "")).strip()
+                if not fact_text:
+                    continue
+                acct = str(f.get("account_number", "") or "").strip() or None
+                ftype = str(f.get("fact_type", "note") or "note").strip()
+                if ftype not in ("account_closed", "account_note", "preference", "other"):
+                    ftype = "other"
+                save_rep_fact(
+                    rep_id=rep_id,
+                    fact_text=fact_text,
+                    fact_type=ftype,
+                    account_number=acct,
+                    account_label=str(f.get("account_label", "") or "").strip(),
+                    source="rep_feedback",
+                    source_message_id=source_message_id,
+                    conversation_id=conv_id,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Fact extraction failed (non-fatal): %s", exc)
+
+    def _validate_draft(self, draft: str, warehouse_block: str, rep_question: str = "") -> str:
         """Second AI pass: fact-check every number in the draft against source data.
 
         Runs a fresh AI call at temperature 0.0 instructed only to verify and
@@ -1343,6 +1452,15 @@ class _AiReplyWorker(QThread):
                 "the source.\n"
                 "6. CHECK TOTALS: the TOTAL in the draft MUST equal the TOTAL row "
                 "in the source data exactly. If it does not, the breakdown is wrong.\n\n"
+                "7. CHECK RELEVANCE: confirm the draft actually ANSWERS what the "
+                "reader asked (see THE READER'S REQUEST below). If the draft "
+                "ignores, only partially answers, or drifts off-topic, fix it so it "
+                "directly addresses the request using only the source data. If the "
+                "source data does not contain what was asked, the draft must say so "
+                "plainly (do not pad with unrelated figures).\n"
+                "8. CHECK COMPLETENESS NOTE: if any relevant data appears missing, the "
+                "draft must end with a line starting '⚠ Note:' describing what may be "
+                "missing. Add it if it is warranted and absent.\n\n"
                 "OUTPUT RULES — STRICTLY FOLLOW:\n"
                 "- If the draft is 100% accurate: return it VERBATIM, unchanged.\n"
                 "- If corrections are needed: return ONLY the corrected text — no "
@@ -1355,8 +1473,14 @@ class _AiReplyWorker(QThread):
             # Trim source data to fit safely — first 7 000 chars covers the
             # open-orders + invoiced-sales summary (the hallucination-prone parts).
             source_excerpt = warehouse_block[:7000]
+            question_block = (
+                f"THE READER'S REQUEST (the draft must answer THIS):\n{rep_question[:1500]}\n\n"
+                if rep_question.strip()
+                else ""
+            )
             user_msg = (
                 f"DRAFT EMAIL TO VERIFY:\n{draft}\n\n"
+                f"{question_block}"
                 f"SOURCE DATA (ground truth — all valid numbers come from here):\n"
                 f"{source_excerpt}\n\n"
                 "Return the verified/corrected draft now:"
@@ -1389,8 +1513,20 @@ class _AiReplyWorker(QThread):
             last = inbound[-1]
             last_body = last.body_text or (self._strip_html(last.body_html) if last.body_html else "")
 
+        # Extract & persist any durable facts the rep just asserted (e.g.
+        # "that account is closed") BEFORE building the prompt, so the reply
+        # can acknowledge the fact and future emails honor it.  Best-effort.
+        rep_id = (self._conv.rep_id or "").strip()
+        try:
+            self._extract_and_save_facts(rep_id, last_body, inbound)
+        except Exception:  # noqa: BLE001
+            log.debug("fact extraction failed", exc_info=True)
+
         # Always load the full rep dashboard from the warehouse.
         is_mgmt = self._is_management_sender()
+
+        # Track data-completeness gaps so the reply can flag missing data.
+        completeness_notes: list[str] = []
 
         if is_mgmt:
             # Management sender — load company-wide data across all reps.
@@ -1402,6 +1538,12 @@ class _AiReplyWorker(QThread):
             account_detail = self._fetch_account_detail(account_numbers)
             open_orders = self._fetch_open_orders_data(is_management=True)
             mp_block = self._fetch_marketing_programs_block(account_filter=None)
+            if not warehouse_data:
+                completeness_notes.append("company-wide sales summary could not be loaded")
+            if account_numbers and not account_detail:
+                completeness_notes.append(
+                    "per-account detail for the referenced account(s) could not be loaded"
+                )
             warehouse_block = "\n\n".join(
                 x for x in [warehouse_data, account_detail, open_orders, mp_block] if x
             )
@@ -1417,9 +1559,26 @@ class _AiReplyWorker(QThread):
             mp_block = self._fetch_marketing_programs_block(
                 account_filter=self._rep_accounts
             )
+            if not rep_data:
+                completeness_notes.append("your territory sales summary could not be loaded")
+            if account_numbers and not account_detail:
+                completeness_notes.append(
+                    "per-account detail for the referenced account(s) could not be loaded"
+                )
             warehouse_block = "\n\n".join(
                 x for x in [rep_data, account_detail, open_orders, mp_block] if x
             )
+
+        # Durable rep-asserted facts (closed accounts, supplier switches, etc.).
+        rep_facts = ""
+        try:
+            from app.storage.repos import rep_facts_block as _rfb
+            rep_facts = _rfb(rep_id) if rep_id else ""
+        except Exception:  # noqa: BLE001
+            log.debug("rep_facts_block lookup failed", exc_info=True)
+        if rep_facts:
+            warehouse_block = (warehouse_block + "\n\n" + rep_facts).strip() if warehouse_block else rep_facts
+
 
         if is_mgmt:
             system_msg = (
@@ -1515,7 +1674,18 @@ class _AiReplyWorker(QThread):
                 "  been flagged as important by the manager — prioritise insights about them.\n"
                 "- You may answer at the high-level category (e.g. 'CCA Buying Group') OR at\n"
                 "  the specific program code level. Never invent a program or category not\n"
-                "  present in the block."
+                "  present in the block.\n\n"
+
+                "KNOWN FACTS / DATA COMPLETENESS — CRITICAL:\n"
+                "- If a 'KNOWN FACTS FROM THE REP' block is present, HONOR it. Do not contradict\n"
+                "  a stated fact and do not re-raise an account the rep already told us is closed.\n"
+                "- Make sure you actually answer what was asked. If the data needed to fully\n"
+                "  answer the question is NOT in the warehouse block, do NOT guess — say which\n"
+                "  part you could not cover.\n"
+                "- If ANY relevant data may be missing or incomplete, end the reply with a single\n"
+                "  line beginning exactly with '⚠ Note:' that states plainly what may be missing\n"
+                "  (e.g. '⚠ Note: some data may be incomplete — per-account detail for #51149\n"
+                "  could not be loaded; figures above cover only what was retrieved.')."
             )
         else:
             system_msg = (
@@ -1587,7 +1757,15 @@ class _AiReplyWorker(QThread):
                 "  between program enrollment and the rep's account performance. Programs\n"
                 "  marked with '*' or under 'STARRED PROGRAMS' were flagged as important by\n"
                 "  the manager — mention them when relevant. Never invent a program name or\n"
-                "  category not present in the block."
+                "  category not present in the block.\n\n"
+
+                "KNOWN FACTS / DATA COMPLETENESS — CRITICAL:\n"
+                "- If a 'KNOWN FACTS FROM THE REP' block is present, HONOR it. Never contradict\n"
+                "  a fact the rep already told us, and never re-raise an account they said is closed.\n"
+                "- Make sure you actually answer what the rep asked. If the data needed is NOT in\n"
+                "  the warehouse block, do NOT guess — say which part you could not cover.\n"
+                "- If ANY relevant data may be missing or incomplete, end the reply with a single\n"
+                "  line beginning exactly with '⚠ Note:' stating plainly what may be missing."
             )
 
         sender_label = "MANAGER QUERY" if is_mgmt else f"Rep: {self._conv.rep_name or self._conv.rep_id}"
@@ -1606,6 +1784,13 @@ class _AiReplyWorker(QThread):
                 "Do NOT invent any numbers. Report the data pull failed and "
                 "ask them to try again in a few minutes.\n"
             )
+        if completeness_notes:
+            joined = "; ".join(completeness_notes)
+            user_msg += (
+                f"\nDATA COMPLETENESS WARNING — some data could not be retrieved: {joined}. "
+                "You MUST end your reply with a line starting '⚠ Note:' telling the reader "
+                "exactly what may be missing so they don't treat the figures as complete.\n"
+            )
         user_msg += "\nDraft the reply now:"
 
         result = provider.complete(
@@ -1622,7 +1807,7 @@ class _AiReplyWorker(QThread):
         # Run a second AI pass to fact-check every number against the source
         # data before the reply is sent — prevents hallucinated figures.
         if warehouse_block:
-            draft = self._validate_draft(draft, warehouse_block)
+            draft = self._validate_draft(draft, warehouse_block, rep_question=last_body)
         return draft
 
 
@@ -2221,6 +2406,7 @@ class ConversationsView(QWidget):
         self.tabs.addTab(self._build_all_tab(), "All Conversations")
         self.tabs.addTab(self._build_review_tab(), "Needs Review")
         self.tabs.addTab(self._build_actions_tab(), "Action Items")
+        self.tabs.addTab(self._build_facts_tab(), "Rep Facts")
         root.addWidget(self.tabs, 1)
 
         QTimer.singleShot(0, self.refresh)
@@ -2410,6 +2596,142 @@ class ConversationsView(QWidget):
         self.action_list.itemSelectionChanged.connect(self._on_action_selected)
         return w
 
+    def _build_facts_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(8)
+
+        hdr = QHBoxLayout()
+        intro = QLabel(
+            "Durable facts the assistant remembers from rep replies "
+            "(e.g. an account is closed). These are honored in future emails "
+            "and replies. Deactivate or delete any that are wrong."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color:{TEXT_MUTED};font-size:12px;")
+        hdr.addWidget(intro, 1)
+        self.facts_show_inactive = QPushButton("Show inactive")
+        self.facts_show_inactive.setCheckable(True)
+        self.facts_show_inactive.setFixedHeight(28)
+        self.facts_show_inactive.clicked.connect(self._refresh_facts_table)
+        hdr.addWidget(self.facts_show_inactive)
+        layout.addLayout(hdr)
+
+        self.facts_table = QTableWidget(0, 6)
+        self.facts_table.setHorizontalHeaderLabels(
+            ["Rep", "Account", "Fact", "Type", "Source", "When"]
+        )
+        self.facts_table.verticalHeader().setVisible(False)
+        self.facts_table.setAlternatingRowColors(True)
+        self.facts_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.facts_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.facts_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        hh = self.facts_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.facts_table.itemSelectionChanged.connect(self._on_fact_selected)
+        layout.addWidget(self.facts_table, 1)
+
+        btn_row = QHBoxLayout()
+        self.fact_toggle_btn = QPushButton("Deactivate")
+        self.fact_toggle_btn.setEnabled(False)
+        self.fact_toggle_btn.clicked.connect(self._toggle_fact_active)
+        self.fact_delete_btn = QPushButton("Delete")
+        self.fact_delete_btn.setEnabled(False)
+        self.fact_delete_btn.clicked.connect(self._delete_fact)
+        btn_row.addWidget(self.fact_toggle_btn)
+        btn_row.addWidget(self.fact_delete_btn)
+        btn_row.addStretch(1)
+        self.facts_status = QLabel("")
+        self.facts_status.setStyleSheet(f"color:{TEXT_MUTED};font-size:12px;")
+        btn_row.addWidget(self.facts_status)
+        layout.addLayout(btn_row)
+        return w
+
+    def _refresh_facts_table(self) -> None:
+        active_only = not self.facts_show_inactive.isChecked()
+        try:
+            facts = list_rep_facts(active_only=active_only)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to load rep facts: %s", exc)
+            facts = []
+        self._facts = facts
+        tbl = self.facts_table
+        tbl.setRowCount(0)
+        for f in facts:
+            row = tbl.rowCount()
+            tbl.insertRow(row)
+            rep = (f.rep_name or f.rep_id or "—").strip()
+            acct = f.account_label or f.account_number or "—"
+            when = (f.created_at or "")[:16]
+            cells = [
+                rep,
+                acct,
+                f.fact_text,
+                f.fact_type.replace("_", " "),
+                f.source.replace("_", " "),
+                when,
+            ]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(str(text))
+                if col == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, f.id)
+                if not f.active:
+                    item.setForeground(Qt.GlobalColor.gray)
+                tbl.setItem(row, col, item)
+        n = len(facts)
+        self.facts_status.setText(
+            f"{n} fact{'s' if n != 1 else ''}" + ("" if active_only else " (incl. inactive)")
+        )
+        self.fact_toggle_btn.setEnabled(False)
+        self.fact_delete_btn.setEnabled(False)
+
+    def _selected_fact(self):
+        rows = self.facts_table.selectionModel().selectedRows() if self.facts_table.selectionModel() else []
+        if not rows:
+            return None
+        row = rows[0].row()
+        item = self.facts_table.item(row, 0)
+        if item is None:
+            return None
+        fid = item.data(Qt.ItemDataRole.UserRole)
+        for f in getattr(self, "_facts", []):
+            if f.id == fid:
+                return f
+        return None
+
+    def _on_fact_selected(self) -> None:
+        f = self._selected_fact()
+        self.fact_toggle_btn.setEnabled(f is not None)
+        self.fact_delete_btn.setEnabled(f is not None)
+        if f is not None:
+            self.fact_toggle_btn.setText("Reactivate" if not f.active else "Deactivate")
+
+    def _toggle_fact_active(self) -> None:
+        f = self._selected_fact()
+        if f is None:
+            return
+        try:
+            set_rep_fact_active(f.id, not f.active)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to toggle fact: %s", exc)
+        self._refresh_facts_table()
+
+    def _delete_fact(self) -> None:
+        f = self._selected_fact()
+        if f is None:
+            return
+        try:
+            delete_rep_fact(f.id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to delete fact: %s", exc)
+        self._refresh_facts_table()
+
     # ================================================================ data
 
     def refresh(self) -> None:
@@ -2426,6 +2748,7 @@ class ConversationsView(QWidget):
         self._populate_conv_list(self._conversations)
         self._populate_review_list()
         self._refresh_action_list()
+        self._refresh_facts_table()
         self._update_tab_badges()
 
     def _update_tab_badges(self) -> None:

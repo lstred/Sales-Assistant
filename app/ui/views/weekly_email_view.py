@@ -617,6 +617,28 @@ class WeeklyEmailView(QWidget):
         except Exception:  # noqa: BLE001
             log.exception("marketing programs lazy-load failed")
 
+    def _rep_facts_block_for(self, salesman_number: str) -> str:
+        """Durable rep-asserted facts (e.g. closed accounts) to honor in the email."""
+        if not salesman_number:
+            return ""
+        try:
+            from app.storage.repos import rep_facts_block
+            return rep_facts_block(salesman_number)
+        except Exception:  # noqa: BLE001
+            log.debug("rep_facts_block lookup failed", exc_info=True)
+            return ""
+
+    def _recent_emails_for(self, salesman_number: str) -> list[str]:
+        """Recently-sent weekly emails for anti-repetition steering."""
+        if not salesman_number:
+            return []
+        try:
+            from app.storage.repos import recent_weekly_email_texts
+            return recent_weekly_email_texts(salesman_number, days=30)
+        except Exception:  # noqa: BLE001
+            log.debug("recent_weekly_email_texts lookup failed", exc_info=True)
+            return []
+
     def _marketing_programs_block(self, rep_accounts: set[str] | None) -> str:
         """Return the formatted marketing-programs prompt block for the given scope."""
         self._ensure_marketing_programs()
@@ -865,6 +887,8 @@ class WeeklyEmailView(QWidget):
                 marketing_programs_block=self._marketing_programs_block(
                     self._accounts_for_rep(rep_key)
                 ),
+                rep_facts_block=self._rep_facts_block_for(slmn),
+                recent_email_texts=self._recent_emails_for(slmn),
             )
             ai_jobs.append((rep_key, system_msg, user_msg))
 
@@ -2459,6 +2483,8 @@ def _build_rep_prompt(
     week_lines: dict,
     tone: int,
     marketing_programs_block: str = "",
+    rep_facts_block: str = "",
+    recent_email_texts: list[str] | None = None,
 ) -> tuple[str, str]:
     tone_word = (
         "extra-encouraging and warm" if tone >= 2
@@ -2478,70 +2504,60 @@ def _build_rep_prompt(
     is_struggling = _bottom_40 and (_declining or _low_activation)
 
     if is_struggling:
-        section5_instruction = (
-            "5. THIS WEEK'S ACTION (1 specific, non-negotiable task)\n"
-            "   ONE concrete, measurable action this rep must complete this week.\n"
+        section_focus = (
+            "WHAT TO FOCUS ON THIS WEEK (1 specific, non-negotiable action)\n"
+            "   ONE concrete, measurable action you need to complete this week.\n"
             "   Format: 'Priority: [task] — [account name (#number), dollar context].'\n"
             "   This is a direct expectation. Name the account, name the dollar, name the action."
         )
     else:
-        section5_instruction = (
-            "5. THIS WEEK'S ACTION (1 high-upside opportunity)\n"
+        section_focus = (
+            "WHAT TO FOCUS ON THIS WEEK (1 high-upside opportunity)\n"
             "   ONE specific, high-impact action worth prioritizing this week.\n"
-            "   Frame as an opportunity, not an order. Tie it directly to their data.\n"
+            "   Frame it as an opportunity. Tie it directly to your data.\n"
             "   Must name an account (name + number) and include dollar context."
         )
 
-    # Build conditional display/sample coaching examples
+    # Build conditional display/sample coaching example (second person)
     _display_example = (
-        "• 'Your accounts with core displays are ordering at roughly twice the frequency "
-        "of accounts without displays — consider accelerating placements at your top "
-        "unequipped accounts.'\n"
+        "• 'Your accounts with core displays are ordering about twice as often as your "
+        "accounts without displays — accelerating placements at your top unequipped accounts "
+        "should lift volume.'\n"
         if scorecard.core_display_configured else ""
     )
 
     sys_msg = (
-        "You are a senior sales intelligence analyst for a flooring distribution company.\n"
-        "You are generating a personalized weekly territory brief for ONE sales rep.\n"
-        "Your job is to perform genuine analysis — not summarize raw data.\n"
-        "Identify meaningful patterns, surface specific opportunities, detect early risks,\n"
-        "and recommend high-impact actions. Every sentence must add value.\n\n"
+        "You are a senior sales manager writing a short, personal weekly email DIRECTLY TO one "
+        "of your sales reps. You are speaking to them, not about them.\n\n"
+
+        "VOICE — CRITICAL:\n"
+        "• Write in the SECOND PERSON. Address the rep as 'you' and 'your' throughout.\n"
+        "• NEVER use the rep's name in a possessive ('Mark Lomonaco's Carpet Residential'). "
+        "Write 'your Carpet Residential' instead. You may greet them by first name once, "
+        "but everything after is 'you'/'your'.\n"
+        "• Examples: 'Your Carpet Residential revenue slipped from $X to $Y.' / "
+        "'You grew ABC FLOORING (#1234) from $X to $Y.' / 'Your margin in Hardwood held strong.'\n\n"
 
         "BUSINESS CONTEXT:\n"
         "• Cost Center = Product Category (e.g. Carpet Residential, Hardwood, LVT)\n"
-        "• Revenue alone is not the measure of success — margin quality and category breadth "
-        "matter equally\n"
-        "• Sample placements are leading indicators of future revenue (typically convert in "
-        "30–60 days)\n"
+        "• Margin quality and category breadth matter as much as raw revenue\n"
+        "• Sample placements are leading indicators (typically convert in 30–60 days)\n"
         "• Display placements drive long-term account engagement and repeat volume\n"
-        "• Granular data only exists from August 2025 forward — do not make long-term "
-        "granular claims about periods before that\n\n"
+        "• Granular data only exists from August 2025 forward\n\n"
 
-        "ANALYTICAL RULES — apply all of these when interpreting the data:\n"
-        "• NORMALIZE: Think revenue per active account, margin trends, category breadth — "
-        "not just raw volume totals\n"
-        "• MARGIN: Revenue growth with margin compression is not purely positive — flag it\n"
-        "• SAMPLES AS SIGNALS: Rising sample activity predicts growth; stalled conversion "
-        "after heavy sampling is a red flag\n"
-        "• DISPLAY EFFECTIVENESS: Display accounts should outperform non-display accounts "
-        "in frequency and category breadth — if they don't, note it\n"
-        "• MISSING-CATEGORY OPPORTUNITIES: Flag accounts buying one product category but not its "
-        "complementary ones (e.g. buys carpet but no cushion). Say it in plain English — "
-        "do NOT use the term 'whitespace'.\n"
-        "• EARLY WARNINGS: Slowing order frequency, narrowing category breadth, margin drift, "
-        "declining sample activity are risk signals — name them\n"
-        "• CORRELATION: Distinguish likely correlation from confirmed trend in your language\n\n"
+        "ANALYTICAL JUDGMENT — apply when reading the data:\n"
+        "• Revenue growth with margin compression is not purely good — flag it\n"
+        "• Rising sample activity predicts growth; stalled conversion after heavy sampling is a risk\n"
+        "• Flag accounts buying one category but missing a complementary one (e.g. carpet but no "
+        "cushion). Say it plainly — do NOT use the word 'whitespace'.\n"
+        "• Distinguish likely correlation from confirmed trend in your wording\n\n"
 
         "CATEGORY INTEGRITY — CRITICAL ANTI-HALLUCINATION RULE:\n"
         "• The 'SALES BY CATEGORY / COST CENTER' block is the ONLY source of truth for "
-        "product-category names and totals. Use those category names verbatim. Never invent "
-        "category names that are not in that block.\n"
-        "• In the 'TOP PRODUCTS' block each product is prefixed with its category in [brackets]. "
-        "You MUST keep every product under its bracket category. Never describe a product as "
-        "belonging to a different category (e.g. do not put product code MW-H under 'Carpet "
-        "Residential' if its tag says [CARPET COMMERCIAL]).\n"
-        "• If a category is not in the SALES BY CATEGORY block, the rep had ZERO sales in it — "
-        "do not pretend they have sales there.\n\n"
+        "product-category names and totals. Use those names verbatim. Never invent a category.\n"
+        "• In 'TOP PRODUCTS' each product is prefixed with its category in [brackets]. Keep every "
+        "product under its bracket category — never move it to a different one.\n"
+        "• If a category is not in the SALES BY CATEGORY block, you had ZERO sales there.\n\n"
     )
     _tier_line = (
         "STRUGGLING — be direct, name specific gaps, set clear expectations. "
@@ -2551,94 +2567,59 @@ def _build_rep_prompt(
     )
     sys_msg += (
         f"TONE: {tone_word}\n"
-        f"REP TIER: {_tier_line}\n\n"
+        f"THIS REP'S TIER: {_tier_line}\n\n"
 
-        "FORMATTING:\n"
-        "• 180–280 words total. Short sections with short bullets. No walls of text.\n"
+        "LENGTH & FORMAT — KEEP IT SHORT AND SCANNABLE:\n"
+        "• 110–180 words total. This is a quick, focused weekly note — not a report.\n"
+        "• Optional one-line greeting by first name, then go straight into the sections below.\n"
         "• Only reference numbers present in the data block. Never invent figures.\n"
-        "• Always write full date ranges ('February–April 2026'), never 'previous period'\n"
-        "• When citing an account's sales, ALWAYS show both periods: "
-        "'$25,239 (Feb–Apr 2025) → $12,548 (Feb–Apr 2026)'\n"
-        "• Always pair account numbers with names: 'ABC FLOORING (#1234)'\n"
-        "• Use product descriptions ('Carpet Residential') not 6-character price class codes\n"
-        "• No subject line. No greeting. Start directly with section 1 header.\n"
-        "• System appends a scorecard footer automatically — do not repeat those numbers.\n\n"
+        "• Write full date ranges ('February–April 2026'), never 'previous period'.\n"
+        "• When citing an account's sales, show both periods: "
+        "'$25,239 (Feb–Apr 2025) → $12,548 (Feb–Apr 2026)'.\n"
+        "• Always pair account numbers with names: 'ABC FLOORING (#1234)'.\n"
+        "• Use product descriptions ('Carpet Residential') not price-class codes.\n"
+        "• Plain text. The system appends a scorecard footer automatically — do not repeat those numbers.\n\n"
 
-        "WRITE EXACTLY THESE 5 SECTIONS IN ORDER:\n\n"
+        "WRITE THESE THREE SHORT SECTIONS IN ORDER:\n\n"
 
-        "1. TERRITORY SNAPSHOT (3–5 short bullets)\n"
-        "   Overall direction of this rep's territory. Analytically honest — not cheerleading.\n"
-        "   • Revenue and margin trend vs prior year (cite exact periods and dollar amounts)\n"
-        "   • Account activation rate — what fraction of assigned accounts are active?\n"
-        "   • Peer comparison — where does this rep stand relative to peers?\n"
-        "   • ONE key positive and ONE key concern. One line each. No editorializing.\n\n"
+        "WHAT'S GOING WELL (2 short bullets)\n"
+        "   Two areas where you're performing well OR trending the right direction. Be specific — "
+        "name the category or account and the dollar/percentage movement with dates. Genuine wins only.\n\n"
 
-        "2. CATEGORY PERFORMANCE (2–3 sentences)\n"
-        "   Use ONLY the 'SALES BY CATEGORY / COST CENTER' block for category-level totals — "
-        "those are the authoritative category names and amounts. Use the TOP PRODUCTS block "
-        "for product-level color, keeping each product under its tagged [CATEGORY].\n"
-        "   • Which categories are strongest? Growing, flat, or declining?\n"
-        "   • Are margins healthy in the top categories or compressing?\n"
-        "   • Are sample placements correlating with category expansion into accounts?\n"
-        "   • Is there an account buying one category but missing a complementary one "
-        "(e.g. carpet without cushion)? Say it plainly — do NOT use the word 'whitespace'.\n\n"
+        "WHAT'S TRENDING THE WRONG WAY (2–3 short bullets)\n"
+        "   Two or three areas going the wrong direction or that need attention. Name the category or "
+        "account (name + number) and the dollar movement with dates.\n"
+        "   HIGH-IMPACT RULE: any account with a >$5k decline OR a consistent buyer now at $0 MUST "
+        "appear here until resolved.\n\n"
 
-        "3. ACCOUNT OPPORTUNITIES (2–3 named bullets)\n"
-        "   Identify specific, actionable opportunities. Every bullet must name an account "
-        "(name + number) and include dollar context.\n"
-        "   Candidates: stale accounts with strong history, accounts missing complementary "
-        "categories, display accounts underperforming their potential, momentum accounts "
-        "worth accelerating.\n"
-        "   HIGH-IMPACT RULE: Any account with >$5k decline OR a consistent buyer now at $0 "
-        "MUST appear here every week until resolved.\n\n"
+        f"{section_focus}\n\n"
 
-        "4. EARLY SIGNALS (1–2 sentences)\n"
-        "   The highest-value section. One smart, territory-specific observation about what the "
-        "data suggests is coming — positive or negative.\n"
-        "   Draw from: sample-to-sales conversion trends, display effectiveness patterns, order "
-        "frequency changes, category breadth shifts, margin drift.\n"
-        "   Make it feel like real analysis, not a dashboard readout.\n\n"
-
-        f"{section5_instruction}\n\n"
-
-        "STRONG EXAMPLES OF EARLY SIGNALS:\n"
-        + _display_example
-        + "• 'Sample activity in Carpet Residential is tracking significantly above last "
-        "quarter — watch for conversion in the next 4–6 weeks.'\n"
-        "• 'Several of your historically strong accounts have shown declining order frequency "
-        "over the past 6 weeks — revenue typically follows 4–8 weeks later.'\n"
-        "• 'Three of your top five growth accounts share the same product category — a "
-        "repeatable playbook may be emerging.'\n\n"
+        "FRESHNESS — DO NOT REPEAT YOURSELF:\n"
+        "• If 'RECENT EMAILS ALREADY SENT TO THIS REP' is provided, do NOT reuse the same wins, "
+        "concerns, accounts, or coaching angle you already used in the last ~30 days. Find a fresh "
+        "angle from a different category, account, or signal. Repetition makes the email worthless.\n\n"
 
         "NEVER WRITE:\n"
-        "• 'Please continue your efforts.' or 'Thank you for all you do.'\n"
-        "• 'Sales were up 3.2%.' — describe the business implication, not just the number\n"
-        "• Vague observations that any rep on any team could receive\n"
-        "• Percentages without accompanying dollar context\n"
-        "• Generic advice unconnected to this rep's specific data\n"
-        "• 'This period', 'the current period', 'previous period', 'prior period', "
-        "'recent months', or 'recent period' — always write the exact date range "
-        "(e.g. 'February–May 2026' or 'August 2025–May 2026')\n"
-        "• Numbers from the L3M block if it is marked DATA NOT LOADED — any prior-3-month "
-        "surge or decline percentage is FORBIDDEN when that flag is present; use yoy_3mo only\n"
-        "\n"
+        "• 'Please continue your efforts.' / 'Thank you for all you do.'\n"
+        "• A bare percentage with no dollar context\n"
+        "• Generic advice that any rep could receive\n"
+        "• The rep's name in a possessive — use 'your' instead\n"
+        "• 'This period', 'current period', 'previous period', 'prior period', 'recent months', "
+        "'recent period' — always write the exact date range\n"
+        "• Numbers from the L3M block if it is marked DATA NOT LOADED — use yoy_3mo only\n"
+        "• The word 'whitespace'\n\n"
+
         "CLOSED ACCOUNTS — CRITICAL RULE:\n"
-        "• Any account label suffixed with '[CLOSED]' is a permanently closed account.\n"
-        "• NEVER tell the rep to call, visit, follow up with, or re-engage a closed account — "
-        "the customer is gone and the doors are locked.\n"
-        "• You MAY mention a closed account ONCE to explain a revenue drop or pinpoint lost "
-        "business — frame it as 'replace this lost volume at active accounts X, Y, Z' and "
-        "name 2–3 specific active accounts the rep should target instead.\n"
-        "• Action items must always be aimed at OPEN accounts only.\n"
-        "\n"
+        "• Any account label suffixed with '[CLOSED]', and any account listed under KNOWN FACTS "
+        "as closed, is permanently closed.\n"
+        "• NEVER tell the rep to call, visit, follow up with, or re-engage a closed account.\n"
+        "• You MAY mention it ONCE to explain a revenue drop — frame as 'replace this lost volume "
+        "at active accounts X, Y' and name 2 specific active accounts to target instead.\n\n"
+
         "MARKETING PROGRAMS:\n"
-        "• When a 'MARKETING PROGRAMS' block is included, treat it as the source of truth for "
-        "which of this rep's accounts are enrolled in programs (CCA Buying Group, NRF Rebate "
-        "Program, etc.). Programs flagged with '*' or under 'STARRED PROGRAMS' are manager "
-        "priorities — call out enrollment gaps or wins when relevant.\n"
-        "• Look for correlations: do enrolled accounts grow faster, retain better, or buy more "
-        "categories than unenrolled ones in this territory?\n"
-        "• Speak in correlation language, not causation. Never invent a program or category.\n"
+        "• When a 'MARKETING PROGRAMS' block is included, use it as the source of truth for which "
+        "of your accounts are enrolled. Programs flagged '*' or under 'STARRED PROGRAMS' are "
+        "priorities — call out gaps or wins when relevant. Correlation language only; never invent a program.\n"
     )
     if scorecard.is_yoy_outlier:
         sys_msg += (
@@ -2786,9 +2767,32 @@ def _build_rep_prompt(
         f"NEW ACCOUNTS (zero {prior_start_label}–{prior_end_label}, revenue {start_label}–{end_label}):\n{new_lines}\n"
         f"{week_block}\n"
         + (f"\n{marketing_programs_block}\n" if marketing_programs_block else "")
+        + (f"\n{rep_facts_block}\n" if rep_facts_block else "")
+        + _recent_emails_block(recent_email_texts)
         + f"NOTES:\n  " + ("\n  ".join(sc.notes) if sc.notes else "(none)")
     )
     return sys_msg, user_msg
+
+
+def _recent_emails_block(recent_email_texts: list[str] | None) -> str:
+    """Build the anti-repetition context block from recently-sent weekly emails.
+
+    Returns '' when there is no recent email history.  The AI is told to avoid
+    reusing the same angles/accounts so the rep does not receive near-identical
+    emails week after week.
+    """
+    if not recent_email_texts:
+        return ""
+    lines = [
+        "RECENT EMAILS ALREADY SENT TO THIS REP (last ~30 days) — do NOT reuse the same "
+        "wins, concerns, accounts, or coaching angle. Pick FRESH angles this week:"
+    ]
+    for i, body in enumerate(recent_email_texts[:4], start=1):
+        excerpt = (body or "").strip().replace("\n", " ")
+        if len(excerpt) > 900:
+            excerpt = excerpt[:900] + " …"
+        lines.append(f"  [Email {i}] {excerpt}")
+    return "\n".join(lines) + "\n\n"
 
 
 def _fallback_body(
@@ -2797,136 +2801,85 @@ def _fallback_body(
     week_lines: dict | None,
 ) -> str:
     """Deterministic fallback when AI is not configured or fails.
-    Matches the new 5-section structure:
-      1. TERRITORY SNAPSHOT
-      2. CATEGORY PERFORMANCE
-      3. ACCOUNT OPPORTUNITIES
-      4. EARLY SIGNALS
-      5. THIS WEEK'S ACTION
+
+    Mirrors the short second-person 3-section email structure:
+      WHAT'S GOING WELL / WHAT'S TRENDING THE WRONG WAY / WHAT TO FOCUS ON THIS WEEK
     """
     parts: list[str] = []
 
-    # 1. TERRITORY SNAPSHOT
-    snapshot: list[str] = []
-    if week_lines:
-        prev_rev = week_lines.get("previous_week_revenue", 0.0)
-        snapshot.append(f"Last full week: ${prev_rev:,.0f}")
-    if sc.yoy_pct is not None and not sc.is_yoy_outlier:
-        direction = "up" if sc.yoy_pct >= 0 else "down"
-        snapshot.append(f"Period revenue {direction} {abs(sc.yoy_pct):.1f}% vs prior year")
-    elif sc.last_3mo_vs_prior_3mo_pct is not None:
-        snapshot.append(f"3-month trend: {sc.last_3mo_vs_prior_3mo_pct:+.1f}% vs prior 3 months")
-    if sc.gpp_pct:
-        snapshot.append(f"Gross margin: {sc.gpp_pct:.1f}%")
-    if sc.active_accounts and sc.total_accounts:
-        snapshot.append(
-            f"Account activation: {sc.active_accounts}/{sc.total_accounts} accounts active "
-            f"({sc.active_account_pct:.0f}%)"
+    # ---- WHAT'S GOING WELL ------------------------------------------------
+    wins: list[str] = []
+    if sc.top_growing_accounts:
+        a = sc.top_growing_accounts[0]
+        wins.append(
+            f"You grew {format_account_label(a)} to ${a['current']:,.0f} "
+            f"(was ${a['prior']:,.0f}, {a['delta']:+,.0f}). Keep that momentum going."
         )
-    if sc.rank_revenue is not None:
-        snapshot.append(f"Territory rank: #{sc.rank_revenue} of {sc.peer_count} peers by revenue")
-    if snapshot:
-        parts.append("TERRITORY SNAPSHOT\n" + "\n".join(f"• {s}" for s in snapshot))
-
-    # 2. CATEGORY PERFORMANCE
-    category_lines: list[str] = []
-    if sc.price_class_top:
+    if sc.new_accounts:
+        a = sc.new_accounts[0]
+        wins.append(
+            f"You opened {format_account_label(a)} at ${a['current']:,.0f} — strong new business."
+        )
+    if not wins and sc.price_class_top:
         top_cat = sc.price_class_top[0]
         cat_name = top_cat.get("desc") or top_cat.get("price_class", "")
-        category_lines.append(
-            f"Top category is {cat_name} at ${top_cat['revenue']:,.0f} "
-            f"(GP {top_cat['gp_pct']:.1f}%) — the largest driver of territory revenue."
+        wins.append(
+            f"Your strongest category is {cat_name} at ${top_cat['revenue']:,.0f} "
+            f"(GP {top_cat['gp_pct']:.1f}%)."
         )
-    if sc.sample_lines > 0:
-        category_lines.append(
-            f"Sample activity ({sc.sample_lines} placements, "
-            f"{sc.samples_per_account:.1f} per account) is a leading indicator — "
-            "strong placement volume typically converts to orders in 4–6 weeks."
-        )
-    if sc.core_display_configured and sc.core_display_coverage_pct > 0:
-        category_lines.append(
-            f"Core display coverage is {sc.core_display_coverage_pct:.0f}% of accounts. "
-            "Accounts with displays in place typically generate stronger repeat volume."
-        )
-    if category_lines:
-        parts.append("CATEGORY PERFORMANCE\n" + " ".join(category_lines))
+    if not wins and sc.gpp_pct:
+        wins.append(f"Your gross margin held at {sc.gpp_pct:.1f}%.")
+    if wins:
+        parts.append("WHAT'S GOING WELL\n" + "\n".join(f"• {w}" for w in wins[:2]))
 
-    # 3. ACCOUNT OPPORTUNITIES
-    opportunities: list[str] = []
+    # ---- WHAT'S TRENDING THE WRONG WAY -----------------------------------
+    concerns: list[str] = []
     for a in sc.stale_accounts[:2]:
-        opportunities.append(
-            f"{format_account_label(a)} — bought ${a['prior']:,.0f} last year, "
-            "zero this period. High priority to re-engage."
+        concerns.append(
+            f"{format_account_label(a)} bought ${a['prior']:,.0f} last year but is at "
+            "$0 now — worth re-engaging."
         )
     for a in (sc.top_declining_accounts or [])[:2]:
         if abs(a["delta"]) >= 2000:
-            opportunities.append(
-                f"{format_account_label(a)} — down ${-a['delta']:,.0f} vs prior year "
-                f"(${a['current']:,.0f} vs ${a['prior']:,.0f}). Worth a direct conversation."
+            concerns.append(
+                f"{format_account_label(a)} is down ${-a['delta']:,.0f} "
+                f"(${a['prior']:,.0f} → ${a['current']:,.0f})."
             )
-    if sc.top_growing_accounts and not opportunities:
-        a = sc.top_growing_accounts[0]
-        opportunities.append(
-            f"{format_account_label(a)} — up ${a['delta']:,.0f} vs prior year. "
-            "Consider deepening category breadth here while momentum is strong."
+    if not concerns and sc.active_account_pct < 60.0 and sc.total_accounts:
+        concerns.append(
+            f"Only {sc.active_accounts}/{sc.total_accounts} of your accounts are active "
+            f"({sc.active_account_pct:.0f}%) — there's room to reactivate."
         )
-    if sc.new_accounts and not opportunities:
-        a = sc.new_accounts[0]
-        opportunities.append(
-            f"New account: {format_account_label(a)} at ${a['current']:,.0f} this period. "
-            "Strong opening — focus on category expansion and display placement."
+    if concerns:
+        parts.append(
+            "WHAT'S TRENDING THE WRONG WAY\n"
+            + "\n".join(f"• {c}" for c in concerns[:3])
         )
-    if opportunities:
-        parts.append("ACCOUNT OPPORTUNITIES\n" + "\n".join(f"• {o}" for o in opportunities))
 
-    # 4. EARLY SIGNALS
-    signals: list[str] = []
-    if sc.last_3mo_vs_prior_3mo_pct is not None and sc.last_3mo_vs_prior_3mo_pct < -5.0:
-        signals.append(
-            f"3-month revenue is tracking {sc.last_3mo_vs_prior_3mo_pct:+.1f}% vs the "
-            "prior 3 months — a sustained decline at this level typically signals "
-            "account churn or reduced order frequency before it shows in annual totals."
-        )
-    elif sc.sample_lines > 0 and sc.active_account_pct < 60.0:
-        signals.append(
-            "Sample activity is healthy but account activation rate is below 60% — "
-            "samples may not be converting consistently. Worth reviewing which accounts "
-            "received samples but haven't placed orders."
-        )
-    elif sc.top_growing_accounts:
-        signals.append(
-            "Strongest accounts show clear momentum — consider using this period's "
-            "winning category mix as a template for underpenetrated accounts in the territory."
-        )
-    if signals:
-        parts.append("EARLY SIGNALS\n" + " ".join(signals))
-
-    # 5. THIS WEEK'S ACTION
+    # ---- WHAT TO FOCUS ON THIS WEEK --------------------------------------
     if sc.stale_accounts:
         a = sc.stale_accounts[0]
         parts.append(
-            f"THIS WEEK'S ACTION\n"
-            f"Priority: Contact {format_account_label(a)} — strong purchase history "
-            f"(${a['prior']:,.0f} last year) with zero activity this period. "
-            "Understand what changed and re-establish the relationship."
+            "WHAT TO FOCUS ON THIS WEEK\n"
+            f"Priority: reconnect with {format_account_label(a)} — they bought "
+            f"${a['prior']:,.0f} last year and nothing this period. Find out what changed."
         )
     elif sc.top_declining_accounts:
         a = sc.top_declining_accounts[0]
         parts.append(
-            f"THIS WEEK'S ACTION\n"
-            f"Priority: Speak directly with {format_account_label(a)} about what's driving "
-            f"the ${-a['delta']:,.0f} decline. Get a clear answer before end of week."
+            "WHAT TO FOCUS ON THIS WEEK\n"
+            f"Priority: talk to {format_account_label(a)} about the "
+            f"${-a['delta']:,.0f} drop and get a clear answer this week."
         )
     elif sc.top_growing_accounts:
         a = sc.top_growing_accounts[0]
         parts.append(
-            f"THIS WEEK'S ACTION\n"
-            f"Opportunity: Double down on {format_account_label(a)} — up ${a['delta']:,.0f} "
-            "vs prior year and momentum is building. Explore category expansion or display "
-            "placement while the relationship is strong."
+            "WHAT TO FOCUS ON THIS WEEK\n"
+            f"Opportunity: keep building {format_account_label(a)} — up "
+            f"${a['delta']:,.0f} and growing. Look at adding a complementary category."
         )
 
-    parts.append("Full metrics in the scorecard below. Reply with any questions.")
+    parts.append("Full metrics are in the scorecard below. Reply with any questions.")
     return "\n\n".join(parts)
 
 

@@ -688,3 +688,222 @@ def create_conversation_for_inbound(
         imap_uid=imap_uid,
     )
     return get_conversation(conv_id)
+
+
+# ============================================================ rep facts (durable memory)
+@dataclass
+class RepFact:
+    id: int
+    rep_id: str
+    account_number: Optional[str]
+    account_label: str
+    fact_type: str
+    fact_text: str
+    source: str
+    source_message_id: Optional[int]
+    conversation_id: Optional[int]
+    active: bool
+    created_at: str
+    updated_at: str
+    # populated by join queries
+    rep_name: str = ""
+
+
+def _normalise_acct(acct: str | None) -> str | None:
+    if acct is None:
+        return None
+    a = str(acct).strip()
+    return a or None
+
+
+def save_rep_fact(
+    *,
+    rep_id: str,
+    fact_text: str,
+    fact_type: str = "note",
+    account_number: str | None = None,
+    account_label: str = "",
+    source: str = "rep_feedback",
+    source_message_id: int | None = None,
+    conversation_id: int | None = None,
+) -> int:
+    """Insert a rep-asserted fact, de-duplicating on (rep_id, account_number, fact_type).
+
+    If an active fact with the same rep + account + type already exists, its text
+    is refreshed (and it stays active) instead of creating a duplicate.  Returns
+    the fact id.
+    """
+    rep_id = (rep_id or "").strip()
+    if not rep_id or not (fact_text or "").strip():
+        return 0
+    acct = _normalise_acct(account_number)
+    with get_conn() as conn:
+        existing = None
+        if acct is not None:
+            existing = conn.execute(
+                """
+                SELECT id FROM rep_facts
+                WHERE rep_id = ? AND account_number = ? AND fact_type = ? AND active = 1
+                LIMIT 1
+                """,
+                (rep_id, acct, fact_type),
+            ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE rep_facts
+                SET fact_text = ?, account_label = ?, source = ?,
+                    source_message_id = ?, conversation_id = ?,
+                    updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                (
+                    fact_text.strip(), account_label, source,
+                    source_message_id, conversation_id, int(existing["id"]),
+                ),
+            )
+            return int(existing["id"])
+        cur = conn.execute(
+            """
+            INSERT INTO rep_facts
+              (rep_id, account_number, account_label, fact_type, fact_text,
+               source, source_message_id, conversation_id, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                rep_id, acct, account_label, fact_type, fact_text.strip(),
+                source, source_message_id, conversation_id,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def list_rep_facts(
+    rep_id: str | None = None,
+    *,
+    active_only: bool = True,
+) -> list[RepFact]:
+    """Return rep facts, newest first.  Optionally filter to one rep / active only."""
+    with get_conn() as conn:
+        params: list = []
+        where = "WHERE 1=1"
+        if rep_id:
+            where += " AND f.rep_id = ?"
+            params.append(rep_id.strip())
+        if active_only:
+            where += " AND f.active = 1"
+        rows = conn.execute(
+            f"""
+            SELECT f.*, r.name AS rep_name
+            FROM rep_facts f
+            LEFT JOIN reps r ON r.salesman_number = f.rep_id
+            {where}
+            ORDER BY f.created_at DESC
+            """,
+            params,
+        ).fetchall()
+    return [_row_to_rep_fact(r) for r in rows]
+
+
+def set_rep_fact_active(fact_id: int, active: bool) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE rep_facts SET active = ?, updated_at = datetime('now') WHERE id = ?",
+            (1 if active else 0, int(fact_id)),
+        )
+
+
+def delete_rep_fact(fact_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM rep_facts WHERE id = ?", (int(fact_id),))
+
+
+def closed_account_numbers(rep_id: str | None = None) -> set[str]:
+    """Return the set of account numbers a rep (or anyone) has flagged closed."""
+    facts = list_rep_facts(rep_id, active_only=True)
+    return {
+        f.account_number
+        for f in facts
+        if f.fact_type == "account_closed" and f.account_number
+    }
+
+
+def rep_facts_block(rep_id: str | None) -> str:
+    """Build a prompt block of durable rep-asserted facts to honor.
+
+    Returns '' when there are no active facts so prompts stay clean.
+    """
+    facts = list_rep_facts(rep_id, active_only=True)
+    if not facts:
+        return ""
+    lines: list[str] = [
+        "KNOWN FACTS FROM THE REP (durable memory — HONOR these; do NOT contradict them):"
+    ]
+    for f in facts:
+        tag = ""
+        if f.fact_type == "account_closed":
+            tag = " [ACCOUNT CLOSED — do not suggest contacting or pursuing it]"
+        acct = f" (account {f.account_label or f.account_number})" if f.account_number else ""
+        lines.append(f"  - {f.fact_text.strip()}{acct}{tag}")
+    lines.append(
+        "  Treat the above as established truth the rep already told us. Do not "
+        "re-raise a closed account as an opportunity or ask about facts already stated."
+    )
+    return "\n".join(lines)
+
+
+def _row_to_rep_fact(row) -> RepFact:
+    return RepFact(
+        id=row["id"],
+        rep_id=row["rep_id"],
+        account_number=row["account_number"],
+        account_label=row["account_label"] or "",
+        fact_type=row["fact_type"],
+        fact_text=row["fact_text"],
+        source=row["source"],
+        source_message_id=row["source_message_id"],
+        conversation_id=row["conversation_id"],
+        active=bool(row["active"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        rep_name=(row["rep_name"] if "rep_name" in row.keys() else "") or "",
+    )
+
+
+# ============================================================ anti-repetition (weekly emails)
+def recent_weekly_email_texts(rep_id: str, days: int = 30) -> list[str]:
+    """Return plain-text bodies of weekly emails sent to a rep in the last *days*.
+
+    Used to steer the AI away from reusing the same insights/angles week over
+    week.  Sourced from already-stored outbound messages on 'weekly_email'
+    conversations — no extra table required.
+    """
+    rep_id = (rep_id or "").strip()
+    if not rep_id:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT m.body_text, m.body_html, m.sent_at
+            FROM messages m
+            JOIN conversations c ON c.id = m.conversation_id
+            WHERE c.rep_id = ?
+              AND c.topic = 'weekly_email'
+              AND m.direction = 'outbound'
+              AND m.sent_at >= datetime('now', ?)
+            ORDER BY m.sent_at DESC
+            LIMIT 6
+            """,
+            (rep_id, f"-{int(days)} days"),
+        ).fetchall()
+    out: list[str] = []
+    for r in rows:
+        body = (r["body_text"] or "").strip()
+        if not body and r["body_html"]:
+            # crude HTML strip
+            import re as _re
+            body = _re.sub(r"<[^>]+>", " ", r["body_html"])
+            body = _re.sub(r"\s+", " ", body).strip()
+        if body:
+            out.append(body)
+    return out

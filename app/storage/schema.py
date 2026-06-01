@@ -128,6 +128,34 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS idx_ai_analyses_hash ON ai_analyses(question_hash)
     """,
+    # ---- rep_facts: durable, auditable memory of rep-asserted facts --------
+    # Captures statements a rep makes in conversations (e.g. "that account is
+    # closed", "they switched suppliers") so future weekly emails and AI replies
+    # stop surfacing stale/irrelevant accounts.  Every fact is auditable
+    # (who/when/source message) and reversible (active flag) per the manager's
+    # integrity requirement — a rep can never silently hide an account.
+    """
+    CREATE TABLE IF NOT EXISTS rep_facts (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        rep_id            TEXT NOT NULL,             -- salesman_number or sender key
+        account_number    TEXT,                      -- new-system account # (nullable)
+        account_label     TEXT NOT NULL DEFAULT '',  -- human label for display
+        fact_type         TEXT NOT NULL DEFAULT 'note',  -- account_closed|account_note|preference|other
+        fact_text         TEXT NOT NULL,             -- the asserted fact, verbatim/condensed
+        source            TEXT NOT NULL DEFAULT 'rep_feedback',  -- rep_feedback|manager
+        source_message_id INTEGER,                   -- messages.id that triggered it
+        conversation_id   INTEGER,                   -- conversations.id for context
+        active            INTEGER NOT NULL DEFAULT 1,  -- 0 = retired/overridden by manager
+        created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_rep_facts_rep ON rep_facts(rep_id, active)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_rep_facts_acct ON rep_facts(account_number, active)
+    """,
 )
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
